@@ -3,13 +3,13 @@ use std::{cmp::Ordering, ops::Range};
 use editor::{
     display_map::{DisplayRow, DisplaySnapshot},
     movement::{find_boundary_range_fold, TextLayoutDetails},
-    DisplayPoint, Editor, RowExt, RowRangeExt,
+    DisplayPoint, Editor, RowRangeExt,
 };
+use gpui::Window;
 use itertools::Itertools;
 use language::CharClassifier;
 use multi_buffer::MultiBufferPoint;
 use text::{Bias, Selection};
-use ui::ViewContext;
 
 use crate::{
     easy_motion::{Direction, WordType},
@@ -17,7 +17,7 @@ use crate::{
 };
 
 pub fn manh_distance(point_1: &DisplayPoint, point_2: &DisplayPoint, x_bias: f32) -> f32 {
-    x_bias * (point_1.row().as_f32() - point_2.row().as_f32()).abs()
+    x_bias * (point_1.row().0 as f32 - point_2.row().0 as f32).abs()
         + (point_1.column() as i32 - point_2.column() as i32).abs() as f32
 }
 
@@ -46,12 +46,12 @@ pub fn ranges(
 ) -> Range<DisplayPoint> {
     let start = match direction {
         Direction::Both | Direction::Backwards => {
-            let times = if text_layout_details.scroll_anchor.offset.y == 0. {
+            let times = if text_layout_details.scroll_anchor.scroll_anchor.offset.y == 0. {
                 0
             } else {
                 1
             };
-            window_top(map, DisplayPoint::zero(), &text_layout_details, times).0
+            window_top(map, DisplayPoint::zero(), text_layout_details, times).0
         }
         Direction::Forwards => selection.end,
     };
@@ -60,7 +60,7 @@ pub fn ranges(
             window_bottom(
                 map,
                 DisplayPoint::new(DisplayRow(0), u32::max_value()),
-                &text_layout_details,
+                text_layout_details,
                 0,
             )
             .0
@@ -73,21 +73,27 @@ pub fn ranges(
 pub fn row_starts(
     direction: Direction,
     editor: &mut Editor,
-    cx: &mut ViewContext<Editor>,
+    window: &mut Window,
+    cx: &mut gpui::App,
 ) -> Vec<DisplayPoint> {
-    let selections = editor.selections.newest_display(cx);
-    let snapshot = editor.snapshot(cx);
-    let map = &snapshot.display_snapshot;
-    let Range { start, end } = ranges(direction, map, &selections, &editor.text_layout_details(cx));
+    let snapshot = editor.display_snapshot(cx);
+    let selections = editor.selections.newest_display(&snapshot);
+    let mut text_layout_details = editor.text_layout_details(window, cx);
+    text_layout_details.vertical_scroll_margin = 0.0;
+    let Range { start, end } = ranges(direction, &snapshot, &selections, &text_layout_details);
+    let num_display_rows = (start.row()..end.row()).len();
     snapshot
-        .buffer_rows(start.row())
-        .take((start.row()..end.row()).len())
-        .flatten()
-        .filter_map(|row| {
+        .row_infos(start.row())
+        .take(num_display_rows)
+        .filter_map(|row_info| {
+            if row_info.wrapped_buffer_row.is_some() {
+                return None;
+            }
+            let row = row_info.multibuffer_row?;
             if snapshot.is_line_folded(row) {
                 None
             } else {
-                Some(map.point_to_display_point(MultiBufferPoint::new(row.0, 0), Bias::Left))
+                Some(snapshot.point_to_display_point(MultiBufferPoint::new(row.0, 0), Bias::Left))
             }
         })
         .collect_vec()
@@ -97,21 +103,21 @@ pub fn word_starts(
     word_type: WordType,
     direction: Direction,
     editor: &mut Editor,
-    cx: &mut ViewContext<Editor>,
+    window: &mut Window,
+    cx: &mut gpui::App,
 ) -> Vec<DisplayPoint> {
-    let selections = editor.selections.newest_display(cx);
-    let snapshot = editor.snapshot(cx);
-    let map = &snapshot.display_snapshot;
-    let mut text_layout_details = editor.text_layout_details(cx);
+    let snapshot = editor.display_snapshot(cx);
+    let selections = editor.selections.newest_display(&snapshot);
+    let mut text_layout_details = editor.text_layout_details(window, cx);
     text_layout_details.vertical_scroll_margin = 0.0;
-    let Range { start, end } = ranges(direction, map, &selections, &text_layout_details);
+    let Range { start, end } = ranges(direction, &snapshot, &selections, &text_layout_details);
     // TODO subword
     let full_word = match word_type {
         WordType::Word => false,
         WordType::FullWord => true,
     };
 
-    word_starts_in_range(map, start, end, full_word)
+    word_starts_in_range(&snapshot, start, end, full_word)
 }
 
 fn is_boundary(classifier: &CharClassifier, full_word: bool, left: char, right: char) -> bool {
@@ -130,7 +136,7 @@ pub fn word_starts_in_range(
     to: DisplayPoint,
     full_word: bool,
 ) -> Vec<DisplayPoint> {
-    let classifier = map.buffer_snapshot.char_classifier_at(from.to_point(map));
+    let classifier = map.buffer_snapshot().char_classifier_at(from.to_point(map));
     let mut results = Vec::new();
 
     let fold_snapshot = &map.fold_snapshot;
@@ -172,18 +178,17 @@ mod tests {
         test::marked_display_snapshot,
         FoldPlaceholder, MultiBuffer,
     };
-    use gpui::{font, px, AppContext, Model, TestAppContext};
+    use gpui::{font, px, App, Entity, TestAppContext};
     // use indoc::indoc;
     use project::Project;
     use rope::Point;
     use settings::SettingsStore;
-    use ui::Context;
 
     fn display_point(x: u32, y: u32) -> DisplayPoint {
         DisplayPoint::new(DisplayRow(y), x)
     }
 
-    fn test_helper_fold(text: &str, list: Vec<DisplayPoint>, full_word: bool, cx: &mut AppContext) {
+    fn test_helper_fold(text: &str, list: Vec<DisplayPoint>, full_word: bool, cx: &mut App) {
         let (snapshot, display_points) = marked_display_snapshot(text, cx);
         let point = *display_points.first().unwrap();
         let end = *display_points.last().unwrap();
@@ -192,7 +197,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_easy_get_word_starts(cx: &mut AppContext) {
+    fn test_easy_get_word_starts(cx: &mut App) {
         init_test(cx);
 
         let marked_text = "ˇlorem ipsuˇm hi hello ";
@@ -225,7 +230,7 @@ mod tests {
         );
     }
 
-    fn display_map_helper(text: &str, cx: &mut TestAppContext) -> Model<DisplayMap> {
+    fn display_map_helper(text: &str, cx: &mut TestAppContext) -> Entity<DisplayMap> {
         let buffer_start_excerpt_header_height = 1;
         let excerpt_header_height = 1;
         let font_size = px(14.0);
@@ -233,7 +238,7 @@ mod tests {
 
         let buffer = cx.update(|cx| MultiBuffer::build_simple(text, cx));
 
-        cx.new_model(|cx| {
+        cx.new(|cx| {
             DisplayMap::new(
                 buffer.clone(),
                 font("Helvetica"),
@@ -278,73 +283,9 @@ mod tests {
                 display_point(0, 7)
             ]
         );
-
-        // TODO - get this test working
-        // everything is appearing on a single line and I don't know why
-
-        // let text = indoc! {r#"
-        //     fn hi() {
-        //     print!("hi");
-        //     }
-
-        //     fn main() {
-        //     hi();
-        //     }
-        // "#};
-        // dbg!(text);
-        // let map = display_map_helper(text, cx);
-        // let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
-        // dbg!(snapshot.fold_snapshot.text());
-        // dbg!(snapshot.text());
-
-        // let starts =
-        //     word_starts_in_range_fold(&snapshot, DisplayPoint::zero(), snapshot.max_point(), false);
-        // assert_eq!(
-        //     starts,
-        //     [
-        //         display_point(0, 0),
-        //         display_point(0, 3),
-        //         display_point(1, 1),
-        //         display_point(1, 8),
-        //         display_point(3, 0),
-        //         display_point(3, 3),
-        //         display_point(4, 1),
-        //     ]
-        // );
-
-        // let snapshot = map.update(cx, |map, cx| {
-        //     let folds = vec![(Point::new(0, 9)..Point::new(1, 17), FoldPlaceholder::test())];
-        //     map.fold(folds, cx);
-        //     map.snapshot(cx)
-        // });
-
-        // let output_text = indoc! {r#"
-        //     fn hi() {⋯
-        //     }
-
-        //     fn main() {
-        //         hi();
-        //     }
-        // "#};
-        // assert_eq!(snapshot.fold_snapshot.text(), output_text);
-
-        // let starts =
-        //     word_starts_in_range_fold(&snapshot, DisplayPoint::zero(), snapshot.max_point(), false);
-        // assert_eq!(
-        //     starts,
-        //     [
-        //         display_point(0, 0),
-        //         display_point(0, 3),
-        //         display_point(1, 1),
-        //         display_point(1, 8),
-        //         display_point(3, 0),
-        //         display_point(3, 3),
-        //         display_point(4, 1),
-        //     ]
-        // );
     }
 
-    fn init_test(cx: &mut AppContext) {
+    fn init_test(cx: &mut App) {
         let settings_store = SettingsStore::test(cx);
         cx.set_global(settings_store);
         theme::init(theme::LoadThemes::JustBase, cx);

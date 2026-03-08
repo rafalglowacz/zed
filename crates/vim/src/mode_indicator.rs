@@ -109,6 +109,7 @@ impl Render for ModeIndicator {
             crate::state::Mode::VisualBlock => colors.vim_visual_block_foreground,
             crate::state::Mode::HelixNormal => colors.vim_helix_normal_foreground,
             crate::state::Mode::HelixSelect => colors.vim_helix_select_foreground,
+            crate::state::Mode::EasyMotion => colors.vim_normal_foreground,
         };
         let bg_color = match mode {
             crate::state::Mode::Normal => colors.vim_normal_background,
@@ -119,6 +120,7 @@ impl Render for ModeIndicator {
             crate::state::Mode::VisualBlock => colors.vim_visual_block_background,
             crate::state::Mode::HelixNormal => colors.vim_helix_normal_background,
             crate::state::Mode::HelixSelect => colors.vim_helix_select_background,
+            crate::state::Mode::EasyMotion => colors.vim_normal_background,
         };
 
         let (label, mode): (SharedString, Option<SharedString>) = if let Some(label) = status_label

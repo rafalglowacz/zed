@@ -7,7 +7,7 @@ use crate::{
     scroll::{ScrollOffset, SharedScrollAnchor},
     DisplayRow, EditorStyle, FoldOffset, FoldPoint, ToOffset, ToPoint,
 };
-use gpui::{px, Pixels, WindowTextSystem};
+use gpui::{Pixels, WindowTextSystem};
 use language::{CharClassifier, Point};
 use multi_buffer::{MultiBufferOffset, MultiBufferRow, MultiBufferSnapshot};
 use serde::Deserialize;
@@ -746,7 +746,7 @@ pub fn find_boundary_point_in_range_fold(
 
     let mut iter = map.chars_for_range(offset, to_offset);
     let mut prev_ch = iter.next()?;
-    offset += FoldOffset(1);
+    offset += FoldOffset(MultiBufferOffset(1));
     for ch in iter {
         if is_boundary(prev_ch, ch) {
             if return_point_before_boundary {
@@ -760,9 +760,9 @@ pub fn find_boundary_point_in_range_fold(
         // not really sure why this is necessary but this fixes the bug with a match
         // appearing at the end of a folded block
         offset += if ch == '⋯' {
-            FoldOffset(3)
+            FoldOffset(MultiBufferOffset(3))
         } else {
-            FoldOffset(1)
+            FoldOffset(MultiBufferOffset(1))
         };
         prev_ch = ch;
     }

@@ -1,11 +1,12 @@
 use gpui::HighlightStyle;
+use multi_buffer::MultiBufferOffset;
 
 use crate::easy_motion::trie::{Trie, TrimResult};
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct OverlayState {
     pub style: HighlightStyle,
-    pub offset: usize,
+    pub offset: MultiBufferOffset,
 }
 
 #[derive(Debug)]

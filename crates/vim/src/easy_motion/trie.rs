@@ -70,7 +70,7 @@ impl<T> Trie<T> {
             TrieNode::Leaf(_) => {
                 return TrimResult::Err;
             }
-            TrieNode::Node(ref mut map) => {
+            TrieNode::Node(map) => {
                 let index = self.keys.find(character);
                 let Some(index) = index else {
                     return TrimResult::NoChange;

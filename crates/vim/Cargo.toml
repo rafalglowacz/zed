@@ -59,7 +59,6 @@ command_palette = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }
 futures.workspace = true
 rope.workspace = true
-project.workspace = true
 git_ui = { workspace = true, features = ["test-support"] }
 title_bar = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }

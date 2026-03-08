@@ -89,7 +89,6 @@ pub use fold_map::{
     ChunkRenderer, ChunkRendererContext, ChunkRendererId, Fold, FoldId, FoldOffset, FoldPlaceholder,
     FoldPoint, FoldSnapshot,
 };
-use fold_map::{FoldMap, FoldMapWriter};
 pub use inlay_map::{InlayOffset, InlayPoint};
 pub use invisibles::{is_invisible, replacement};
 pub use wrap_map::{WrapPoint, WrapRow, WrapSnapshot};
@@ -130,7 +129,6 @@ use crate::{
     EditorStyle, RowExt, hover_links::InlayHighlight, inlays::Inlay, movement::TextLayoutDetails,
 };
 use block_map::{BlockRow, BlockSnapshot};
-use fold_map::FoldSnapshot;
 use inlay_map::InlaySnapshot;
 use tab_map::TabSnapshot;
 use wrap_map::{WrapMap, WrapPatch};
@@ -154,6 +152,7 @@ pub enum HighlightKey {
     BufferSearchHighlights,
     ConsoleAnsiHighlight(usize),
     DebugStackFrameLine,
+    EasyMotion,
     DocumentHighlightRead,
     DocumentHighlightWrite,
     EditPredictionHighlight,

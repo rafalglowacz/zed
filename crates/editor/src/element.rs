@@ -4496,9 +4496,8 @@ impl EditorElement {
         content_origin: gpui::Point<Pixels>,
         line_height: Pixels,
         visible_display_row_range: Range<DisplayRow>,
-        scroll_pixel_position: gpui::Point<Pixels>,
+        scroll_pixel_position: gpui::Point<f64>,
         line_layouts: &[LineWithInvisibles],
-        text_style: &TextStyle,
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<AnyElement> {
@@ -4508,22 +4507,22 @@ impl EditorElement {
         let overlays = overlay_map
             .iter()
             .flat_map(|(_, list)| list.iter())
-            .filter_map(|overlay| overlay.render(text_style, visible_display_row_range.clone()));
+            .filter_map(|overlay| overlay.render(visible_display_row_range.clone()));
         let available_space = size(AvailableSpace::MinContent, AvailableSpace::MinContent);
 
         let overlays = overlays
             .map(|(anchor, mut overlay)| {
-                let _overlay_size = overlay.layout_as_root(available_space, window);
+                let _overlay_size = overlay.layout_as_root(available_space, window, cx);
 
                 let hovered_row_layout =
                     &line_layouts[anchor.row().minus(visible_display_row_range.start) as usize];
 
                 let x = hovered_row_layout.x_for_index(anchor.column() as usize)
-                    - scroll_pixel_position.x;
-                let y = anchor.row().as_f32() * line_height - scroll_pixel_position.y;
+                    - px(scroll_pixel_position.x as f32);
+                let y = anchor.row().0 as f32 * line_height - px(scroll_pixel_position.y as f32);
                 let origin = content_origin + point(x, y);
 
-                overlay.prepaint_at(origin, window);
+                overlay.prepaint_at(origin, window, cx);
                 overlay
             })
             .collect_vec();
@@ -10918,7 +10917,6 @@ impl Element for EditorElement {
                         start_row..end_row,
                         scroll_pixel_position,
                         &line_layouts,
-                        &style.text,
                         window,
                         cx,
                     );
@@ -11192,6 +11190,7 @@ impl Element for EditorElement {
                     for overlay in layout.overlays.iter_mut() {
                         overlay.paint(window, cx);
                     }
+
 
                     if !layout.spacer_blocks.is_empty() {
                         window.with_element_namespace("blocks", |window| {

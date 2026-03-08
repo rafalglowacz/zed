@@ -202,6 +202,15 @@ pub struct SettingsContent {
 
     /// Settings related to Vim mode in Zed.
     pub vim: Option<VimSettingsContent>,
+
+    /// Settings related to EasyMotion in Zed.
+    pub easy_motion: Option<EasyMotionSettingsContent>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct EasyMotionSettingsContent {
+    pub enabled: Option<bool>,
+    pub keys: Option<String>,
 }
 
 impl SettingsContent {

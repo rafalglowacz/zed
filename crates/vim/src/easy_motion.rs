@@ -1,25 +1,22 @@
-use anyhow::Result;
-use schemars::JsonSchema;
-use search::word_starts;
-use serde::{Deserialize, Serialize};
 use std::fmt;
 
 use editor::{
-    display_map::DisplaySnapshot, overlay::Overlay, scroll::Autoscroll, DisplayPoint, Editor,
-    EditorEvent, MultiBufferSnapshot, ToPoint,
+    display_map::{DisplaySnapshot, HighlightKey},
+    overlay::Overlay,
+    scroll::Autoscroll,
+    DisplayPoint, Editor, EditorEvent, MultiBufferSnapshot,
 };
 use gpui::{
-    actions, impl_actions, Action, AppContext, HighlightStyle, Hsla, KeystrokeEvent, View,
-    ViewContext, WeakView,
+    actions, Action, App, AppContext, Entity, HighlightStyle, Hsla, KeystrokeEvent, WeakEntity,
+    Window,
 };
-use settings::{Settings, SettingsSources};
+use settings::Settings;
 use text::{Bias, SelectionGoal};
-use theme::ThemeSettings;
-use ui::{IntoElement, Render, VisualContext};
+use ui::{ActiveTheme, Context, IntoElement, Render};
 
 use crate::easy_motion::{
     editor_state::{EasyMotionState, OverlayState},
-    search::{row_starts, sort_matches_display},
+    search::{row_starts, sort_matches_display, word_starts},
     trie::{Trie, TrimResult},
 };
 use crate::{state::Mode, Vim};
@@ -28,7 +25,7 @@ pub mod editor_state;
 mod search;
 mod trie;
 
-#[derive(Eq, PartialEq, Copy, Clone, Deserialize, Debug, Default)]
+#[derive(Eq, PartialEq, Copy, Clone, serde::Deserialize, schemars::JsonSchema, Debug, Default)]
 #[serde(rename_all = "camelCase")]
 enum Direction {
     #[default]
@@ -37,34 +34,32 @@ enum Direction {
     Backwards,
 }
 
-#[derive(Clone, Deserialize, PartialEq)]
+#[derive(Clone, serde::Deserialize, schemars::JsonSchema, PartialEq, gpui::Action)]
 #[serde(rename_all = "camelCase")]
 struct NChar {
     direction: Direction,
     n: u32,
 }
 
-#[derive(Clone, Deserialize, PartialEq)]
+#[derive(Clone, serde::Deserialize, schemars::JsonSchema, PartialEq, gpui::Action)]
 #[serde(rename_all = "camelCase")]
 struct Pattern(Direction);
 
-#[derive(Clone, Deserialize, PartialEq)]
+#[derive(Clone, serde::Deserialize, schemars::JsonSchema, PartialEq, gpui::Action)]
 #[serde(rename_all = "camelCase")]
-struct Word(Direction);
+pub struct Word(pub Direction);
 
-#[derive(Clone, Deserialize, PartialEq)]
+#[derive(Clone, serde::Deserialize, schemars::JsonSchema, PartialEq, gpui::Action)]
 #[serde(rename_all = "camelCase")]
 struct SubWord(Direction);
 
-#[derive(Clone, Deserialize, PartialEq)]
+#[derive(Clone, serde::Deserialize, schemars::JsonSchema, PartialEq, gpui::Action)]
 #[serde(rename_all = "camelCase")]
-struct FullWord(Direction);
+pub struct FullWord(pub Direction);
 
-#[derive(Clone, Deserialize, PartialEq)]
+#[derive(Clone, serde::Deserialize, schemars::JsonSchema, PartialEq, gpui::Action)]
 #[serde(rename_all = "camelCase")]
-struct Row(Direction);
-
-impl_actions!(easy_motion, [NChar, Pattern, Word, FullWord, Row]);
+pub struct Row(pub Direction);
 
 actions!(easy_motion, [Cancel, PatternSubmit]);
 
@@ -76,7 +71,7 @@ enum WordType {
 
 #[derive(Clone)]
 pub(crate) struct EasyMotionAddon {
-    pub(crate) _view: View<EasyMotion>,
+    pub(crate) _view: Entity<EasyMotion>,
 }
 
 impl editor::Addon for EasyMotionAddon {
@@ -87,8 +82,8 @@ impl editor::Addon for EasyMotionAddon {
 
 pub struct EasyMotion {
     state: Option<EasyMotionState>,
-    editor: WeakView<Editor>,
-    vim: WeakView<Vim>,
+    editor: WeakEntity<Editor>,
+    vim: WeakEntity<Vim>,
 }
 
 impl fmt::Debug for EasyMotion {
@@ -99,11 +94,11 @@ impl fmt::Debug for EasyMotion {
     }
 }
 
-pub fn init(cx: &mut AppContext) {
+pub fn init(cx: &mut App) {
     EasyMotionSettings::register(cx);
 }
 
-pub(crate) fn register(editor: &mut Editor, cx: &mut ViewContext<EasyMotion>) {
+pub(crate) fn register(editor: &mut Editor, cx: &mut Context<EasyMotion>) {
     EasyMotion::action(editor, cx, EasyMotion::word);
     EasyMotion::action(editor, cx, EasyMotion::full_word);
     EasyMotion::action(editor, cx, EasyMotion::row);
@@ -114,16 +109,16 @@ pub(crate) fn register(editor: &mut Editor, cx: &mut ViewContext<EasyMotion>) {
 // This means it needs a VisualContext. The easiest way to satisfy that constraint is
 // to make Vim a "View" that is just never actually rendered.
 impl Render for EasyMotion {
-    fn render(&mut self, _cx: &mut ViewContext<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         gpui::Empty
     }
 }
 
 impl EasyMotion {
-    pub(crate) fn new(cx: &mut ViewContext<Editor>, vim: WeakView<Vim>) -> View<Self> {
-        let editor = cx.view().clone();
+    pub(crate) fn new(cx: &mut Context<Editor>, vim: WeakEntity<Vim>) -> Entity<Self> {
+        let editor = cx.entity();
 
-        cx.new_view(|cx: &mut ViewContext<EasyMotion>| {
+        cx.new(|cx: &mut Context<EasyMotion>| {
             cx.subscribe(&editor, EasyMotion::update_overlays).detach();
 
             cx.observe_keystrokes(EasyMotion::observe_keystrokes)
@@ -138,31 +133,32 @@ impl EasyMotion {
 
     pub fn action<A: Action>(
         editor: &mut Editor,
-        cx: &mut ViewContext<EasyMotion>,
-        f: impl Fn(&mut EasyMotion, &A, &mut ViewContext<EasyMotion>) + 'static,
+        cx: &mut Context<EasyMotion>,
+        f: impl Fn(&mut EasyMotion, &A, &mut Window, &mut Context<EasyMotion>) + 'static,
     ) {
         let subscription = editor.register_action(cx.listener(f));
-        cx.on_release(|_, _, _| drop(subscription)).detach();
+        cx.on_release(|_, _| drop(subscription)).detach();
     }
 
     fn handle_new_matches(
         mut matches: Vec<DisplayPoint>,
         direction: Direction,
         editor: &mut Editor,
-        cx: &mut ViewContext<Editor>,
+        cx: &mut Context<Editor>,
     ) -> Option<EasyMotionState> {
         editor.blink_manager.update(cx, |blink, cx| {
             blink.disable(cx);
             blink.hide_cursor(cx);
         });
 
-        let selections = editor.selections.newest_display(cx);
-        let snapshot = editor.snapshot(cx);
-        let map = &snapshot.display_snapshot;
+        let display_snapshot = editor.display_snapshot(cx);
+        let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+        let map = &display_snapshot;
 
         if matches.is_empty() {
             return None;
         }
+        let selections = editor.selections.newest_display(map);
         sort_matches_display(&mut matches, &selections.start);
 
         let settings = EasyMotionSettings::get_global(cx);
@@ -184,8 +180,8 @@ impl EasyMotion {
             editor,
             trie.iter(),
             trie.len(),
-            &snapshot.buffer_snapshot,
-            &snapshot.display_snapshot,
+            &buffer_snapshot,
+            map,
             cx,
         );
 
@@ -203,35 +199,36 @@ impl EasyMotion {
             fade_out: Some(0.7),
             ..Default::default()
         };
-        editor.highlight_text::<Self>(vec![anchor_start..anchor_end], highlight, cx);
+        editor.highlight_text(HighlightKey::EasyMotion, vec![anchor_start..anchor_end], highlight, cx);
 
         let new_state = EasyMotionState::new(trie);
         Some(new_state)
     }
 
-    fn word(&mut self, action: &Word, cx: &mut ViewContext<EasyMotion>) {
+    fn word(&mut self, action: &Word, window: &mut Window, cx: &mut Context<EasyMotion>) {
         let Word(direction) = *action;
-        self.word_impl(WordType::Word, direction, cx);
+        self.word_impl(WordType::Word, direction, window, cx);
     }
 
-    fn full_word(&mut self, action: &FullWord, cx: &mut ViewContext<EasyMotion>) {
+    fn full_word(&mut self, action: &FullWord, window: &mut Window, cx: &mut Context<EasyMotion>) {
         let FullWord(direction) = *action;
-        self.word_impl(WordType::FullWord, direction, cx);
+        self.word_impl(WordType::FullWord, direction, window, cx);
     }
 
-    fn clear_editor(editor: &mut Editor, cx: &mut ViewContext<Editor>) {
+    fn clear_editor(editor: &mut Editor, cx: &mut Context<Editor>) {
         editor.blink_manager.update(cx, |blink, cx| {
             blink.enable(cx);
         });
         editor.clear_overlays::<Self>(cx);
-        editor.clear_highlights::<Self>(cx);
+        editor.clear_highlights(HighlightKey::EasyMotion, cx);
     }
 
     fn word_impl(
         &mut self,
         word_type: WordType,
         direction: Direction,
-        cx: &mut ViewContext<EasyMotion>,
+        window: &mut Window,
+        cx: &mut Context<EasyMotion>,
     ) {
         let Some((vim, editor)) = self.vim.upgrade().zip(self.editor.upgrade()) else {
             return;
@@ -239,17 +236,17 @@ impl EasyMotion {
         let mode = vim.update(cx, |vim, cx| {
             let mode = vim.mode;
             assert_ne!(mode, Mode::EasyMotion);
-            vim.switch_mode(Mode::EasyMotion, false, cx);
+            vim.switch_mode(Mode::EasyMotion, false, window, cx);
             mode
         });
 
         let new_state = editor.update(cx, |editor, cx| {
-            let word_starts = word_starts(word_type, direction, editor, cx);
-            Self::handle_new_matches(word_starts, direction, editor, cx)
+            let starts = word_starts(word_type, direction, editor, window, cx);
+            Self::handle_new_matches(starts, direction, editor, cx)
         });
         let Some(new_state) = new_state else {
             vim.update(cx, move |vim, cx| {
-                vim.switch_mode(mode, false, cx);
+                vim.switch_mode(mode, false, window, cx);
             });
             return;
         };
@@ -257,20 +254,19 @@ impl EasyMotion {
         self.state = Some(new_state);
     }
 
-    fn row(&mut self, action: &Row, cx: &mut ViewContext<EasyMotion>) {
+    fn row(&mut self, action: &Row, window: &mut Window, cx: &mut Context<EasyMotion>) {
         let Some((vim, editor)) = self.vim.upgrade().zip(self.editor.upgrade()) else {
             return;
         };
         vim.update(cx, |vim, cx| {
-            let mode = vim.mode;
-            assert_ne!(mode, Mode::EasyMotion);
-            vim.switch_mode(Mode::EasyMotion, false, cx);
+            assert_ne!(vim.mode, Mode::EasyMotion);
+            vim.switch_mode(Mode::EasyMotion, false, window, cx);
         });
 
         let Row(direction) = *action;
 
         let new_state = editor.update(cx, |editor, cx| {
-            let matches = row_starts(direction, editor, cx);
+            let matches = row_starts(direction, editor, window, cx);
             Self::handle_new_matches(matches, direction, editor, cx)
         });
         let Some(new_state) = new_state else {
@@ -280,24 +276,28 @@ impl EasyMotion {
         self.state = Some(new_state);
     }
 
-    fn cancel(&mut self, _action: &Cancel, cx: &mut ViewContext<EasyMotion>) {
+    fn cancel(&mut self, _action: &Cancel, window: &mut Window, cx: &mut Context<EasyMotion>) {
         let Some((vim, editor)) = self.vim.upgrade().zip(self.editor.upgrade()) else {
             return;
         };
         vim.update(cx, |vim, cx| {
-            let mode = vim.mode;
-            assert_eq!(mode, Mode::EasyMotion);
-            vim.switch_mode(Mode::Normal, false, cx);
+            assert_eq!(vim.mode, Mode::EasyMotion);
+            vim.switch_mode(Mode::Normal, false, window, cx);
         });
 
         self.state = None;
         editor.update(cx, |editor, cx| Self::clear_editor(editor, cx));
     }
 
-    fn observe_keystrokes(&mut self, keystroke_event: &KeystrokeEvent, cx: &mut ViewContext<Self>) {
+    fn observe_keystrokes(
+        &mut self,
+        keystroke_event: &KeystrokeEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if keystroke_event.action.is_some() {
             return;
-        } else if cx.has_pending_keystrokes() {
+        } else if window.has_pending_keystrokes() {
             return;
         }
 
@@ -306,12 +306,14 @@ impl EasyMotion {
         };
 
         let keys = keystroke_event.keystroke.key.as_str();
-        let new_state = editor.update(cx, |editor, cx| Self::handle_trim(state, keys, editor, cx));
+        let new_state = editor.update(cx, |editor, cx| {
+            Self::handle_trim(state, keys, editor, window, cx)
+        });
         let Some(new_state) = new_state else {
             let Some(vim) = self.vim.upgrade() else {
                 return;
             };
-            vim.update(cx, |vim, cx| vim.switch_mode(Mode::Normal, false, cx));
+            vim.update(cx, |vim, cx| vim.switch_mode(Mode::Normal, false, window, cx));
             return;
         };
 
@@ -322,18 +324,18 @@ impl EasyMotion {
         selection: EasyMotionState,
         keys: &str,
         editor: &mut Editor,
-        cx: &mut ViewContext<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Editor>,
     ) -> Option<EasyMotionState> {
         let (selection, res) = selection.record_str(keys);
         match res {
             TrimResult::Found(overlay) => {
-                let snapshot = editor.snapshot(cx);
-                let point = overlay.offset.to_point(&snapshot.buffer_snapshot);
-                let point = snapshot
-                    .display_snapshot
-                    .point_to_display_point(point, Bias::Right);
-                editor.change_selections(Some(Autoscroll::fit()), cx, |selection| {
-                    selection.move_cursors_with(|_, _, _| (point, SelectionGoal::None))
+                let display_snapshot = editor.display_snapshot(cx);
+                let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+                let point = buffer_snapshot.offset_to_point(overlay.offset);
+                let point = display_snapshot.point_to_display_point(point, Bias::Right);
+                editor.change_selections(Some(Autoscroll::fit()).into(), window, cx, |selection| {
+                    selection.move_cursors_with(&mut |_, _, _| (point, SelectionGoal::None))
                 });
                 Self::clear_editor(editor, cx);
                 None
@@ -342,13 +344,14 @@ impl EasyMotion {
                 let trie = selection.trie();
                 let len = trie.len();
                 editor.clear_overlays::<Self>(cx);
-                let snapshot = editor.snapshot(cx);
+                let display_snapshot = editor.display_snapshot(cx);
+                let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
                 Self::add_overlays(
                     editor,
                     trie.iter(),
                     len,
-                    &snapshot.buffer_snapshot,
-                    &snapshot.display_snapshot,
+                    &buffer_snapshot,
+                    &display_snapshot,
                     cx,
                 );
                 Some(selection)
@@ -367,7 +370,7 @@ impl EasyMotion {
         len: usize,
         buffer_snapshot: &MultiBufferSnapshot,
         display_snapshot: &DisplaySnapshot,
-        cx: &mut ViewContext<Editor>,
+        cx: &mut Context<Editor>,
     ) {
         let overlays = trie_iter.filter_map(|(seq, overlay)| {
             let mut highlights = vec![(0..1, overlay.style)];
@@ -396,9 +399,9 @@ impl EasyMotion {
 
     fn update_overlays(
         &mut self,
-        view: View<Editor>,
+        view: Entity<Editor>,
         event: &EditorEvent,
-        cx: &mut ViewContext<Self>,
+        cx: &mut Context<Self>,
     ) {
         if !matches!(event, EditorEvent::Fold | EditorEvent::UnFold) {
             return;
@@ -408,21 +411,22 @@ impl EasyMotion {
         };
 
         view.update(cx, |editor, cx| {
-            let snapshot = editor.snapshot(cx);
+            let display_snapshot = editor.display_snapshot(cx);
+            let buffer_snapshot = editor.buffer().read(cx).snapshot(cx);
             editor.clear_overlays::<Self>(cx);
             Self::add_overlays(
                 editor,
                 state.trie().iter(),
                 state.trie().len(),
-                &snapshot.buffer_snapshot,
-                &snapshot.display_snapshot,
+                &buffer_snapshot,
+                &display_snapshot,
                 cx,
             );
         });
     }
 
-    fn get_highlights(cx: &AppContext) -> (HighlightStyle, HighlightStyle, HighlightStyle) {
-        let theme = &ThemeSettings::get_global(cx).active_theme;
+    fn get_highlights(cx: &App) -> (HighlightStyle, HighlightStyle, HighlightStyle) {
+        let theme = cx.theme();
         let players = &theme.players().0;
         let bg = theme.colors().background;
         let style_0 = HighlightStyle {
@@ -450,24 +454,18 @@ pub fn saturate(mut color: Hsla, s: f32) -> Hsla {
     color
 }
 
-#[derive(Deserialize)]
+#[derive(serde::Deserialize)]
 struct EasyMotionSettings {
     pub enabled: bool,
     pub keys: String,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
-struct EasyMotionSettingsContent {
-    pub enabled: Option<bool>,
-    pub keys: Option<String>,
-}
-
 impl Settings for EasyMotionSettings {
-    const KEY: Option<&'static str> = Some("easy_motion");
-
-    type FileContent = EasyMotionSettingsContent;
-
-    fn load(sources: SettingsSources<Self::FileContent>, _: &mut AppContext) -> Result<Self> {
-        sources.json_merge()
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let easy_motion = content.easy_motion.clone().unwrap();
+        Self {
+            enabled: easy_motion.enabled.unwrap(),
+            keys: easy_motion.keys.unwrap(),
+        }
     }
 }
