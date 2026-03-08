@@ -1,8 +1,8 @@
 use crate::{
-    AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DispatchEventResult, GPUSpecs,
+    AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DispatchEventResult, GpuSpecs,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, ScaledPixels, Size, TestPlatform, TileId, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowParams,
+    Point, PromptButton, RequestFrameOptions, Size, TestPlatform, TileId, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
 };
 use collections::HashMap;
 use parking_lot::Mutex;
@@ -19,8 +19,10 @@ pub(crate) struct TestWindowState {
     pub(crate) title: Option<String>,
     pub(crate) edited: bool,
     platform: Weak<TestPlatform>,
+    // TODO: Replace with `Rc`
     sprite_atlas: Arc<dyn PlatformAtlas>,
     pub(crate) should_close_handler: Option<Box<dyn FnMut() -> bool>>,
+    hit_test_window_control_callback: Option<Box<dyn FnMut() -> Option<WindowControlArea>>>,
     input_callback: Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>,
     active_status_change_callback: Option<Box<dyn FnMut(bool)>>,
     hover_status_change_callback: Option<Box<dyn FnMut(bool)>>,
@@ -31,7 +33,7 @@ pub(crate) struct TestWindowState {
 }
 
 #[derive(Clone)]
-pub(crate) struct TestWindow(pub(crate) Rc<Mutex<TestWindowState>>);
+pub struct TestWindow(pub(crate) Rc<Mutex<TestWindowState>>);
 
 impl HasWindowHandle for TestWindow {
     fn window_handle(
@@ -50,7 +52,7 @@ impl HasDisplayHandle for TestWindow {
 }
 
 impl TestWindow {
-    pub fn new(
+    pub(crate) fn new(
         handle: AnyWindowHandle,
         params: WindowParams,
         platform: Weak<TestPlatform>,
@@ -65,6 +67,7 @@ impl TestWindow {
             title: Default::default(),
             edited: false,
             should_close_handler: None,
+            hit_test_window_control_callback: None,
             input_callback: None,
             active_status_change_callback: None,
             hover_status_change_callback: None,
@@ -126,6 +129,11 @@ impl PlatformWindow for TestWindow {
         self.bounds().size
     }
 
+    fn resize(&mut self, size: Size<Pixels>) {
+        let mut lock = self.0.lock();
+        lock.bounds.size = size;
+    }
+
     fn scale_factor(&self) -> f32 {
         2.0
     }
@@ -146,6 +154,10 @@ impl PlatformWindow for TestWindow {
         crate::Modifiers::default()
     }
 
+    fn capslock(&self) -> crate::Capslock {
+        crate::Capslock::default()
+    }
+
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
         self.0.lock().input_handler = Some(input_handler);
     }
@@ -159,7 +171,7 @@ impl PlatformWindow for TestWindow {
         _level: crate::PromptLevel,
         msg: &str,
         detail: Option<&str>,
-        _answers: &[&str],
+        answers: &[PromptButton],
     ) -> Option<futures::channel::oneshot::Receiver<usize>> {
         Some(
             self.0
@@ -167,7 +179,7 @@ impl PlatformWindow for TestWindow {
                 .platform
                 .upgrade()
                 .expect("platform dropped")
-                .prompt(msg, detail),
+                .prompt(msg, detail, answers),
         )
     }
 
@@ -185,6 +197,14 @@ impl PlatformWindow for TestWindow {
     }
 
     fn is_hovered(&self) -> bool {
+        false
+    }
+
+    fn background_appearance(&self) -> WindowBackgroundAppearance {
+        WindowBackgroundAppearance::Opaque
+    }
+
+    fn is_subpixel_rendering_supported(&self) -> bool {
         false
     }
 
@@ -221,7 +241,7 @@ impl PlatformWindow for TestWindow {
         self.0.lock().is_fullscreen
     }
 
-    fn on_request_frame(&self, _callback: Box<dyn FnMut()>) {}
+    fn on_request_frame(&self, _callback: Box<dyn FnMut(RequestFrameOptions)>) {}
 
     fn on_input(&self, callback: Box<dyn FnMut(crate::PlatformInput) -> DispatchEventResult>) {
         self.0.lock().input_callback = Some(callback)
@@ -249,6 +269,10 @@ impl PlatformWindow for TestWindow {
 
     fn on_close(&self, _callback: Box<dyn FnOnce()>) {}
 
+    fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>) {
+        self.0.lock().hit_test_window_control_callback = Some(callback);
+    }
+
     fn on_appearance_changed(&self, _callback: Box<dyn FnMut()>) {}
 
     fn draw(&self, _scene: &crate::Scene) {}
@@ -274,9 +298,9 @@ impl PlatformWindow for TestWindow {
         unimplemented!()
     }
 
-    fn update_ime_position(&self, _bounds: Bounds<ScaledPixels>) {}
+    fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
 
-    fn gpu_specs(&self) -> Option<GPUSpecs> {
+    fn gpu_specs(&self) -> Option<GpuSpecs> {
         None
     }
 }
@@ -326,7 +350,7 @@ impl PlatformAtlas for TestAtlas {
             crate::AtlasTile {
                 texture_id: AtlasTextureId {
                     index: texture_id,
-                    kind: crate::AtlasTextureKind::Path,
+                    kind: crate::AtlasTextureKind::Monochrome,
                 },
                 tile_id: TileId(tile_id),
                 padding: 0,
@@ -338,5 +362,10 @@ impl PlatformAtlas for TestAtlas {
         );
 
         Ok(Some(state.tiles[key].clone()))
+    }
+
+    fn remove(&self, key: &AtlasKey) {
+        let mut state = self.0.lock();
+        state.tiles.remove(key);
     }
 }

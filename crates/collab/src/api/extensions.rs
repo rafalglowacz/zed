@@ -1,25 +1,24 @@
 use crate::db::ExtensionVersionConstraints;
-use crate::{db::NewExtensionVersion, AppState, Error, Result};
-use anyhow::{anyhow, Context as _};
+use crate::{AppState, Error, Result, db::NewExtensionVersion};
+use anyhow::Context as _;
 use aws_sdk_s3::presigning::PresigningConfig;
 use axum::{
+    Extension, Json, Router,
     extract::{Path, Query},
     http::StatusCode,
     response::Redirect,
     routing::get,
-    Extension, Json, Router,
 };
+use cloud_api_types::{ExtensionApiManifest, GetExtensionsResponse};
 use collections::HashMap;
-use rpc::{ExtensionApiManifest, GetExtensionsResponse};
-use semantic_version::SemanticVersion;
+use semver::Version as SemanticVersion;
 use serde::Deserialize;
 use std::{sync::Arc, time::Duration};
 use time::PrimitiveDateTime;
-use util::{maybe, ResultExt};
+use util::{ResultExt, maybe};
 
 pub fn router() -> Router {
     Router::new()
-        .route("/extensions", get(get_extensions))
         .route("/extensions/updates", get(get_extension_updates))
         .route("/extensions/:extension_id", get(get_extension_versions))
         .route(
@@ -33,61 +32,12 @@ pub fn router() -> Router {
 }
 
 #[derive(Debug, Deserialize)]
-struct GetExtensionsParams {
-    filter: Option<String>,
-    #[serde(default)]
-    max_schema_version: i32,
-}
-
-async fn get_extensions(
-    Extension(app): Extension<Arc<AppState>>,
-    Query(params): Query<GetExtensionsParams>,
-) -> Result<Json<GetExtensionsResponse>> {
-    let mut extensions = app
-        .db
-        .get_extensions(params.filter.as_deref(), params.max_schema_version, 500)
-        .await?;
-
-    if let Some(filter) = params.filter.as_deref() {
-        let extension_id = filter.to_lowercase();
-        let mut exact_match = None;
-        extensions.retain(|extension| {
-            if extension.id.as_ref() == extension_id {
-                exact_match = Some(extension.clone());
-                false
-            } else {
-                true
-            }
-        });
-        if exact_match.is_none() {
-            exact_match = app
-                .db
-                .get_extensions_by_ids(&[&extension_id], None)
-                .await?
-                .first()
-                .cloned();
-        }
-
-        if let Some(exact_match) = exact_match {
-            extensions.insert(0, exact_match);
-        }
-    };
-
-    if let Some(query) = params.filter.as_deref() {
-        let count = extensions.len();
-        tracing::info!(query, count, "extension_search")
-    }
-
-    Ok(Json(GetExtensionsResponse { data: extensions }))
-}
-
-#[derive(Debug, Deserialize)]
 struct GetExtensionUpdatesParams {
     ids: String,
     min_schema_version: i32,
     max_schema_version: i32,
-    min_wasm_api_version: SemanticVersion,
-    max_wasm_api_version: SemanticVersion,
+    min_wasm_api_version: semver::Version,
+    max_wasm_api_version: semver::Version,
 }
 
 async fn get_extension_updates(
@@ -159,7 +109,7 @@ async fn download_latest_extension(
         .db
         .get_extension(&params.extension_id, constraints.as_ref())
         .await?
-        .ok_or_else(|| anyhow!("unknown extension"))?;
+        .context("unknown extension")?;
     download_extension(
         Extension(app),
         Path(DownloadExtensionParams {
@@ -216,7 +166,7 @@ async fn download_extension(
         ))
         .presigned(PresigningConfig::expires_in(EXTENSION_DOWNLOAD_URL_LIFETIME).unwrap())
         .await
-        .map_err(|e| anyhow!("failed to create presigned extension download url {e}"))?;
+        .context("creating presigned extension download url")?;
 
     Ok(Redirect::temporary(url.uri()))
 }
@@ -315,8 +265,7 @@ async fn fetch_extensions_from_blob_store(
             if known_versions
                 .binary_search_by_key(&published_version, |known_version| known_version)
                 .is_err()
-            {
-                if let Some(extension) = fetch_extension_manifest(
+                && let Some(extension) = fetch_extension_manifest(
                     blob_store_client,
                     blob_store_bucket,
                     extension_id,
@@ -324,12 +273,11 @@ async fn fetch_extensions_from_blob_store(
                 )
                 .await
                 .log_err()
-                {
-                    new_versions
-                        .entry(extension_id)
-                        .or_default()
-                        .push(extension);
-                }
+            {
+                new_versions
+                    .entry(extension_id)
+                    .or_default()
+                    .push(extension);
             }
         }
     }
@@ -352,7 +300,7 @@ async fn fetch_extension_manifest(
     blob_store_bucket: &String,
     extension_id: &str,
     version: &str,
-) -> Result<NewExtensionVersion, anyhow::Error> {
+) -> anyhow::Result<NewExtensionVersion> {
     let object = blob_store_client
         .get_object()
         .bucket(blob_store_bucket)
@@ -375,8 +323,8 @@ async fn fetch_extension_manifest(
                 String::from_utf8_lossy(&manifest_bytes)
             )
         })?;
-    let published_at = object.last_modified.ok_or_else(|| {
-        anyhow!("missing last modified timestamp for extension {extension_id} version {version}")
+    let published_at = object.last_modified.with_context(|| {
+        format!("missing last modified timestamp for extension {extension_id} version {version}")
     })?;
     let published_at = time::OffsetDateTime::from_unix_timestamp_nanos(published_at.as_nanos())?;
     let published_at = PrimitiveDateTime::new(published_at.date(), published_at.time());
@@ -391,6 +339,7 @@ async fn fetch_extension_manifest(
         repository: manifest.repository,
         schema_version: manifest.schema_version.unwrap_or(0),
         wasm_api_version: manifest.wasm_api_version,
+        provides: manifest.provides,
         published_at,
     })
 }

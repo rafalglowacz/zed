@@ -1,9 +1,10 @@
 [package]
 name = "collections"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
 publish = false
 license = "Apache-2.0"
+description = "Standard collection type re-exports used by Zed and GPUI"
 
 [lints]
 workspace = true
@@ -16,4 +17,5 @@ doctest = false
 test-support = []
 
 [dependencies]
-rustc-hash = "1.1"
+indexmap.workspace = true
+rustc-hash.workspace = true

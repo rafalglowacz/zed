@@ -1,38 +1,23 @@
-mod assets;
 mod color;
 mod vscode;
 
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use indexmap::IndexMap;
+use anyhow::{Context as _, Result};
+use clap::Parser;
+use collections::IndexMap;
 use log::LevelFilter;
-use schemars::schema_for;
 use serde::Deserialize;
 use simplelog::ColorChoice;
 use simplelog::{TermLogger, TerminalMode};
-use theme::{Appearance, AppearanceContent, ThemeFamilyContent};
+use theme::{Appearance, AppearanceContent};
 
 use crate::vscode::VsCodeTheme;
 use crate::vscode::VsCodeThemeConverter;
 
-#[derive(Debug, Deserialize)]
-struct FamilyMetadata {
-    pub name: String,
-    pub author: String,
-    pub themes: Vec<ThemeMetadata>,
-
-    /// Overrides for specific syntax tokens.
-    ///
-    /// Use this to ensure certain Zed syntax tokens are matched
-    /// to an exact set of scopes when it is not otherwise possible
-    /// to rely on the default mappings in the theme importer.
-    #[serde(default)]
-    pub syntax: IndexMap<String, Vec<String>>,
-}
+const ZED_THEME_SCHEMA_URL: &str = "https://zed.dev/schema/themes/v0.2.0.json";
 
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -79,15 +64,6 @@ struct Args {
     /// The path to write the output to.
     #[arg(long, short)]
     output: Option<PathBuf>,
-
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    /// Prints the JSON schema for a theme.
-    PrintSchema,
 }
 
 fn main() -> Result<()> {
@@ -111,32 +87,18 @@ fn main() -> Result<()> {
     )
     .expect("could not initialize logger");
 
-    if let Some(command) = args.command {
-        match command {
-            Command::PrintSchema => {
-                let theme_family_schema = schema_for!(ThemeFamilyContent);
-
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&theme_family_schema).unwrap()
-                );
-
-                return Ok(());
-            }
-        }
-    }
-
     let theme_file_path = args.theme_path;
 
-    let theme_file = match File::open(&theme_file_path) {
-        Ok(file) => file,
+    let mut buffer = Vec::new();
+    match File::open(&theme_file_path).and_then(|mut file| file.read_to_end(&mut buffer)) {
+        Ok(_) => {}
         Err(err) => {
             log::info!("Failed to open file at path: {:?}", theme_file_path);
             return Err(err)?;
         }
     };
 
-    let vscode_theme: VsCodeTheme = serde_json_lenient::from_reader(theme_file)
+    let vscode_theme: VsCodeTheme = serde_json_lenient::from_slice(&buffer)
         .context(format!("failed to parse theme {theme_file_path:?}"))?;
 
     let theme_metadata = ThemeMetadata {
@@ -145,10 +107,14 @@ fn main() -> Result<()> {
         file_name: "".to_string(),
     };
 
-    let converter = VsCodeThemeConverter::new(vscode_theme, theme_metadata, IndexMap::new());
+    let converter = VsCodeThemeConverter::new(vscode_theme, theme_metadata, IndexMap::default());
 
     let theme = converter.convert()?;
-
+    let mut theme = serde_json::to_value(theme).unwrap();
+    theme.as_object_mut().unwrap().insert(
+        "$schema".to_string(),
+        serde_json::Value::String(ZED_THEME_SCHEMA_URL.to_string()),
+    );
     let theme_json = serde_json::to_string_pretty(&theme).unwrap();
 
     if let Some(output) = args.output {

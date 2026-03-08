@@ -1,8 +1,13 @@
+---
+title: Terraform
+description: "Configure Terraform language support in Zed, including language servers, formatting, and debugging."
+---
+
 # Terraform
 
-Terraform support is available through the [Terraform extension](https://github.com/zed-industries/zed/tree/main/extensions/terraform).
+Terraform support is available through the [Terraform extension](https://github.com/zed-extensions/terraform).
 
-- Tree sitter: [MichaHoffmann/tree-sitter-hcl](https://github.com/MichaHoffmann/tree-sitter-hcl)
+- Tree-sitter: [MichaHoffmann/tree-sitter-hcl](https://github.com/MichaHoffmann/tree-sitter-hcl)
 - Language Server: [hashicorp/terraform-ls](https://github.com/hashicorp/terraform-ls)
 
 ## Configuration
@@ -13,7 +18,7 @@ TBD: Add example using `rootModulePaths` to match upstream example https://githu
 
 The Terraform language server can be configured in your `settings.json`, e.g.:
 
-```json
+```json [settings]
 {
   "lsp": {
     "terraform-ls": {

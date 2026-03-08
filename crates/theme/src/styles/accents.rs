@@ -1,14 +1,16 @@
+use std::sync::Arc;
+
 use gpui::Hsla;
-use serde_derive::Deserialize;
+use serde::Deserialize;
 
 use crate::{
     amber, blue, cyan, gold, grass, indigo, iris, jade, lime, orange, pink, purple, tomato,
-    try_parse_color, AccentContent,
+    try_parse_color,
 };
 
 /// A collection of colors that are used to color indent aware lines in the editor.
-#[derive(Clone, Deserialize, PartialEq)]
-pub struct AccentColors(pub Vec<Hsla>);
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct AccentColors(pub Arc<[Hsla]>);
 
 impl Default for AccentColors {
     /// Don't use this!
@@ -22,7 +24,7 @@ impl Default for AccentColors {
 impl AccentColors {
     /// Returns the set of dark accent colors.
     pub fn dark() -> Self {
-        Self(vec![
+        Self(Arc::from(vec![
             blue().dark().step_9(),
             orange().dark().step_9(),
             pink().dark().step_9(),
@@ -36,12 +38,12 @@ impl AccentColors {
             grass().dark().step_9(),
             indigo().dark().step_9(),
             iris().dark().step_9(),
-        ])
+        ]))
     }
 
     /// Returns the set of light accent colors.
     pub fn light() -> Self {
-        Self(vec![
+        Self(Arc::from(vec![
             blue().light().step_9(),
             orange().light().step_9(),
             pink().light().step_9(),
@@ -55,7 +57,7 @@ impl AccentColors {
             grass().light().step_9(),
             indigo().light().step_9(),
             iris().light().step_9(),
-        ])
+        ]))
     }
 }
 
@@ -66,7 +68,7 @@ impl AccentColors {
     }
 
     /// Merges the given accent colors into this [`AccentColors`] instance.
-    pub fn merge(&mut self, accent_colors: &[AccentContent]) {
+    pub fn merge(&mut self, accent_colors: &[settings::AccentContent]) {
         if accent_colors.is_empty() {
             return;
         }
@@ -82,7 +84,7 @@ impl AccentColors {
             .collect::<Vec<_>>();
 
         if !colors.is_empty() {
-            self.0 = colors;
+            self.0 = Arc::from(colors);
         }
     }
 }

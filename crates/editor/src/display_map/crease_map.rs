@@ -1,13 +1,13 @@
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use gpui::{AnyElement, IntoElement};
 use multi_buffer::{Anchor, AnchorRangeExt, MultiBufferRow, MultiBufferSnapshot, ToPoint};
 use serde::{Deserialize, Serialize};
-use std::{cmp::Ordering, ops::Range, sync::Arc};
+use std::{cmp::Ordering, fmt::Debug, ops::Range, sync::Arc};
 use sum_tree::{Bias, SeekTarget, SumTree};
 use text::Point;
-use ui::{IconName, SharedString, WindowContext};
+use ui::{App, SharedString, Window};
 
-use crate::FoldPlaceholder;
+use crate::{BlockStyle, FoldPlaceholder, RenderBlock};
 
 #[derive(Copy, Clone, Default, Debug, Eq, PartialEq, PartialOrd, Ord, Hash)]
 pub struct CreaseId(usize);
@@ -19,6 +19,7 @@ pub struct CreaseMap {
 }
 
 impl CreaseMap {
+    #[ztracing::instrument(skip_all)]
     pub fn new(snapshot: &MultiBufferSnapshot) -> Self {
         CreaseMap {
             snapshot: CreaseSnapshot::new(snapshot),
@@ -40,23 +41,29 @@ impl CreaseSnapshot {
         }
     }
 
+    #[ztracing::instrument(skip_all)]
+    pub fn creases(&self) -> impl Iterator<Item = (CreaseId, &Crease<Anchor>)> {
+        self.creases.iter().map(|item| (item.id, &item.crease))
+    }
+
     /// Returns the first Crease starting on the specified buffer row.
+    #[ztracing::instrument(skip_all)]
     pub fn query_row<'a>(
         &'a self,
         row: MultiBufferRow,
         snapshot: &'a MultiBufferSnapshot,
-    ) -> Option<&'a Crease> {
+    ) -> Option<&'a Crease<Anchor>> {
         let start = snapshot.anchor_before(Point::new(row.0, 0));
         let mut cursor = self.creases.cursor::<ItemSummary>(snapshot);
-        cursor.seek(&start, Bias::Left, snapshot);
+        cursor.seek(&start, Bias::Left);
         while let Some(item) = cursor.item() {
-            match Ord::cmp(&item.crease.range.start.to_point(snapshot).row, &row.0) {
-                Ordering::Less => cursor.next(snapshot),
+            match Ord::cmp(&item.crease.range().start.to_point(snapshot).row, &row.0) {
+                Ordering::Less => cursor.next(),
                 Ordering::Equal => {
-                    if item.crease.range.start.is_valid(snapshot) {
+                    if item.crease.range().start.is_valid(snapshot) {
                         return Some(&item.crease);
                     } else {
-                        cursor.next(snapshot);
+                        cursor.next();
                     }
                 }
                 Ordering::Greater => break,
@@ -65,20 +72,22 @@ impl CreaseSnapshot {
         None
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn creases_in_range<'a>(
         &'a self,
         range: Range<MultiBufferRow>,
         snapshot: &'a MultiBufferSnapshot,
-    ) -> impl 'a + Iterator<Item = &'a Crease> {
+    ) -> impl 'a + Iterator<Item = &'a Crease<Anchor>> {
         let start = snapshot.anchor_before(Point::new(range.start.0, 0));
         let mut cursor = self.creases.cursor::<ItemSummary>(snapshot);
-        cursor.seek(&start, Bias::Left, snapshot);
+        cursor.seek(&start, Bias::Left);
 
         std::iter::from_fn(move || {
             while let Some(item) = cursor.item() {
-                cursor.next(snapshot);
-                let crease_start = item.crease.range.start.to_point(snapshot);
-                let crease_end = item.crease.range.end.to_point(snapshot);
+                cursor.next();
+                let crease_range = item.crease.range();
+                let crease_start = crease_range.start.to_point(snapshot);
+                let crease_end = crease_range.end.to_point(snapshot);
                 if crease_end.row > range.end.0 {
                     continue;
                 }
@@ -90,6 +99,7 @@ impl CreaseSnapshot {
         })
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn crease_items_with_offsets(
         &self,
         snapshot: &MultiBufferSnapshot,
@@ -97,12 +107,13 @@ impl CreaseSnapshot {
         let mut cursor = self.creases.cursor::<ItemSummary>(snapshot);
         let mut results = Vec::new();
 
-        cursor.next(snapshot);
+        cursor.next();
         while let Some(item) = cursor.item() {
-            let start_point = item.crease.range.start.to_point(snapshot);
-            let end_point = item.crease.range.end.to_point(snapshot);
+            let crease_range = item.crease.range();
+            let start_point = crease_range.start.to_point(snapshot);
+            let end_point = crease_range.end.to_point(snapshot);
             results.push((item.id, start_point..end_point));
-            cursor.next(snapshot);
+            cursor.next();
         }
 
         results
@@ -115,32 +126,67 @@ type RenderToggleFn = Arc<
         + Fn(
             MultiBufferRow,
             bool,
-            Arc<dyn Send + Sync + Fn(bool, &mut WindowContext)>,
-            &mut WindowContext,
+            Arc<dyn Send + Sync + Fn(bool, &mut Window, &mut App)>,
+            &mut Window,
+            &mut App,
         ) -> AnyElement,
 >;
 type RenderTrailerFn =
-    Arc<dyn Send + Sync + Fn(MultiBufferRow, bool, &mut WindowContext) -> AnyElement>;
+    Arc<dyn Send + Sync + Fn(MultiBufferRow, bool, &mut Window, &mut App) -> AnyElement>;
 
 #[derive(Clone)]
-pub struct Crease {
-    pub range: Range<Anchor>,
-    pub placeholder: FoldPlaceholder,
-    pub render_toggle: RenderToggleFn,
-    pub render_trailer: RenderTrailerFn,
-    pub metadata: Option<CreaseMetadata>,
+pub enum Crease<T> {
+    Inline {
+        range: Range<T>,
+        placeholder: FoldPlaceholder,
+        render_toggle: Option<RenderToggleFn>,
+        render_trailer: Option<RenderTrailerFn>,
+        metadata: Option<CreaseMetadata>,
+    },
+    Block {
+        range: Range<T>,
+        block_height: u32,
+        block_style: BlockStyle,
+        render_block: RenderBlock,
+        block_priority: usize,
+        render_toggle: Option<RenderToggleFn>,
+    },
 }
 
 /// Metadata about a [`Crease`], that is used for serialization.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreaseMetadata {
-    pub icon: IconName,
+    pub icon_path: SharedString,
     pub label: SharedString,
 }
 
-impl Crease {
-    pub fn new<RenderToggle, ToggleElement, RenderTrailer, TrailerElement>(
-        range: Range<Anchor>,
+impl<T> Crease<T> {
+    #[ztracing::instrument(skip_all)]
+    pub fn simple(range: Range<T>, placeholder: FoldPlaceholder) -> Self {
+        Crease::Inline {
+            range,
+            placeholder,
+            render_toggle: None,
+            render_trailer: None,
+            metadata: None,
+        }
+    }
+
+    #[ztracing::instrument(skip_all)]
+    pub fn block(range: Range<T>, height: u32, style: BlockStyle, render: RenderBlock) -> Self {
+        Self::Block {
+            range,
+            block_height: height,
+            block_style: style,
+            render_block: render,
+            block_priority: 0,
+            render_toggle: None,
+        }
+    }
+
+    #[ztracing::instrument(skip_all)]
+    pub fn inline<RenderToggle, ToggleElement, RenderTrailer, TrailerElement>(
+        range: Range<T>,
         placeholder: FoldPlaceholder,
         render_toggle: RenderToggle,
         render_trailer: RenderTrailer,
@@ -152,49 +198,99 @@ impl Crease {
             + Fn(
                 MultiBufferRow,
                 bool,
-                Arc<dyn Send + Sync + Fn(bool, &mut WindowContext)>,
-                &mut WindowContext,
+                Arc<dyn Send + Sync + Fn(bool, &mut Window, &mut App)>,
+                &mut Window,
+                &mut App,
             ) -> ToggleElement
             + 'static,
         ToggleElement: IntoElement,
         RenderTrailer: 'static
             + Send
             + Sync
-            + Fn(MultiBufferRow, bool, &mut WindowContext) -> TrailerElement
+            + Fn(MultiBufferRow, bool, &mut Window, &mut App) -> TrailerElement
             + 'static,
         TrailerElement: IntoElement,
     {
-        Crease {
+        Crease::Inline {
             range,
             placeholder,
-            render_toggle: Arc::new(move |row, folded, toggle, cx| {
-                render_toggle(row, folded, toggle, cx).into_any_element()
-            }),
-            render_trailer: Arc::new(move |row, folded, cx| {
-                render_trailer(row, folded, cx).into_any_element()
-            }),
+            render_toggle: Some(Arc::new(move |row, folded, toggle, window, cx| {
+                render_toggle(row, folded, toggle, window, cx).into_any_element()
+            })),
+            render_trailer: Some(Arc::new(move |row, folded, window, cx| {
+                render_trailer(row, folded, window, cx).into_any_element()
+            })),
             metadata: None,
         }
     }
 
-    pub fn with_metadata(mut self, metadata: CreaseMetadata) -> Self {
-        self.metadata = Some(metadata);
-        self
+    #[ztracing::instrument(skip_all)]
+    pub fn with_metadata(self, metadata: CreaseMetadata) -> Self {
+        match self {
+            Crease::Inline {
+                range,
+                placeholder,
+                render_toggle,
+                render_trailer,
+                ..
+            } => Crease::Inline {
+                range,
+                placeholder,
+                render_toggle,
+                render_trailer,
+                metadata: Some(metadata),
+            },
+            Crease::Block { .. } => self,
+        }
+    }
+
+    #[ztracing::instrument(skip_all)]
+    pub fn range(&self) -> &Range<T> {
+        match self {
+            Crease::Inline { range, .. } => range,
+            Crease::Block { range, .. } => range,
+        }
+    }
+
+    #[ztracing::instrument(skip_all)]
+    pub fn metadata(&self) -> Option<&CreaseMetadata> {
+        match self {
+            Self::Inline { metadata, .. } => metadata.as_ref(),
+            Self::Block { .. } => None,
+        }
     }
 }
 
-impl std::fmt::Debug for Crease {
+impl<T> std::fmt::Debug for Crease<T>
+where
+    T: Debug,
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Crease")
-            .field("range", &self.range)
-            .finish()
+        match self {
+            Crease::Inline {
+                range, metadata, ..
+            } => f
+                .debug_struct("Crease::Inline")
+                .field("range", range)
+                .field("metadata", metadata)
+                .finish_non_exhaustive(),
+            Crease::Block {
+                range,
+                block_height,
+                ..
+            } => f
+                .debug_struct("Crease::Block")
+                .field("range", range)
+                .field("height", block_height)
+                .finish_non_exhaustive(),
+        }
     }
 }
 
 #[derive(Clone, Debug)]
 struct CreaseItem {
     id: CreaseId,
-    crease: Crease,
+    crease: Crease<Anchor>,
 }
 
 impl CreaseMap {
@@ -202,9 +298,10 @@ impl CreaseMap {
         self.snapshot.clone()
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn insert(
         &mut self,
-        creases: impl IntoIterator<Item = Crease>,
+        creases: impl IntoIterator<Item = Crease<Anchor>>,
         snapshot: &MultiBufferSnapshot,
     ) -> Vec<CreaseId> {
         let mut new_ids = Vec::new();
@@ -212,54 +309,49 @@ impl CreaseMap {
             let mut new_creases = SumTree::new(snapshot);
             let mut cursor = self.snapshot.creases.cursor::<ItemSummary>(snapshot);
             for crease in creases {
-                new_creases.append(cursor.slice(&crease.range, Bias::Left, snapshot), snapshot);
+                let crease_range = crease.range().clone();
+                new_creases.append(cursor.slice(&crease_range, Bias::Left), snapshot);
 
                 let id = self.next_id;
                 self.next_id.0 += 1;
-                self.id_to_range.insert(id, crease.range.clone());
+                self.id_to_range.insert(id, crease_range);
                 new_creases.push(CreaseItem { crease, id }, snapshot);
                 new_ids.push(id);
             }
-            new_creases.append(cursor.suffix(snapshot), snapshot);
+            new_creases.append(cursor.suffix(), snapshot);
             new_creases
         };
         new_ids
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn remove(
         &mut self,
         ids: impl IntoIterator<Item = CreaseId>,
         snapshot: &MultiBufferSnapshot,
-    ) {
+    ) -> Vec<(CreaseId, Range<Anchor>)> {
         let mut removals = Vec::new();
+        let mut ids_to_remove = HashSet::default();
         for id in ids {
             if let Some(range) = self.id_to_range.remove(&id) {
-                removals.push((id, range.clone()));
+                ids_to_remove.insert(id);
+                removals.push((id, range));
             }
         }
-        removals.sort_unstable_by(|(a_id, a_range), (b_id, b_range)| {
-            AnchorRangeExt::cmp(a_range, b_range, snapshot).then(b_id.cmp(a_id))
-        });
 
-        self.snapshot.creases = {
-            let mut new_creases = SumTree::new(snapshot);
-            let mut cursor = self.snapshot.creases.cursor::<ItemSummary>(snapshot);
-
-            for (id, range) in removals {
-                new_creases.append(cursor.slice(&range, Bias::Left, snapshot), snapshot);
-                while let Some(item) = cursor.item() {
-                    cursor.next(snapshot);
-                    if item.id == id {
-                        break;
-                    } else {
+        if !ids_to_remove.is_empty() {
+            self.snapshot.creases = {
+                let mut new_creases = SumTree::new(snapshot);
+                for item in self.snapshot.creases.iter() {
+                    if !ids_to_remove.contains(&item.id) {
                         new_creases.push(item.clone(), snapshot);
                     }
                 }
-            }
+                new_creases
+            };
+        }
 
-            new_creases.append(cursor.suffix(snapshot), snapshot);
-            new_creases
-        };
+        removals
     }
 }
 
@@ -277,9 +369,9 @@ impl Default for ItemSummary {
 }
 
 impl sum_tree::Summary for ItemSummary {
-    type Context = MultiBufferSnapshot;
+    type Context<'a> = &'a MultiBufferSnapshot;
 
-    fn zero(_cx: &Self::Context) -> Self {
+    fn zero(_cx: Self::Context<'_>) -> Self {
         Default::default()
     }
 
@@ -291,21 +383,24 @@ impl sum_tree::Summary for ItemSummary {
 impl sum_tree::Item for CreaseItem {
     type Summary = ItemSummary;
 
+    #[ztracing::instrument(skip_all)]
     fn summary(&self, _cx: &MultiBufferSnapshot) -> Self::Summary {
         ItemSummary {
-            range: self.crease.range.clone(),
+            range: self.crease.range().clone(),
         }
     }
 }
 
 /// Implements `SeekTarget` for `Range<Anchor>` to enable seeking within a `SumTree` of `CreaseItem`s.
 impl SeekTarget<'_, ItemSummary, ItemSummary> for Range<Anchor> {
+    #[ztracing::instrument(skip_all)]
     fn cmp(&self, cursor_location: &ItemSummary, snapshot: &MultiBufferSnapshot) -> Ordering {
         AnchorRangeExt::cmp(self, &cursor_location.range, snapshot)
     }
 }
 
 impl SeekTarget<'_, ItemSummary, ItemSummary> for Anchor {
+    #[ztracing::instrument(skip_all)]
     fn cmp(&self, other: &ItemSummary, snapshot: &MultiBufferSnapshot) -> Ordering {
         self.cmp(&other.range.start, snapshot)
     }
@@ -314,11 +409,11 @@ impl SeekTarget<'_, ItemSummary, ItemSummary> for Anchor {
 #[cfg(test)]
 mod test {
     use super::*;
-    use gpui::{div, AppContext};
+    use gpui::{App, div};
     use multi_buffer::MultiBuffer;
 
     #[gpui::test]
-    fn test_insert_and_remove_creases(cx: &mut AppContext) {
+    fn test_insert_and_remove_creases(cx: &mut App) {
         let text = "line1\nline2\nline3\nline4\nline5";
         let buffer = MultiBuffer::build_simple(text, cx);
         let snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
@@ -326,17 +421,17 @@ mod test {
 
         // Insert creases
         let creases = [
-            Crease::new(
+            Crease::inline(
                 snapshot.anchor_before(Point::new(1, 0))..snapshot.anchor_after(Point::new(1, 5)),
                 FoldPlaceholder::test(),
-                |_row, _folded, _toggle, _cx| div(),
-                |_row, _folded, _cx| div(),
+                |_row, _folded, _toggle, _window, _cx| div(),
+                |_row, _folded, _window, _cx| div(),
             ),
-            Crease::new(
+            Crease::inline(
                 snapshot.anchor_before(Point::new(3, 0))..snapshot.anchor_after(Point::new(3, 5)),
                 FoldPlaceholder::test(),
-                |_row, _folded, _toggle, _cx| div(),
-                |_row, _folded, _cx| div(),
+                |_row, _folded, _toggle, _window, _cx| div(),
+                |_row, _folded, _window, _cx| div(),
             ),
         ];
         let crease_ids = crease_map.insert(creases, &snapshot);
@@ -344,51 +439,60 @@ mod test {
 
         // Verify creases are inserted
         let crease_snapshot = crease_map.snapshot();
-        assert!(crease_snapshot
-            .query_row(MultiBufferRow(1), &snapshot)
-            .is_some());
-        assert!(crease_snapshot
-            .query_row(MultiBufferRow(3), &snapshot)
-            .is_some());
+        assert!(
+            crease_snapshot
+                .query_row(MultiBufferRow(1), &snapshot)
+                .is_some()
+        );
+        assert!(
+            crease_snapshot
+                .query_row(MultiBufferRow(3), &snapshot)
+                .is_some()
+        );
 
         // Remove creases
         crease_map.remove(crease_ids, &snapshot);
 
         // Verify creases are removed
         let crease_snapshot = crease_map.snapshot();
-        assert!(crease_snapshot
-            .query_row(MultiBufferRow(1), &snapshot)
-            .is_none());
-        assert!(crease_snapshot
-            .query_row(MultiBufferRow(3), &snapshot)
-            .is_none());
+        assert!(
+            crease_snapshot
+                .query_row(MultiBufferRow(1), &snapshot)
+                .is_none()
+        );
+        assert!(
+            crease_snapshot
+                .query_row(MultiBufferRow(3), &snapshot)
+                .is_none()
+        );
     }
 
     #[gpui::test]
-    fn test_creases_in_range(cx: &mut AppContext) {
+    #[ztracing::instrument(skip_all)]
+    fn test_creases_in_range(cx: &mut App) {
         let text = "line1\nline2\nline3\nline4\nline5\nline6\nline7";
         let buffer = MultiBuffer::build_simple(text, cx);
         let snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
         let mut crease_map = CreaseMap::new(&snapshot);
 
         let creases = [
-            Crease::new(
+            Crease::inline(
                 snapshot.anchor_before(Point::new(1, 0))..snapshot.anchor_after(Point::new(1, 5)),
                 FoldPlaceholder::test(),
-                |_row, _folded, _toggle, _cx| div(),
-                |_row, _folded, _cx| div(),
+                |_row, _folded, _toggle, _window, _cx| div(),
+                |_row, _folded, _window, _cx| div(),
             ),
-            Crease::new(
+            Crease::inline(
                 snapshot.anchor_before(Point::new(3, 0))..snapshot.anchor_after(Point::new(3, 5)),
                 FoldPlaceholder::test(),
-                |_row, _folded, _toggle, _cx| div(),
-                |_row, _folded, _cx| div(),
+                |_row, _folded, _toggle, _window, _cx| div(),
+                |_row, _folded, _window, _cx| div(),
             ),
-            Crease::new(
+            Crease::inline(
                 snapshot.anchor_before(Point::new(5, 0))..snapshot.anchor_after(Point::new(5, 5)),
                 FoldPlaceholder::test(),
-                |_row, _folded, _toggle, _cx| div(),
-                |_row, _folded, _cx| div(),
+                |_row, _folded, _toggle, _window, _cx| div(),
+                |_row, _folded, _window, _cx| div(),
             ),
         ];
         crease_map.insert(creases, &snapshot);
@@ -402,12 +506,12 @@ mod test {
         let range = MultiBufferRow(2)..MultiBufferRow(5);
         let creases: Vec<_> = crease_snapshot.creases_in_range(range, &snapshot).collect();
         assert_eq!(creases.len(), 1);
-        assert_eq!(creases[0].range.start.to_point(&snapshot).row, 3);
+        assert_eq!(creases[0].range().start.to_point(&snapshot).row, 3);
 
         let range = MultiBufferRow(0)..MultiBufferRow(2);
         let creases: Vec<_> = crease_snapshot.creases_in_range(range, &snapshot).collect();
         assert_eq!(creases.len(), 1);
-        assert_eq!(creases[0].range.start.to_point(&snapshot).row, 1);
+        assert_eq!(creases[0].range().start.to_point(&snapshot).row, 1);
 
         let range = MultiBufferRow(6)..MultiBufferRow(7);
         let creases: Vec<_> = crease_snapshot.creases_in_range(range, &snapshot).collect();

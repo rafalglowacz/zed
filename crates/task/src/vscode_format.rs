@@ -3,7 +3,7 @@ use collections::HashMap;
 use serde::Deserialize;
 use util::ResultExt;
 
-use crate::{TaskTemplate, TaskTemplates, VariableName};
+use crate::{EnvVariableReplacer, TaskTemplate, TaskTemplates, VariableName};
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -13,15 +13,44 @@ struct TaskOptions {
     env: HashMap<String, String>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Debug, PartialEq)]
 struct VsCodeTaskDefinition {
     label: String,
-    #[serde(flatten)]
     command: Option<Command>,
-    #[serde(flatten)]
     other_attributes: HashMap<String, serde_json_lenient::Value>,
     options: Option<TaskOptions>,
+}
+
+impl<'de> serde::Deserialize<'de> for VsCodeTaskDefinition {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct TaskHelper {
+            #[serde(default)]
+            label: Option<String>,
+            #[serde(flatten)]
+            command: Option<Command>,
+            #[serde(flatten)]
+            other_attributes: HashMap<String, serde_json_lenient::Value>,
+            options: Option<TaskOptions>,
+        }
+
+        let helper = TaskHelper::deserialize(deserializer)?;
+
+        let label = helper
+            .label
+            .unwrap_or_else(|| generate_label(&helper.command));
+
+        Ok(VsCodeTaskDefinition {
+            label,
+            command: helper.command,
+            other_attributes: helper.other_attributes,
+            options: helper.options,
+        })
+    }
 }
 
 #[derive(Clone, Deserialize, PartialEq, Debug)]
@@ -41,52 +70,32 @@ enum Command {
     },
 }
 
-type VsCodeEnvVariable = String;
-type ZedEnvVariable = String;
-
-struct EnvVariableReplacer {
-    variables: HashMap<VsCodeEnvVariable, ZedEnvVariable>,
-}
-
-impl EnvVariableReplacer {
-    fn new(variables: HashMap<VsCodeEnvVariable, ZedEnvVariable>) -> Self {
-        Self { variables }
-    }
-    // Replaces occurrences of VsCode-specific environment variables with Zed equivalents.
-    fn replace(&self, input: &str) -> String {
-        shellexpand::env_with_context_no_errors(&input, |var: &str| {
-            // Colons denote a default value in case the variable is not set. We want to preserve that default, as otherwise shellexpand will substitute it for us.
-            let colon_position = var.find(':').unwrap_or(var.len());
-            let (variable_name, default) = var.split_at(colon_position);
-            let append_previous_default = |ret: &mut String| {
-                if !default.is_empty() {
-                    ret.push_str(default);
-                }
-            };
-            if let Some(substitution) = self.variables.get(variable_name) {
-                // Got a VSCode->Zed hit, perform a substitution
-                let mut name = format!("${{{substitution}");
-                append_previous_default(&mut name);
-                name.push('}');
-                return Some(name);
+fn generate_label(command: &Option<Command>) -> String {
+    match command {
+        Some(Command::Npm { script }) => format!("npm: {}", script),
+        Some(Command::Gulp { task }) => format!("gulp: {}", task),
+        Some(Command::Shell { command, .. }) => {
+            if command.trim().is_empty() {
+                "shell".to_string()
+            } else {
+                command.clone()
             }
-            // This is an unknown variable.
-            // We should not error out, as they may come from user environment (e.g. $PATH). That means that the variable substitution might not be perfect.
-            // If there's a default, we need to return the string verbatim as otherwise shellexpand will apply that default for us.
-            if !default.is_empty() {
-                return Some(format!("${{{var}}}"));
-            }
-            // Else we can just return None and that variable will be left as is.
-            None
-        })
-        .into_owned()
+        }
+        None => "Untitled Task".to_string(),
     }
 }
 
 impl VsCodeTaskDefinition {
-    fn into_zed_format(self, replacer: &EnvVariableReplacer) -> anyhow::Result<TaskTemplate> {
+    fn into_zed_format(
+        self,
+        replacer: &EnvVariableReplacer,
+    ) -> anyhow::Result<Option<TaskTemplate>> {
         if self.other_attributes.contains_key("dependsOn") {
-            bail!("Encountered unsupported `dependsOn` key during deserialization");
+            log::warn!(
+                "Skipping deserializing of a task `{}` with the unsupported `dependsOn` key",
+                self.label
+            );
+            return Ok(None);
         }
         // `type` might not be set in e.g. tasks that use `dependsOn`; we still want to deserialize the whole object though (hence command is an Option),
         // as that way we can provide more specific description of why deserialization failed.
@@ -104,17 +113,17 @@ impl VsCodeTaskDefinition {
         // Per VSC docs, only `command`, `args` and `options` support variable substitution.
         let command = replacer.replace(&command);
         let args = args.into_iter().map(|arg| replacer.replace(&arg)).collect();
-        let mut ret = TaskTemplate {
+        let mut template = TaskTemplate {
             label: self.label,
             command,
             args,
-            ..Default::default()
+            ..TaskTemplate::default()
         };
         if let Some(options) = self.options {
-            ret.cwd = options.cwd.map(|cwd| replacer.replace(&cwd));
-            ret.env = options.env;
+            template.cwd = options.cwd.map(|cwd| replacer.replace(&cwd));
+            template.env = options.env;
         }
-        Ok(ret)
+        Ok(Some(template))
     }
 }
 
@@ -143,7 +152,12 @@ impl TryFrom<VsCodeTaskFile> for TaskTemplates {
         let templates = value
             .tasks
             .into_iter()
-            .filter_map(|vscode_definition| vscode_definition.into_zed_format(&replacer).log_err())
+            .filter_map(|vscode_definition| {
+                vscode_definition
+                    .into_zed_format(&replacer)
+                    .log_err()
+                    .flatten()
+            })
             .collect();
         Ok(Self(templates))
     }
@@ -154,11 +168,11 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::{
-        vscode_format::{Command, VsCodeTaskDefinition},
         TaskTemplate, TaskTemplates, VsCodeTaskFile,
+        vscode_format::{Command, VsCodeTaskDefinition},
     };
 
-    use super::EnvVariableReplacer;
+    use super::{EnvVariableReplacer, generate_label};
 
     fn compare_without_other_attributes(lhs: VsCodeTaskDefinition, rhs: VsCodeTaskDefinition) {
         assert_eq!(
@@ -387,5 +401,63 @@ mod tests {
         ];
         let tasks: TaskTemplates = vscode_definitions.try_into().unwrap();
         assert_eq!(tasks.0, expected);
+    }
+
+    #[test]
+    fn can_deserialize_tasks_without_labels() {
+        const TASKS_WITHOUT_LABELS: &str = include_str!("../test_data/tasks-without-labels.json");
+        let vscode_definitions: VsCodeTaskFile =
+            serde_json_lenient::from_str(TASKS_WITHOUT_LABELS).unwrap();
+
+        assert_eq!(vscode_definitions.tasks.len(), 4);
+        assert_eq!(vscode_definitions.tasks[0].label, "npm: start");
+        assert_eq!(vscode_definitions.tasks[1].label, "Explicit Label");
+        assert_eq!(vscode_definitions.tasks[2].label, "gulp: build");
+        assert_eq!(vscode_definitions.tasks[3].label, "echo hello");
+    }
+
+    #[test]
+    fn test_generate_label() {
+        assert_eq!(
+            generate_label(&Some(Command::Npm {
+                script: "start".to_string()
+            })),
+            "npm: start"
+        );
+        assert_eq!(
+            generate_label(&Some(Command::Gulp {
+                task: "build".to_string()
+            })),
+            "gulp: build"
+        );
+        assert_eq!(
+            generate_label(&Some(Command::Shell {
+                command: "echo hello".to_string(),
+                args: vec![]
+            })),
+            "echo hello"
+        );
+        assert_eq!(
+            generate_label(&Some(Command::Shell {
+                command: "cargo build --release".to_string(),
+                args: vec![]
+            })),
+            "cargo build --release"
+        );
+        assert_eq!(
+            generate_label(&Some(Command::Shell {
+                command: "  ".to_string(),
+                args: vec![]
+            })),
+            "shell"
+        );
+        assert_eq!(
+            generate_label(&Some(Command::Shell {
+                command: "".to_string(),
+                args: vec![]
+            })),
+            "shell"
+        );
+        assert_eq!(generate_label(&None), "Untitled Task");
     }
 }

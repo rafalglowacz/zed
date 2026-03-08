@@ -1,23 +1,43 @@
+(identifier) @variable
+
 (type_identifier) @type
-(field_identifier) @variable.member
+
+(type_spec
+  name: (type_identifier) @type.definition)
+
+(field_identifier) @property
+
+(package_identifier) @namespace
+
+(label_name) @label
 
 (keyed_element
   .
   (literal_element
-    (identifier) @variable.member))
+    (identifier) @property))
 
 (call_expression
-  function: (identifier) @function)
+  function: (identifier) @function.call)
 
 (call_expression
   function: (selector_expression
-    field: (field_identifier) @function.method))
+    field: (field_identifier) @function.method.call))
 
 (function_declaration
   name: (identifier) @function)
 
 (method_declaration
   name: (field_identifier) @function.method)
+
+(method_elem
+  name: (field_identifier) @function.method)
+
+[
+  ";"
+  "."
+  ","
+  ":"
+] @punctuation.delimiter
 
 [
   "("
@@ -116,8 +136,18 @@
 [
   (true)
   (false)
+] @boolean
+
+[
   (nil)
   (iota)
 ] @constant.builtin
 
 (comment) @comment
+
+; Go directives
+((comment) @preproc
+  (#match? @preproc "^//go:"))
+
+((comment) @preproc
+  (#match? @preproc "^// \\+build"))

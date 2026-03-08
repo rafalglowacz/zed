@@ -1,17 +1,26 @@
-use gpui::{actions, impl_actions};
+use gpui::{Action, actions};
 use gpui_macros::register_action;
-use serde_derive::Deserialize;
+use schemars::JsonSchema;
+use serde::Deserialize;
 
 #[test]
 fn test_action_macros() {
-    actions!(test, [TestAction]);
+    actions!(
+        test_only,
+        [
+            SomeAction,
+            /// Documented action
+            SomeActionWithDocs,
+        ]
+    );
 
-    #[derive(PartialEq, Clone, Deserialize)]
-    struct AnotherTestAction;
+    #[derive(PartialEq, Clone, Deserialize, JsonSchema, Action)]
+    #[action(namespace = test_only)]
+    #[serde(deny_unknown_fields)]
+    struct AnotherAction;
 
-    impl_actions!(test, [AnotherTestAction]);
-
-    #[derive(PartialEq, Clone, gpui::private::serde_derive::Deserialize)]
+    #[derive(PartialEq, Clone, gpui::private::serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct RegisterableAction {}
 
     register_action!(RegisterableAction);
@@ -21,19 +30,15 @@ fn test_action_macros() {
             unimplemented!()
         }
 
-        fn as_any(&self) -> &dyn std::any::Any {
-            unimplemented!()
-        }
-
         fn partial_eq(&self, _action: &dyn gpui::Action) -> bool {
             unimplemented!()
         }
 
-        fn name(&self) -> &str {
+        fn name(&self) -> &'static str {
             unimplemented!()
         }
 
-        fn debug_name() -> &'static str
+        fn name_for_type() -> &'static str
         where
             Self: Sized,
         {

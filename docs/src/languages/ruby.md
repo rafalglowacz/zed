@@ -1,3 +1,8 @@
+---
+title: Ruby
+description: "Configure Ruby language support in Zed, including language servers, formatting, and debugging."
+---
+
 # Ruby
 
 Ruby support is available through the [Ruby extension](https://github.com/zed-extensions/ruby).
@@ -9,6 +14,8 @@ Ruby support is available through the [Ruby extension](https://github.com/zed-ex
   - [ruby-lsp](https://github.com/Shopify/ruby-lsp)
   - [solargraph](https://github.com/castwide/solargraph)
   - [rubocop](https://github.com/rubocop/rubocop)
+  - [Herb](https://herb-tools.dev)
+- Debug Adapter: [`rdbg`](https://github.com/ruby/debug)
 
 The Ruby extension also provides support for ERB files.
 
@@ -21,11 +28,40 @@ There are multiple language servers available for Ruby. Zed supports the two fol
 
 They both have an overlapping feature set of autocomplete, diagnostics, code actions, etc. and it's up to you to decide which one you want to use. Note that you can't use both at the same time.
 
-In addition to these two language servers, Zed also supports [rubocop](https://github.com/rubocop/rubocop) which is a static code analyzer and linter for Ruby. Under the hood, it's also used by Zed as a language server, but its functionality is complimentary to that of solargraph and ruby-lsp.
+In addition to these two language servers, Zed also supports:
+
+- [rubocop](https://github.com/rubocop/rubocop) which is a static code analyzer and linter for Ruby. Under the hood, it's also used by Zed as a language server, but its functionality is complimentary to that of solargraph and ruby-lsp.
+- [sorbet](https://sorbet.org/) which is a static type checker for Ruby with a custom gradual type system.
+- [steep](https://github.com/soutaro/steep) which is a static type checker for Ruby that uses Ruby Signature (RBS).
+- [Herb](https://herb-tools.dev) which is a language server for ERB files.
+
+When configuring a language server, it helps to open the LSP Logs window using the 'dev: Open Language Server Logs' command. You can then choose the corresponding language instance to see any logged information.
 
 ## Configuring a language server
 
 The [Ruby extension](https://github.com/zed-extensions/ruby) offers both `solargraph` and `ruby-lsp` language server support.
+
+### Language Server Activation
+
+For all supported Ruby language servers (`solargraph`, `ruby-lsp`, `rubocop`, `sorbet`, and `steep`), the Ruby extension follows this activation sequence:
+
+1. If the language server is found in your project's `Gemfile`, it will be used through `bundle exec`.
+2. If not found in the `Gemfile`, the Ruby extension will look for the executable in your system `PATH`.
+3. If the language server is not found in either location, the Ruby extension will automatically install it as a global gem (note: this will not install to your current Ruby gemset).
+
+You can skip step 1 and force using the system executable by setting `use_bundler` to `false` in your settings:
+
+```json [settings]
+{
+  "lsp": {
+    "<SERVER_NAME>": {
+      "settings": {
+        "use_bundler": false
+      }
+    }
+  }
+}
+```
 
 ### Using `solargraph`
 
@@ -33,27 +69,39 @@ The [Ruby extension](https://github.com/zed-extensions/ruby) offers both `solarg
 
 ### Using `ruby-lsp`
 
-To switch to `ruby-lsp`, add the following to your `settings.json`:
+Configure language servers in Settings ({#kb zed::OpenSettings}) under Languages > Ruby, or add to your settings file:
 
-```json
+```json [settings]
 {
   "languages": {
     "Ruby": {
       "language_servers": ["ruby-lsp", "!solargraph", "!rubocop", "..."]
+    },
+    // Enable herb and ruby-lsp for *.html.erb files
+    "HTML+ERB": {
+      "language_servers": ["herb", "ruby-lsp", "..."]
+    },
+    // Enable ruby-lsp for *.js.erb files
+    "JS+ERB": {
+      "language_servers": ["ruby-lsp", "..."]
+    },
+    // Enable ruby-lsp for *.yaml.erb files
+    "YAML+ERB": {
+      "language_servers": ["ruby-lsp", "..."]
     }
   }
 }
 ```
 
-That disables `solargraph` and `rubocop` and enables `ruby-lsp`.
+That disables `solargraph` and `rubocop` and uses `ruby-lsp`.
 
 ### Using `rubocop`
 
 The Ruby extension also provides support for `rubocop` language server for offense detection and autocorrection.
 
-To enable it, add the following to your `settings.json`:
+Configure language servers in Settings ({#kb zed::OpenSettings}) under Languages > Ruby, or add to your settings file:
 
-```json
+```json [settings]
 {
   "languages": {
     "Ruby": {
@@ -63,9 +111,9 @@ To enable it, add the following to your `settings.json`:
 }
 ```
 
-Or, conversely, you can disable `ruby-lsp` and enable `solargraph` and `rubocop` by adding the following to your `settings.json`:
+Or, conversely, you can disable `ruby-lsp` and enable `solargraph` and `rubocop`:
 
-```json
+```json [settings]
 {
   "languages": {
     "Ruby": {
@@ -77,23 +125,9 @@ Or, conversely, you can disable `ruby-lsp` and enable `solargraph` and `rubocop`
 
 ## Setting up `solargraph`
 
-Zed currently doesn't install Solargraph automatically. To use Solargraph, you need to install the gem. Zed just looks for an executable called `solargraph` on your `PATH`.
-
-You can install the gem manually with the following command:
-
-```sh
-gem install solargraph
-```
-
-Alternatively, if your project uses Bundler, you can add the Solargraph gem to your `Gemfile`:
-
-```rb
-gem 'solargraph', group: :development
-```
-
 Solargraph has formatting and diagnostics disabled by default. We can tell Zed to enable them by adding the following to your `settings.json`:
 
-```json
+```json [settings]
 {
   "lsp": {
     "solargraph": {
@@ -106,37 +140,15 @@ Solargraph has formatting and diagnostics disabled by default. We can tell Zed t
 }
 ```
 
-To use Solargraph in the context of the bundle, you can use [folder-specific settings](../configuring-zed.md#settings-files) and specify the absolute path to the [`binstub`](https://bundler.io/v2.5/man/bundle-binstubs.1.html) of Solargraph:
-
-```json
-{
-  "lsp": {
-    "solargraph": {
-      "binary": {
-        "path": "<path_to_your_project>/bin/solargraph"
-      }
-    }
-  }
-}
-```
-
 ### Configuration
 
 Solargraph reads its configuration from a file called `.solargraph.yml` in the root of your project. For more information about this file, see the [Solargraph configuration documentation](https://solargraph.org/guides/configuration).
 
 ## Setting up `ruby-lsp`
 
-Zed currently doesn't install Ruby LSP automatically. To use Ruby LSP, you need to install the gem. Zed just looks for an executable called `ruby-lsp` on your `PATH`.
+You can pass Ruby LSP configuration to `initialization_options`, e.g.
 
-You can install the gem manually with the following command:
-
-```sh
-gem install ruby-lsp
-```
-
-Ruby LSP uses pull-based diagnostics which Zed doesn't support yet. We can tell Zed to disable it by adding the following to your `settings.json`:
-
-```json
+```json [settings]
 {
   "languages": {
     "Ruby": {
@@ -147,9 +159,25 @@ Ruby LSP uses pull-based diagnostics which Zed doesn't support yet. We can tell 
     "ruby-lsp": {
       "initialization_options": {
         "enabledFeatures": {
-          // This disables diagnostics
-          "diagnostics": false
+          // "someFeature": false
         }
+      }
+    }
+  }
+}
+```
+
+For full configuration options, see the [Ruby LSP website](https://shopify.github.io/ruby-lsp/editors.html).
+
+LSP `settings` and `initialization_options` can also be project-specific. For example to use [standardrb/standard](https://github.com/standardrb/standard) as a formatter and linter for a particular project, add this to a `.zed/settings.json` inside your project repo:
+
+```json [settings]
+{
+  "lsp": {
+    "ruby-lsp": {
+      "initialization_options": {
+        "formatter": "standard",
+        "linters": ["standard"]
       }
     }
   }
@@ -158,17 +186,9 @@ Ruby LSP uses pull-based diagnostics which Zed doesn't support yet. We can tell 
 
 ## Setting up `rubocop` LSP
 
-Zed currently doesn't install `rubocop` automatically. To use `rubocop`, you need to install the gem. Zed just looks for an executable called `rubocop` on your `PATH`.
-
-You can install the gem manually with the following command:
-
-```sh
-gem install rubocop
-```
-
 Rubocop has unsafe autocorrection disabled by default. We can tell Zed to enable it by adding the following to your `settings.json`:
 
-```json
+```json [settings]
 {
   "languages": {
     "Ruby": {
@@ -193,40 +213,69 @@ Rubocop has unsafe autocorrection disabled by default. We can tell Zed to enable
 }
 ```
 
-To use Rubocop in the context of the bundle, you can use [folder-specific settings](../configuring-zed.md#settings-files) and specify the absolute path to the [`binstub`](https://bundler.io/v2.5/man/bundle-binstubs.1.html) of Rubocop:
+## Setting up Sorbet
 
-```json
+[Sorbet](https://sorbet.org/) is a popular static type checker for Ruby that includes a language server.
+
+To enable Sorbet, add `\"sorbet\"` to the `language_servers` list for Ruby. You may want to disable other language servers if Sorbet is intended to be your primary LSP, or if you plan to use it alongside another LSP for specific features like type checking.
+
+Configure language servers in Settings ({#kb zed::OpenSettings}) under Languages > Ruby, or add to your settings file:
+
+```json [settings]
 {
-  "lsp": {
-    "rubocop": {
-      "binary": {
-        "path": "<path_to_your_project>/bin/rubocop"
-      }
+  "languages": {
+    "Ruby": {
+      "language_servers": [
+        "ruby-lsp",
+        "sorbet",
+        "!rubocop",
+        "!solargraph",
+        "..."
+      ]
     }
   }
 }
 ```
 
-## Using the Tailwind CSS Language Server with Ruby
+For all aspects of installing Sorbet, setting it up in your project, and configuring its behavior, please refer to the [official Sorbet documentation](https://sorbet.org/docs/overview).
 
-It's possible to use the [Tailwind CSS Language Server](https://github.com/tailwindlabs/tailwindcss-intellisense/tree/HEAD/packages/tailwindcss-language-server#readme) in Ruby and ERB files.
+## Setting up Steep
 
-In order to do that, you need to configure the language server so that it knows about where to look for CSS classes in Ruby/ERB files by adding the following to your `settings.json`:
+[Steep](https://github.com/soutaro/steep) is a static type checker for Ruby that uses RBS files to define types.
 
-```json
+To enable Steep, add `\"steep\"` to the `language_servers` list for Ruby. You may need to adjust the order or disable other LSPs depending on your desired setup.
+
+Configure language servers in Settings ({#kb zed::OpenSettings}) under Languages > Ruby, or add to your settings file:
+
+```json [settings]
 {
   "languages": {
     "Ruby": {
-      "language_servers": ["tailwindcss-language-server", "..."]
+      "language_servers": [
+        "ruby-lsp",
+        "steep",
+        "!solargraph",
+        "!rubocop",
+        "..."
+      ]
     }
-  },
+  }
+}
+```
+
+## Setting up Herb
+
+`Herb` is enabled by default for the `HTML+ERB` language.
+
+## Using the Tailwind CSS Language Server with Ruby
+
+To get all the features (autocomplete, linting, etc.) from the [Tailwind CSS language server](https://github.com/tailwindlabs/tailwindcss-intellisense/tree/HEAD/packages/tailwindcss-language-server#readme) in Ruby/ERB files, you need to configure the language server so that it knows about where to look for CSS classes by adding the following to your `settings.json`:
+
+```json [settings]
+{
   "lsp": {
     "tailwindcss-language-server": {
       "settings": {
-        "includeLanguages": {
-          "erb": "html",
-          "ruby": "html"
-        },
         "experimental": {
           "classRegex": ["\\bclass:\\s*['\"]([^'\"]*)['\"]"]
         }
@@ -236,7 +285,7 @@ In order to do that, you need to configure the language server so that it knows 
 }
 ```
 
-With these settings you will get completions for Tailwind CSS classes in HTML attributes inside ERB files and inside Ruby/ERB strings that are coming after a `class:` key. Examples:
+With these settings, you will get completions for Tailwind CSS classes in HTML attributes inside ERB files and inside Ruby/ERB strings that are coming after a `class:` key. Examples:
 
 ```rb
 # Ruby file:
@@ -255,14 +304,43 @@ end
 
 To run tests in your Ruby project, you can set up custom tasks in your local `.zed/tasks.json` configuration file. These tasks can be defined to work with different test frameworks like Minitest, RSpec, quickdraw, and tldr. Below are some examples of how to set up these tasks to run your tests from within your editor.
 
-### Minitest
+### Minitest with Rails
 
-```json
+```json [tasks]
 [
   {
-    "label": "test $ZED_RELATIVE_FILE:$ZED_ROW",
-    "command": "bundle exec rails",
-    "args": ["test", "\"$ZED_RELATIVE_FILE:$ZED_ROW\""],
+    "label": "test $ZED_RELATIVE_FILE -n /$ZED_CUSTOM_RUBY_TEST_NAME/",
+    "command": "bin/rails",
+    "args": [
+      "test",
+      "$ZED_RELATIVE_FILE",
+      "-n",
+      "\"$ZED_CUSTOM_RUBY_TEST_NAME\""
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "tags": ["ruby-test"]
+  }
+]
+```
+
+### Minitest
+
+Plain minitest does not support running tests by line number, only by name, so we need to use `$ZED_CUSTOM_RUBY_TEST_NAME` instead:
+
+```json [tasks]
+[
+  {
+    "label": "-Itest $ZED_RELATIVE_FILE -n /$ZED_CUSTOM_RUBY_TEST_NAME/",
+    "command": "bundle",
+    "args": [
+      "exec",
+      "ruby",
+      "-Itest",
+      "$ZED_RELATIVE_FILE",
+      "-n",
+      "\"$ZED_CUSTOM_RUBY_TEST_NAME\""
+    ],
+    "cwd": "$ZED_WORKTREE_ROOT",
     "tags": ["ruby-test"]
   }
 ]
@@ -270,39 +348,77 @@ To run tests in your Ruby project, you can set up custom tasks in your local `.z
 
 ### RSpec
 
-```json
+```json [tasks]
 [
   {
     "label": "test $ZED_RELATIVE_FILE:$ZED_ROW",
-    "command": "bundle exec rspec",
-    "args": ["\"$ZED_RELATIVE_FILE:$ZED_ROW\""],
+    "command": "bundle",
+    "args": ["exec", "rspec", "\"$ZED_RELATIVE_FILE:$ZED_ROW\""],
+    "cwd": "$ZED_WORKTREE_ROOT",
     "tags": ["ruby-test"]
   }
 ]
 ```
 
-### quickdraw
+Similar task syntax can be used for other test frameworks such as `quickdraw` or `tldr`.
 
-```json
+## Debugging
+
+The Ruby extension provides a debug adapter for debugging Ruby code. Zed's name for the adapter (in the UI and `debug.json`) is `rdbg`, and under the hood, it uses the [`debug`](https://github.com/ruby/debug) gem. The extension uses the [same activation logic](#language-server-activation) as the language servers.
+
+### Examples
+
+#### Debug a Ruby script
+
+```json [debug]
 [
   {
-    "label": "test $ZED_RELATIVE_FILE:$ZED_ROW",
-    "command": "bundle exec qt",
-    "args": ["\"$ZED_RELATIVE_FILE:$ZED_ROW\""],
-    "tags": ["ruby-test"]
+    "label": "Debug current file",
+    "adapter": "rdbg",
+    "request": "launch",
+    "script": "$ZED_FILE",
+    "cwd": "$ZED_WORKTREE_ROOT"
   }
 ]
 ```
 
-### tldr
+#### Debug Rails server
 
-```json
+```json [debug]
 [
   {
-    "label": "test $ZED_RELATIVE_FILE:$ZED_ROW",
-    "command": "bundle exec tldr",
-    "args": ["\"$ZED_RELATIVE_FILE:$ZED_ROW\""],
-    "tags": ["ruby-test"]
+    "label": "Debug Rails server",
+    "adapter": "rdbg",
+    "request": "launch",
+    "command": "./bin/rails",
+    "args": ["server"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "env": {
+      "RUBY_DEBUG_OPEN": "true"
+    }
   }
 ]
+```
+
+## Formatters
+
+### `erb-formatter`
+
+To format ERB templates, you can use the `erb-formatter` formatter. This formatter uses the [`erb-formatter`](https://rubygems.org/gems/erb-formatter) gem to format ERB templates.
+
+Configure formatting in Settings ({#kb zed::OpenSettings}) under Languages > HTML+ERB, or add to your settings file:
+
+```json [settings]
+{
+  "languages": {
+    "HTML+ERB": {
+      "formatter": {
+        "external": {
+          "command": "erb-formatter",
+          "arguments": ["--stdin-filename", "{buffer_path}"]
+        }
+      }
+    }
+  }
+}
 ```

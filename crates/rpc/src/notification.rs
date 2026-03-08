@@ -1,7 +1,7 @@
 use crate::proto;
 use serde::{Deserialize, Serialize};
-use serde_json::{map, Value};
-use strum::{EnumVariantNames, VariantNames as _};
+use serde_json::{Value, map};
+use strum::VariantNames;
 
 const KIND: &str = "kind";
 const ENTITY_ID: &str = "entity_id";
@@ -15,7 +15,7 @@ const ENTITY_ID: &str = "entity_id";
 /// Most notification types have a special field which is aliased to
 /// `entity_id`. This field is stored in its own database column, and can
 /// be used to query the notification.
-#[derive(Debug, Clone, PartialEq, Eq, EnumVariantNames, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, VariantNames, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 pub enum Notification {
     ContactRequest {
@@ -32,12 +32,6 @@ pub enum Notification {
         channel_name: String,
         inviter_id: u64,
     },
-    ChannelMessageMention {
-        #[serde(rename = "entity_id")]
-        message_id: u64,
-        sender_id: u64,
-        channel_id: u64,
-    },
 }
 
 impl Notification {
@@ -48,10 +42,10 @@ impl Notification {
         let Some(Value::String(kind)) = value.remove(KIND) else {
             unreachable!("kind is the enum tag")
         };
-        if let map::Entry::Occupied(e) = value.entry(ENTITY_ID) {
-            if e.get().is_u64() {
-                entity_id = e.remove().as_u64();
-            }
+        if let map::Entry::Occupied(e) = value.entry(ENTITY_ID)
+            && e.get().is_u64()
+        {
+            entity_id = e.remove().as_u64();
         }
         proto::Notification {
             kind,
@@ -90,11 +84,6 @@ mod tests {
                 channel_id: 100,
                 channel_name: "the-channel".into(),
                 inviter_id: 50,
-            },
-            Notification::ChannelMessageMention {
-                sender_id: 200,
-                channel_id: 30,
-                message_id: 1,
             },
         ] {
             let message = notification.to_proto();

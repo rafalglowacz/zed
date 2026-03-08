@@ -1,15 +1,16 @@
-use std::path::PathBuf;
-
-use anyhow::{bail, Context};
+use anyhow::{Context as _, bail};
 use collections::{HashMap, HashSet};
-use schemars::{gen::SchemaSettings, JsonSchema};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use util::{truncate_and_remove_front, ResultExt};
+use std::path::PathBuf;
+use util::schemars::{AllowTrailingCommas, DefaultDenyUnknownFields};
+use util::serde::default_true;
+use util::{ResultExt, truncate_and_remove_front};
 
 use crate::{
-    ResolvedTask, Shell, SpawnInTerminal, TaskContext, TaskId, VariableName,
-    ZED_VARIABLE_NAME_PREFIX,
+    AttachRequest, ResolvedTask, RevealTarget, Shell, SpawnInTerminal, TaskContext, TaskId,
+    VariableName, ZED_VARIABLE_NAME_PREFIX, serde_helpers::non_empty_string_vec,
 };
 
 /// A template definition of a Zed task to run.
@@ -41,34 +42,57 @@ pub struct TaskTemplate {
     #[serde(default)]
     pub allow_concurrent_runs: bool,
     /// What to do with the terminal pane and tab, after the command was started:
-    /// * `always` — always show the terminal pane, add and focus the corresponding task's tab in it (default)
-    /// * `never` — avoid changing current terminal pane focus, but still add/reuse the task's tab there
+    /// * `always` — always show the task's pane, and focus the corresponding tab in it (default)
+    // * `no_focus` — always show the task's pane, add the task's tab in it, but don't focus it
+    // * `never` — do not alter focus, but still add/reuse the task's tab in its pane
     #[serde(default)]
     pub reveal: RevealStrategy,
+    /// Where to place the task's terminal item after starting the task.
+    /// * `dock` — in the terminal dock, "regular" terminal items' place (default).
+    /// * `center` — in the central pane group, "main" editor area.
+    #[serde(default)]
+    pub reveal_target: RevealTarget,
     /// What to do with the terminal pane and tab, after the command had finished:
     /// * `never` — do nothing when the command finishes (default)
     /// * `always` — always hide the terminal tab, hide the pane also if it was the last tab in it
     /// * `on_success` — hide the terminal tab on task success only, otherwise behaves similar to `always`.
     #[serde(default)]
     pub hide: HideStrategy,
-    /// Represents the tags which this template attaches to. Adding this removes this task from other UI.
-    #[serde(default)]
+    /// Represents the tags which this template attaches to.
+    /// Adding this removes this task from other UI and gives you ability to run it by tag.
+    #[serde(default, deserialize_with = "non_empty_string_vec")]
+    #[schemars(length(min = 1))]
     pub tags: Vec<String>,
     /// Which shell to use when spawning the task.
     #[serde(default)]
     pub shell: Shell,
+    /// Whether to show the task line in the task output.
+    #[serde(default = "default_true")]
+    pub show_summary: bool,
+    /// Whether to show the command line in the task output.
+    #[serde(default = "default_true")]
+    pub show_command: bool,
+}
+
+#[derive(Deserialize, Eq, PartialEq, Clone, Debug)]
+/// Use to represent debug request type
+pub enum DebugArgsRequest {
+    /// launch (program, cwd) are stored in TaskTemplate as (command, cwd)
+    Launch,
+    /// Attach
+    Attach(AttachRequest),
 }
 
 /// What to do with the terminal pane and tab, after the command was started.
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RevealStrategy {
-    /// Always show the terminal pane, add and focus the corresponding task's tab in it.
+    /// Always show the task's pane, and focus the corresponding tab in it.
     #[default]
     Always,
-    /// Always show the terminal pane, add the task's tab in it, but don't focus it.
+    /// Always show the task's pane, add the task's tab in it, but don't focus it.
     NoFocus,
-    /// Do not change terminal pane focus, but still add/reuse the task's tab there.
+    /// Do not alter focus, but still add/reuse the task's tab in its pane.
     Never,
 }
 
@@ -91,20 +115,19 @@ pub struct TaskTemplates(pub Vec<TaskTemplate>);
 
 impl TaskTemplates {
     /// Generates JSON schema of Tasks JSON template format.
-    pub fn generate_json_schema() -> serde_json_lenient::Value {
-        let schema = SchemaSettings::draft07()
-            .with(|settings| settings.option_add_null_type = false)
+    pub fn generate_json_schema() -> serde_json::Value {
+        let schema = schemars::generate::SchemaSettings::draft2019_09()
+            .with_transform(DefaultDenyUnknownFields)
+            .with_transform(AllowTrailingCommas)
             .into_generator()
-            .into_root_schema_for::<Self>();
+            .root_schema_for::<Self>();
 
-        serde_json_lenient::to_value(schema).unwrap()
+        serde_json::to_value(schema).unwrap()
     }
 }
 
 impl TaskTemplate {
     /// Replaces all `VariableName` task variables in the task template string fields.
-    /// If any replacement fails or the new string substitutions still have [`ZED_VARIABLE_NAME_PREFIX`],
-    /// `None` is returned.
     ///
     /// Every [`ResolvedTask`] gets a [`TaskId`], based on the `id_base` (to avoid collision with various task sources),
     /// and hashes of its template and [`TaskContext`], see [`ResolvedTask`] fields' documentation for more details.
@@ -130,23 +153,41 @@ impl TaskTemplate {
         let truncated_variables = truncate_variables(&task_variables);
         let cwd = match self.cwd.as_deref() {
             Some(cwd) => {
-                let substitured_cwd = substitute_all_template_variables_in_str(
+                let substituted_cwd = substitute_all_template_variables_in_str(
                     cwd,
                     &task_variables,
                     &variable_names,
                     &mut substituted_variables,
                 )?;
-                Some(PathBuf::from(substitured_cwd))
+                Some(PathBuf::from(substituted_cwd))
             }
             None => None,
         }
         .or(cx.cwd.clone());
-        let human_readable_label = substitute_all_template_variables_in_str(
+        let full_label = substitute_all_template_variables_in_str(
             &self.label,
-            &truncated_variables,
+            &task_variables,
             &variable_names,
             &mut substituted_variables,
-        )?
+        )?;
+
+        // Arbitrarily picked threshold below which we don't truncate any variables.
+        const TRUNCATION_THRESHOLD: usize = 64;
+
+        let human_readable_label = if full_label.len() > TRUNCATION_THRESHOLD {
+            substitute_all_template_variables_in_str(
+                &self.label,
+                &truncated_variables,
+                &variable_names,
+                &mut substituted_variables,
+            )?
+        } else {
+            #[allow(
+                clippy::redundant_clone,
+                reason = "We want to clone the full_label to avoid borrowing it in the fold closure"
+            )]
+            full_label.clone()
+        }
         .lines()
         .fold(String::new(), |mut string, line| {
             if string.is_empty() {
@@ -157,12 +198,7 @@ impl TaskTemplate {
             }
             string
         });
-        let full_label = substitute_all_template_variables_in_str(
-            &self.label,
-            &task_variables,
-            &variable_names,
-            &mut substituted_variables,
-        )?;
+
         let command = substitute_all_template_variables_in_str(
             &self.command,
             &task_variables,
@@ -209,7 +245,7 @@ impl TaskTemplate {
             substituted_variables,
             original_task: self.clone(),
             resolved_label: full_label.clone(),
-            resolved: Some(SpawnInTerminal {
+            resolved: SpawnInTerminal {
                 id,
                 cwd,
                 full_label,
@@ -222,16 +258,67 @@ impl TaskTemplate {
                         command_label
                     },
                 ),
-                command,
-                args: self.args.clone(),
+                command: Some(command),
+                args: args_with_substitutions,
                 env,
                 use_new_terminal: self.use_new_terminal,
                 allow_concurrent_runs: self.allow_concurrent_runs,
                 reveal: self.reveal,
+                reveal_target: self.reveal_target,
                 hide: self.hide,
                 shell: self.shell.clone(),
-            }),
+                show_summary: self.show_summary,
+                show_command: self.show_command,
+                show_rerun: true,
+            },
         })
+    }
+
+    /// Validates that all `$ZED_*` variables used in this template are known
+    /// variable names, returning a vector with all of the unique unknown
+    /// variables.
+    ///
+    /// Note that `$ZED_CUSTOM_*` variables are never considered to be invalid
+    /// since those are provided dynamically by extensions.
+    pub fn unknown_variables(&self) -> Vec<String> {
+        let mut variables = HashSet::default();
+
+        Self::collect_unknown_variables(&self.label, &mut variables);
+        Self::collect_unknown_variables(&self.command, &mut variables);
+
+        self.args
+            .iter()
+            .for_each(|arg| Self::collect_unknown_variables(arg, &mut variables));
+
+        self.env
+            .values()
+            .for_each(|value| Self::collect_unknown_variables(value, &mut variables));
+
+        if let Some(cwd) = &self.cwd {
+            Self::collect_unknown_variables(cwd, &mut variables);
+        }
+
+        variables.into_iter().collect()
+    }
+
+    fn collect_unknown_variables(template: &str, unknown: &mut HashSet<String>) {
+        shellexpand::env_with_context_no_errors(template, |variable| {
+            // It's possible that the variable has a default defined, which is
+            // separated by a `:`, for example, `${ZED_FILE:default_value} so we
+            // ensure that we're only looking at the variable name itself.
+            let colon_position = variable.find(':').unwrap_or(variable.len());
+            let variable_name = &variable[..colon_position];
+
+            if variable_name.starts_with(ZED_VARIABLE_NAME_PREFIX)
+                && let without_prefix = &variable_name[ZED_VARIABLE_NAME_PREFIX.len()..]
+                && !without_prefix.starts_with("CUSTOM_")
+                && variable_name.parse::<VariableName>().is_err()
+            {
+                unknown.insert(variable_name.to_string());
+            }
+
+            None::<&str>
+        });
     }
 }
 
@@ -256,6 +343,28 @@ fn to_hex_hash(object: impl Serialize) -> anyhow::Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+pub fn substitute_variables_in_str(template_str: &str, context: &TaskContext) -> Option<String> {
+    let mut variable_names = HashMap::default();
+    let mut substituted_variables = HashSet::default();
+    let task_variables = context
+        .task_variables
+        .0
+        .iter()
+        .map(|(key, value)| {
+            let key_string = key.to_string();
+            if !variable_names.contains_key(&key_string) {
+                variable_names.insert(key_string.clone(), key.clone());
+            }
+            (key_string, value.as_str())
+        })
+        .collect::<HashMap<_, _>>();
+    substitute_all_template_variables_in_str(
+        template_str,
+        &task_variables,
+        &variable_names,
+        &mut substituted_variables,
+    )
+}
 fn substitute_all_template_variables_in_str<A: AsRef<str>>(
     template_str: &str,
     task_variables: &HashMap<String, A>,
@@ -263,33 +372,40 @@ fn substitute_all_template_variables_in_str<A: AsRef<str>>(
     substituted_variables: &mut HashSet<VariableName>,
 ) -> Option<String> {
     let substituted_string = shellexpand::env_with_context(template_str, |var| {
-        // Colons denote a default value in case the variable is not set. We want to preserve that default, as otherwise shellexpand will substitute it for us.
+        // Colons denote a default value in case the variable is not set. We
+        // want to preserve that default, as otherwise shellexpand will
+        // substitute it for us.
         let colon_position = var.find(':').unwrap_or(var.len());
         let (variable_name, default) = var.split_at(colon_position);
         if let Some(name) = task_variables.get(variable_name) {
             if let Some(substituted_variable) = variable_names.get(variable_name) {
                 substituted_variables.insert(substituted_variable.clone());
             }
-
-            let mut name = name.as_ref().to_owned();
-            // Got a task variable hit
-            if !default.is_empty() {
-                name.push_str(default);
-            }
-            return Ok(Some(name));
+            // Got a task variable hit - use the variable value, ignore default
+            return Ok(Some(name.as_ref().to_owned()));
         } else if variable_name.starts_with(ZED_VARIABLE_NAME_PREFIX) {
-            bail!("Unknown variable name: {variable_name}");
+            // Unknown ZED variable - use default if available
+            if !default.is_empty() {
+                // Strip the colon and return the default value
+                return Ok(Some(default[1..].to_owned()));
+            } else {
+                bail!("Unknown variable name: {variable_name}");
+            }
         }
         // This is an unknown variable.
-        // We should not error out, as they may come from user environment (e.g. $PATH). That means that the variable substitution might not be perfect.
-        // If there's a default, we need to return the string verbatim as otherwise shellexpand will apply that default for us.
+        // We should not error out, as they may come from user environment (e.g.
+        // $PATH). That means that the variable substitution might not be
+        // perfect. If there's a default, we need to return the string verbatim
+        // as otherwise shellexpand will apply that default for us.
         if !default.is_empty() {
             return Ok(Some(format!("${{{var}}}")));
         }
+
         // Else we can just return None and that variable will be left as is.
         Ok(None)
     })
     .ok()?;
+
     Some(substituted_string.into_owned())
 }
 
@@ -309,9 +425,35 @@ fn substitute_all_template_variables_in_vec(
         )?;
         expanded.push(new_value);
     }
+
     Some(expanded)
 }
 
+pub fn substitute_variables_in_map(
+    keys_and_values: &HashMap<String, String>,
+    context: &TaskContext,
+) -> Option<HashMap<String, String>> {
+    let mut variable_names = HashMap::default();
+    let mut substituted_variables = HashSet::default();
+    let task_variables = context
+        .task_variables
+        .0
+        .iter()
+        .map(|(key, value)| {
+            let key_string = key.to_string();
+            if !variable_names.contains_key(&key_string) {
+                variable_names.insert(key_string.clone(), key.clone());
+            }
+            (key_string, value.as_str())
+        })
+        .collect::<HashMap<_, _>>();
+    substitute_all_template_variables_in_map(
+        keys_and_values,
+        &task_variables,
+        &variable_names,
+        &mut substituted_variables,
+    )
+}
 fn substitute_all_template_variables_in_map(
     keys_and_values: &HashMap<String, String>,
     task_variables: &HashMap<String, &str>,
@@ -334,6 +476,7 @@ fn substitute_all_template_variables_in_map(
         )?;
         new_map.insert(new_key, new_value);
     }
+
     Some(new_map)
 }
 
@@ -369,7 +512,7 @@ mod tests {
             TaskTemplate {
                 label: "".to_string(),
                 command: "".to_string(),
-                ..task_with_all_properties.clone()
+                ..task_with_all_properties
             },
         ] {
             assert_eq!(
@@ -394,12 +537,7 @@ mod tests {
                 .resolve_task(TEST_ID_BASE, task_cx)
                 .unwrap_or_else(|| panic!("failed to resolve task {task_without_cwd:?}"));
             assert_substituted_variables(&resolved_task, Vec::new());
-            resolved_task
-                .resolved
-                .clone()
-                .unwrap_or_else(|| {
-                    panic!("failed to get resolve data for resolved task. Template: {task_without_cwd:?} Resolved: {resolved_task:?}")
-                })
+            resolved_task.resolved
         };
 
         let cx = TaskContext {
@@ -442,7 +580,7 @@ mod tests {
         );
 
         let cx = TaskContext {
-            cwd: Some(context_cwd.clone()),
+            cwd: Some(context_cwd),
             task_variables: TaskVariables::default(),
             project_env: HashMap::default(),
         };
@@ -546,35 +684,35 @@ mod tests {
                 all_variables.iter().map(|(name, _)| name.clone()).collect(),
             );
 
-            let spawn_in_terminal = resolved_task
-                .resolved
-                .as_ref()
-                .expect("should have resolved a spawn in terminal task");
+            let spawn_in_terminal = &resolved_task.resolved;
             assert_eq!(
                 spawn_in_terminal.label,
                 format!(
                     "test label for 1234 and …{}",
-                    &long_value[..=MAX_DISPLAY_VARIABLE_LENGTH]
+                    &long_value[long_value.len() - MAX_DISPLAY_VARIABLE_LENGTH..]
                 ),
                 "Human-readable label should have long substitutions trimmed"
             );
             assert_eq!(
-                spawn_in_terminal.command,
+                spawn_in_terminal.command.clone().unwrap(),
                 format!("echo test_file {long_value}"),
                 "Command should be substituted with variables and those should not be shortened"
             );
             assert_eq!(
                 spawn_in_terminal.args,
                 &[
-                    "arg1 $ZED_SELECTED_TEXT",
-                    "arg2 $ZED_COLUMN",
-                    "arg3 $ZED_SYMBOL",
+                    "arg1 test_selected_text",
+                    "arg2 5678",
+                    "arg3 010101010101010101010101010101010101010101010101010101010101",
                 ],
-                "Args should not be substituted with variables"
+                "Args should be substituted with variables"
             );
             assert_eq!(
                 spawn_in_terminal.command_label,
-                format!("{} arg1 test_selected_text arg2 5678 arg3 {long_value}", spawn_in_terminal.command),
+                format!(
+                    "{} arg1 test_selected_text arg2 5678 arg3 {long_value}",
+                    spawn_in_terminal.command.clone().unwrap()
+                ),
                 "Command label args should be substituted with variables and those should not be shortened"
             );
 
@@ -611,7 +749,10 @@ mod tests {
                     project_env: HashMap::default(),
                 },
             );
-            assert_eq!(resolved_task_attempt, None, "If any of the Zed task variables is not substituted, the task should not be resolved, but got some resolution without the variable {removed_variable:?} (index {i})");
+            assert!(
+                matches!(resolved_task_attempt, None),
+                "If any of the Zed task variables is not substituted, the task should not be resolved, but got some resolution without the variable {removed_variable:?} (index {i})"
+            );
         }
     }
 
@@ -621,15 +762,15 @@ mod tests {
             label: "My task".into(),
             command: "echo".into(),
             args: vec!["$PATH".into()],
-            ..Default::default()
+            ..TaskTemplate::default()
         };
         let resolved_task = task
             .resolve_task(TEST_ID_BASE, &TaskContext::default())
             .unwrap();
         assert_substituted_variables(&resolved_task, Vec::new());
-        let resolved = resolved_task.resolved.unwrap();
+        let resolved = resolved_task.resolved;
         assert_eq!(resolved.label, task.label);
-        assert_eq!(resolved.command, task.command);
+        assert_eq!(resolved.command, Some(task.command));
         assert_eq!(resolved.args, task.args);
     }
 
@@ -639,11 +780,12 @@ mod tests {
             label: "My task".into(),
             command: "echo".into(),
             args: vec!["$ZED_VARIABLE".into()],
-            ..Default::default()
+            ..TaskTemplate::default()
         };
-        assert!(task
-            .resolve_task(TEST_ID_BASE, &TaskContext::default())
-            .is_none());
+        assert!(
+            task.resolve_task(TEST_ID_BASE, &TaskContext::default())
+                .is_none()
+        );
     }
 
     #[test]
@@ -685,7 +827,7 @@ mod tests {
                     "test_env_key".to_string(),
                     format!("test_env_var_{}", VariableName::Symbol.template_value()),
                 )]),
-                ..task_with_all_properties.clone()
+                ..task_with_all_properties
             },
         ]
         .into_iter()
@@ -788,15 +930,14 @@ mod tests {
 
         let context = TaskContext {
             cwd: None,
-            task_variables: TaskVariables::from_iter(all_variables.clone()),
+            task_variables: TaskVariables::from_iter(all_variables),
             project_env,
         };
 
         let resolved = template
             .resolve_task(TEST_ID_BASE, &context)
             .unwrap()
-            .resolved
-            .unwrap();
+            .resolved;
 
         assert_eq!(resolved.env["TASK_ENV_VAR1"], "TASK_ENV_VAR1_VALUE");
         assert_eq!(resolved.env["TASK_ENV_VAR2"], "env_var_2 1234 5678");
@@ -805,5 +946,132 @@ mod tests {
             resolved.env["PROJECT_ENV_WILL_BE_OVERWRITTEN"],
             "overwritten"
         );
+    }
+
+    #[test]
+    fn test_variable_default_values() {
+        let task_with_defaults = TaskTemplate {
+            label: "test with defaults".to_string(),
+            command: format!(
+                "echo ${{{}}}",
+                VariableName::File.to_string() + ":fallback.txt"
+            ),
+            args: vec![
+                "${ZED_MISSING_VAR:default_value}".to_string(),
+                format!("${{{}}}", VariableName::Row.to_string() + ":42"),
+            ],
+            ..TaskTemplate::default()
+        };
+
+        // Test 1: When ZED_FILE exists, should use actual value and ignore default
+        let context_with_file = TaskContext {
+            cwd: None,
+            task_variables: TaskVariables::from_iter(vec![
+                (VariableName::File, "actual_file.rs".to_string()),
+                (VariableName::Row, "123".to_string()),
+            ]),
+            project_env: HashMap::default(),
+        };
+
+        let resolved = task_with_defaults
+            .resolve_task(TEST_ID_BASE, &context_with_file)
+            .expect("Should resolve task with existing variables");
+
+        assert_eq!(
+            resolved.resolved.command.unwrap(),
+            "echo actual_file.rs",
+            "Should use actual ZED_FILE value, not default"
+        );
+        assert_eq!(
+            resolved.resolved.args,
+            vec!["default_value", "123"],
+            "Should use default for missing var, actual value for existing var"
+        );
+
+        // Test 2: When ZED_FILE doesn't exist, should use default value
+        let context_without_file = TaskContext {
+            cwd: None,
+            task_variables: TaskVariables::from_iter(vec![(VariableName::Row, "456".to_string())]),
+            project_env: HashMap::default(),
+        };
+
+        let resolved = task_with_defaults
+            .resolve_task(TEST_ID_BASE, &context_without_file)
+            .expect("Should resolve task using default values");
+
+        assert_eq!(
+            resolved.resolved.command.unwrap(),
+            "echo fallback.txt",
+            "Should use default value when ZED_FILE is missing"
+        );
+        assert_eq!(
+            resolved.resolved.args,
+            vec!["default_value", "456"],
+            "Should use defaults for missing vars"
+        );
+
+        // Test 3: Missing ZED variable without default should fail
+        let task_no_default = TaskTemplate {
+            label: "test no default".to_string(),
+            command: "${ZED_MISSING_NO_DEFAULT}".to_string(),
+            ..TaskTemplate::default()
+        };
+
+        assert!(
+            task_no_default
+                .resolve_task(TEST_ID_BASE, &TaskContext::default())
+                .is_none(),
+            "Should fail when ZED variable has no default and doesn't exist"
+        );
+    }
+
+    #[test]
+    fn test_unknown_variables() {
+        // Variable names starting with `ZED_` that are not valid should be
+        // reported.
+        let label = "test unknown variables".to_string();
+        let command = "$ZED_UNKNOWN".to_string();
+        let task = TaskTemplate {
+            label,
+            command,
+            ..TaskTemplate::default()
+        };
+
+        assert_eq!(task.unknown_variables(), vec!["ZED_UNKNOWN".to_string()]);
+
+        // Variable names starting with `ZED_CUSTOM_` should never be reported,
+        // as those are dynamically provided by extensions.
+        let label = "test custom variables".to_string();
+        let command = "$ZED_CUSTOM_UNKNOWN".to_string();
+        let task = TaskTemplate {
+            label,
+            command,
+            ..TaskTemplate::default()
+        };
+
+        assert!(task.unknown_variables().is_empty());
+
+        // Unknown variable names with defaults should still be reported,
+        // otherwise the default would always be silently used.
+        let label = "test custom variables".to_string();
+        let command = "${ZED_UNKNOWN:default_value}".to_string();
+        let task = TaskTemplate {
+            label,
+            command,
+            ..TaskTemplate::default()
+        };
+
+        assert_eq!(task.unknown_variables(), vec!["ZED_UNKNOWN".to_string()]);
+
+        // Valid variable names are not reported.
+        let label = "test custom variables".to_string();
+        let command = "$ZED_FILE".to_string();
+        let task = TaskTemplate {
+            label,
+            command,
+            ..TaskTemplate::default()
+        };
+
+        assert!(task.unknown_variables().is_empty());
     }
 }

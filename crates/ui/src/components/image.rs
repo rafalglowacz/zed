@@ -1,41 +1,48 @@
-#![allow(missing_docs)]
-use gpui::{svg, IntoElement, Rems, RenderOnce, Size, Styled, WindowContext};
+use std::sync::Arc;
+
+use gpui::Transformation;
+use gpui::{App, IntoElement, Rems, RenderOnce, Size, Styled, Window, svg};
 use serde::{Deserialize, Serialize};
 use strum::{EnumIter, EnumString, IntoStaticStr};
-use ui_macros::{path_str, DerivePathStr};
 
-use crate::Color;
+use crate::prelude::*;
+use crate::traits::transformable::Transformable;
 
 #[derive(
-    Debug,
-    PartialEq,
-    Eq,
-    Copy,
-    Clone,
-    EnumIter,
-    EnumString,
-    IntoStaticStr,
-    Serialize,
-    Deserialize,
-    DerivePathStr,
+    Debug, PartialEq, Eq, Copy, Clone, EnumIter, EnumString, IntoStaticStr, Serialize, Deserialize,
 )]
 #[strum(serialize_all = "snake_case")]
-#[path_str(prefix = "images", suffix = ".svg")]
 pub enum VectorName {
+    AcpGrid,
+    AcpLogo,
+    AcpLogoSerif,
+    AiGrid,
+    Grid,
+    ProTrialStamp,
+    ProUserStamp,
     ZedLogo,
     ZedXCopilot,
 }
 
+impl VectorName {
+    /// Returns the path to this vector image.
+    pub fn path(&self) -> Arc<str> {
+        let file_stem: &'static str = self.into();
+        format!("images/{file_stem}.svg").into()
+    }
+}
+
 /// A vector image, such as an SVG.
 ///
-/// A [`Vector`] is different from an [`Icon`] in that it is intended
+/// A [`Vector`] is different from an [`crate::Icon`] in that it is intended
 /// to be displayed at a specific size, or series of sizes, rather
 /// than conforming to the standard size of an icon.
-#[derive(IntoElement)]
+#[derive(IntoElement, RegisterComponent)]
 pub struct Vector {
-    path: &'static str,
+    path: Arc<str>,
     color: Color,
     size: Size<Rems>,
+    transformation: Transformation,
 }
 
 impl Vector {
@@ -45,6 +52,7 @@ impl Vector {
             path: vector.path(),
             color: Color::default(),
             size: Size { width, height },
+            transformation: Transformation::default(),
         }
     }
 
@@ -62,14 +70,20 @@ impl Vector {
     /// Sets the vector size.
     pub fn size(mut self, size: impl Into<Size<Rems>>) -> Self {
         let size = size.into();
-
         self.size = size;
         self
     }
 }
 
+impl Transformable for Vector {
+    fn transform(mut self, transformation: Transformation) -> Self {
+        self.transformation = transformation;
+        self
+    }
+}
+
 impl RenderOnce for Vector {
-    fn render(self, cx: &mut WindowContext) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let width = self.size.width;
         let height = self.size.height;
 
@@ -81,27 +95,79 @@ impl RenderOnce for Vector {
             .h(height)
             .path(self.path)
             .text_color(self.color.color(cx))
+            .with_transformation(self.transformation)
     }
 }
 
-#[cfg(feature = "stories")]
-pub mod story {
-    use gpui::Render;
-    use story::{Story, StoryItem, StorySection};
-    use strum::IntoEnumIterator;
+impl Component for Vector {
+    fn scope() -> ComponentScope {
+        ComponentScope::Images
+    }
 
-    use crate::prelude::*;
+    fn name() -> &'static str {
+        "Vector"
+    }
 
-    use super::{Vector, VectorName};
+    fn description() -> Option<&'static str> {
+        Some("A vector image component that can be displayed at specific sizes.")
+    }
 
-    pub struct VectorStory;
+    fn preview(_window: &mut Window, _cx: &mut App) -> Option<AnyElement> {
+        let size = rems_from_px(60.);
 
-    impl Render for VectorStory {
-        fn render(&mut self, _cx: &mut ViewContext<Self>) -> impl IntoElement {
-            Story::container().child(StorySection::new().children(VectorName::iter().map(
-                |vector| StoryItem::new(format!("{:?}", vector), Vector::square(vector, rems(8.))),
-            )))
-        }
+        Some(
+            v_flex()
+                .gap_6()
+                .children(vec![
+                    example_group_with_title(
+                        "Basic Usage",
+                        vec![
+                            single_example(
+                                "Default",
+                                Vector::square(VectorName::ZedLogo, size).into_any_element(),
+                            ),
+                            single_example(
+                                "Custom Size",
+                                h_flex()
+                                    .h(rems_from_px(120.))
+                                    .justify_center()
+                                    .child(Vector::new(
+                                        VectorName::ZedLogo,
+                                        rems_from_px(120.),
+                                        rems_from_px(200.),
+                                    ))
+                                    .into_any_element(),
+                            ),
+                        ],
+                    ),
+                    example_group_with_title(
+                        "Colored",
+                        vec![
+                            single_example(
+                                "Accent Color",
+                                Vector::square(VectorName::ZedLogo, size)
+                                    .color(Color::Accent)
+                                    .into_any_element(),
+                            ),
+                            single_example(
+                                "Error Color",
+                                Vector::square(VectorName::ZedLogo, size)
+                                    .color(Color::Error)
+                                    .into_any_element(),
+                            ),
+                        ],
+                    ),
+                    example_group_with_title(
+                        "Different Vectors",
+                        vec![single_example(
+                            "Zed X Copilot",
+                            Vector::square(VectorName::ZedXCopilot, rems_from_px(100.))
+                                .into_any_element(),
+                        )],
+                    ),
+                ])
+                .into_any_element(),
+        )
     }
 }
 
@@ -111,6 +177,6 @@ mod tests {
 
     #[test]
     fn vector_path() {
-        assert_eq!(VectorName::ZedLogo.path(), "images/zed_logo.svg");
+        assert_eq!(VectorName::ZedLogo.path().as_ref(), "images/zed_logo.svg");
     }
 }

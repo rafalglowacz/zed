@@ -1,15 +1,21 @@
+---
+title: Building Zed for macOS
+description: "Guide to building zed for macos for Zed development."
+---
+
 # Building Zed for macOS
 
 ## Repository
 
-Clone down the [Zed repository](https://github.com/zed-industries/zed).
+Clone the [Zed repository](https://github.com/zed-industries/zed).
 
 ## Dependencies
 
-- Install [Rust](https://www.rust-lang.org/tools/install)
-- Install [Xcode](https://apps.apple.com/us/app/xcode/id497799835?mt=12) from the macOS App Store, or from the [Apple Developer](https://developer.apple.com/download/all/) website. Note this requires a developer account.
+- Install [rustup](https://www.rust-lang.org/tools/install)
 
-> Ensure you launch Xcode after installing, and install the macOS components, which is the default option.
+- Install [Xcode](https://apps.apple.com/us/app/xcode/id497799835?mt=12) from the macOS App Store or from the [Apple Developer](https://developer.apple.com/download/all/) website. The Apple Developer download requires a developer account.
+
+> Launch Xcode after installation and install the macOS components (the default option).
 
 - Install [Xcode command line tools](https://developer.apple.com/xcode/resources/)
 
@@ -24,34 +30,11 @@ Clone down the [Zed repository](https://github.com/zed-industries/zed).
   sudo xcodebuild -license accept
   ```
 
-- Install the Rust wasm toolchain:
-
-  ```sh
-  rustup target add wasm32-wasip1
-  ```
-
 - Install `cmake` (required by [a dependency](https://docs.rs/wasmtime-c-api-impl/latest/wasmtime_c_api/))
 
   ```sh
   brew install cmake
   ```
-
-## Backend Dependencies
-
-If you are developing collaborative features of Zed, you'll need to install the dependencies of zed's `collab` server:
-
-- Install [Postgres](https://postgresapp.com)
-- Install [Livekit](https://formulae.brew.sh/formula/livekit) and [Foreman](https://formulae.brew.sh/formula/foreman)
-
-  ```sh
-  brew install livekit foreman
-  ```
-
-Alternatively, if you have [Docker](https://www.docker.com/) installed you can bring up all the `collab` dependencies using Docker Compose:
-
-```sh
-docker compose up -d
-```
 
 ## Building Zed from Source
 
@@ -75,6 +58,54 @@ And to run the tests:
 cargo test --workspace
 ```
 
+## Visual Regression Tests
+
+Zed includes visual regression tests that capture screenshots of real Zed windows and compare them against baseline images. These tests require macOS with Screen Recording permission.
+
+### Prerequisites
+
+You must grant Screen Recording permission to your terminal:
+
+1. Run the visual test runner once - macOS will prompt for permission
+2. Or manually: System Settings > Privacy & Security > Screen Recording
+3. Enable your terminal app (e.g., Terminal.app, iTerm2, Ghostty)
+4. Restart your terminal after granting permission
+
+### Running Visual Tests
+
+```sh
+cargo run -p zed --bin zed_visual_test_runner --features visual-tests
+```
+
+### Baseline Images
+
+Baseline images are stored in `crates/zed/test_fixtures/visual_tests/` but are
+**gitignored** to avoid bloating the repository. You must generate them locally
+before running tests.
+
+#### Initial Setup
+
+Before making any UI changes, generate baseline images from a known-good state:
+
+```sh
+git checkout origin/main
+UPDATE_BASELINE=1 cargo run -p zed --bin visual_test_runner --features visual-tests
+git checkout -
+```
+
+This creates baselines that reflect the current expected UI.
+
+#### Updating Baselines
+
+When UI changes are intentional, update the baseline images after your changes:
+
+```sh
+UPDATE_BASELINE=1 cargo run -p zed --bin zed_visual_test_runner --features visual-tests
+```
+
+> **Note:** In the future, baselines may be stored externally. For now, they
+> remain local-only to keep the git repository lightweight.
+
 ## Troubleshooting
 
 ### Error compiling metal shaders
@@ -86,6 +117,8 @@ xcrun: error: unable to find utility "metal", not a developer tool or in PATH
 ```
 
 Try `sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer`
+
+If you're on macOS 26, try `xcodebuild -downloadComponent MetalToolchain`
 
 ### Cargo errors claiming that a dependency is using unstable features
 
@@ -110,7 +143,7 @@ Caused by:
   cargo:rerun-if-env-changed=BINDGEN_EXTRA_CLANG_ARGS
 ```
 
-This file is part of Xcode. Ensure you have installed the Xcode command line tools and set the correct path:
+This file is part of Xcode. Make sure the Xcode command line tools are installed and the path is set correctly:
 
 ```sh
 xcode-select --install
@@ -129,3 +162,35 @@ Then clean and rebuild the project:
 cargo clean
 cargo run
 ```
+
+### Tests failing due to `Too many open files (os error 24)`
+
+This error seems to be caused by OS resource constraints. Installing and running tests with `cargo-nextest` should resolve the issue.
+
+- `cargo install cargo-nextest --locked`
+- `cargo nextest run --workspace --no-fail-fast`
+
+## Tips & Tricks
+
+### Avoiding continual rebuilds
+
+If Zed continually rebuilds root crates, you may be opening the Zed codebase itself in your development build.
+
+This causes problems because `cargo run` exports a bunch of environment
+variables which are picked up by the `rust-analyzer` that runs in the development
+build of Zed. These environment variables are in turn passed to `cargo check`, which
+invalidates the build cache of some of the crates we depend on.
+
+To avoid this, run the built binary against a different project, for example `cargo run ~/path/to/other/project`.
+
+### Speeding up verification
+
+If you build Zed frequently, macOS may keep verifying new builds, which can add a few seconds to each iteration.
+
+To fix this, you can:
+
+- Run `sudo spctl developer-mode enable-terminal` to enable the Developer Tools panel in System Settings.
+- In System Settings, search for "Developer Tools" and add your terminal (e.g. iTerm or Ghostty) to the list under "Allow applications to use developer tools"
+- Restart your terminal.
+
+Thanks to the nextest developers for publishing [this](https://nexte.st/docs/installation/macos/#gatekeeper).

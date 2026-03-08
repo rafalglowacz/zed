@@ -1,9 +1,9 @@
 [package]
 description = "Shared logic for communication between the Zed app and the zed.dev server"
-edition = "2021"
+edition.workspace = true
 name = "rpc"
 version = "0.1.0"
-publish = false
+publish.workspace = true
 license = "GPL-3.0-or-later"
 
 [lints]
@@ -21,7 +21,6 @@ test-support = ["collections/test-support", "gpui/test-support", "proto/test-sup
 anyhow.workspace = true
 async-tungstenite.workspace = true
 base64.workspace = true
-chrono.workspace = true
 collections.workspace = true
 futures.workspace = true
 gpui = { workspace = true, optional = true }
@@ -39,6 +38,6 @@ zstd.workspace = true
 
 [dev-dependencies]
 collections = { workspace = true, features = ["test-support"] }
-env_logger.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 proto = { workspace = true, features = ["test-support"] }
+zlog.workspace = true

@@ -1,28 +1,42 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use collections::HashMap;
 use futures::StreamExt;
-use gpui::{AppContext, AsyncAppContext, Task};
+use gpui::{App, AsyncApp, Task};
 use http_client::github::latest_github_release;
 pub use language::*;
+use language::{LanguageToolchainStore, LspAdapterDelegate, LspInstaller};
 use lsp::{LanguageServerBinary, LanguageServerName};
+
+use project::lsp_store::language_server_settings;
 use regex::Regex;
-use serde_json::json;
-use smol::{fs, process};
+use serde_json::{Value, json};
+use settings::SemanticTokenRules;
+use smol::fs;
 use std::{
-    any::Any,
     borrow::Cow,
     ffi::{OsStr, OsString},
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    process::Output,
     str,
     sync::{
-        atomic::{AtomicBool, Ordering::SeqCst},
         Arc, LazyLock,
+        atomic::{AtomicBool, Ordering::SeqCst},
     },
 };
 use task::{TaskTemplate, TaskTemplates, TaskVariables, VariableName};
-use util::{fs::remove_matching, maybe, ResultExt};
+use util::{ResultExt, fs::remove_matching, maybe, merge_json_value_into};
+
+use crate::LanguageDir;
+
+pub(crate) fn semantic_token_rules() -> SemanticTokenRules {
+    let content = LanguageDir::get("go/semantic_token_rules.json")
+        .expect("missing go/semantic_token_rules.json");
+    let json = std::str::from_utf8(&content.data).expect("invalid utf-8 in semantic_token_rules");
+    settings::parse_json_with_comments::<SemanticTokenRules>(json)
+        .expect("failed to parse go semantic_token_rules.json")
+}
 
 fn server_binary_arguments() -> Vec<OsString> {
     vec!["-mode=stdio".into()]
@@ -35,23 +49,47 @@ impl GoLspAdapter {
     const SERVER_NAME: LanguageServerName = LanguageServerName::new_static("gopls");
 }
 
-static GOPLS_VERSION_REGEX: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"\d+\.\d+\.\d+").expect("Failed to create GOPLS_VERSION_REGEX"));
+static VERSION_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\d+\.\d+\.\d+").expect("Failed to create VERSION_REGEX"));
 
 static GO_ESCAPE_SUBTEST_NAME_REGEX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"[.*+?^${}()|\[\]\\]"#).expect("Failed to create GO_ESCAPE_SUBTEST_NAME_REGEX")
+    Regex::new(r#"[.*+?^${}()|\[\]\\"']"#).expect("Failed to create GO_ESCAPE_SUBTEST_NAME_REGEX")
 });
 
-#[async_trait(?Send)]
-impl super::LspAdapter for GoLspAdapter {
-    fn name(&self) -> LanguageServerName {
-        Self::SERVER_NAME.clone()
-    }
+const BINARY: &str = if cfg!(target_os = "windows") {
+    "gopls.exe"
+} else {
+    "gopls"
+};
+
+impl LspInstaller for GoLspAdapter {
+    type BinaryVersion = Option<String>;
 
     async fn fetch_latest_server_version(
         &self,
         delegate: &dyn LspAdapterDelegate,
-    ) -> Result<Box<dyn 'static + Send + Any>> {
+        _: bool,
+        cx: &mut AsyncApp,
+    ) -> Result<Option<String>> {
+        static DID_SHOW_NOTIFICATION: AtomicBool = AtomicBool::new(false);
+
+        const NOTIFICATION_MESSAGE: &str =
+            "Could not install the Go language server `gopls`, because `go` was not found.";
+
+        if delegate.which("go".as_ref()).await.is_none() {
+            if DID_SHOW_NOTIFICATION
+                .compare_exchange(false, true, SeqCst, SeqCst)
+                .is_ok()
+            {
+                cx.update(|cx| {
+                    delegate.show_notification(NOTIFICATION_MESSAGE, cx);
+                });
+            }
+            anyhow::bail!(
+                "Could not install the Go language server `gopls`, because `go` was not found."
+            );
+        }
+
         let release =
             latest_github_release("golang/tools", false, false, delegate.http_client()).await?;
         let version: Option<String> = release.tag_name.strip_prefix("gopls/v").map(str::to_string);
@@ -61,13 +99,14 @@ impl super::LspAdapter for GoLspAdapter {
                 release.tag_name
             );
         }
-        Ok(Box::new(version) as Box<_>)
+        Ok(version)
     }
 
     async fn check_if_user_installed(
         &self,
         delegate: &dyn LspAdapterDelegate,
-        _: &AsyncAppContext,
+        _: Option<Toolchain>,
+        _: &AsyncApp,
     ) -> Option<LanguageServerBinary> {
         let path = delegate.which(Self::SERVER_NAME.as_ref()).await?;
         Some(LanguageServerBinary {
@@ -77,69 +116,43 @@ impl super::LspAdapter for GoLspAdapter {
         })
     }
 
-    fn will_fetch_server(
-        &self,
-        delegate: &Arc<dyn LspAdapterDelegate>,
-        cx: &mut AsyncAppContext,
-    ) -> Option<Task<Result<()>>> {
-        static DID_SHOW_NOTIFICATION: AtomicBool = AtomicBool::new(false);
-
-        const NOTIFICATION_MESSAGE: &str =
-            "Could not install the Go language server `gopls`, because `go` was not found.";
-
-        let delegate = delegate.clone();
-        Some(cx.spawn(|cx| async move {
-            let install_output = process::Command::new("go").args(["version"]).output().await;
-            if install_output.is_err() {
-                if DID_SHOW_NOTIFICATION
-                    .compare_exchange(false, true, SeqCst, SeqCst)
-                    .is_ok()
-                {
-                    cx.update(|cx| {
-                        delegate.show_notification(NOTIFICATION_MESSAGE, cx);
-                    })?
-                }
-                return Err(anyhow!("cannot install gopls"));
-            }
-            Ok(())
-        }))
-    }
-
     async fn fetch_server_binary(
         &self,
-        version: Box<dyn 'static + Send + Any>,
+        version: Option<String>,
         container_dir: PathBuf,
         delegate: &dyn LspAdapterDelegate,
     ) -> Result<LanguageServerBinary> {
-        let version = version.downcast::<Option<String>>().unwrap();
-        let this = *self;
-
-        if let Some(version) = *version {
-            let binary_path = container_dir.join(format!("gopls_{version}"));
-            if let Ok(metadata) = fs::metadata(&binary_path).await {
-                if metadata.is_file() {
-                    remove_matching(&container_dir, |entry| {
-                        entry != binary_path && entry.file_name() != Some(OsStr::new("gobin"))
-                    })
-                    .await;
-
-                    return Ok(LanguageServerBinary {
-                        path: binary_path.to_path_buf(),
-                        arguments: server_binary_arguments(),
-                        env: None,
-                    });
-                }
-            }
-        } else if let Some(path) = this
-            .cached_server_binary(container_dir.clone(), delegate)
+        let go = delegate.which("go".as_ref()).await.unwrap_or("go".into());
+        let go_version_output = util::command::new_command(&go)
+            .args(["version"])
+            .output()
             .await
-        {
+            .context("failed to get go version via `go version` command`")?;
+        let go_version = parse_version_output(&go_version_output)?;
+
+        if let Some(version) = version {
+            let binary_path = container_dir.join(format!("gopls_{version}_go_{go_version}"));
+            if let Ok(metadata) = fs::metadata(&binary_path).await
+                && metadata.is_file()
+            {
+                remove_matching(&container_dir, |entry| {
+                    entry != binary_path && entry.file_name() != Some(OsStr::new("gobin"))
+                })
+                .await;
+
+                return Ok(LanguageServerBinary {
+                    path: binary_path.to_path_buf(),
+                    arguments: server_binary_arguments(),
+                    env: None,
+                });
+            }
+        } else if let Some(path) = get_cached_server_binary(&container_dir).await {
             return Ok(path);
         }
 
         let gobin_dir = container_dir.join("gobin");
         fs::create_dir_all(&gobin_dir).await?;
-        let install_output = process::Command::new("go")
+        let install_output = util::command::new_command(go)
             .env("GO111MODULE", "on")
             .env("GOBIN", &gobin_dir)
             .args(["install", "golang.org/x/tools/gopls@latest"])
@@ -152,23 +165,19 @@ impl super::LspAdapter for GoLspAdapter {
                 String::from_utf8_lossy(&install_output.stdout),
                 String::from_utf8_lossy(&install_output.stderr)
             );
-
-            return Err(anyhow!("failed to install gopls with `go install`. Is `go` installed and in the PATH? Check logs for more information."));
+            anyhow::bail!(
+                "failed to install gopls with `go install`. Is `go` installed and in the PATH? Check logs for more information."
+            );
         }
 
-        let installed_binary_path = gobin_dir.join("gopls");
-        let version_output = process::Command::new(&installed_binary_path)
+        let installed_binary_path = gobin_dir.join(BINARY);
+        let version_output = util::command::new_command(&installed_binary_path)
             .arg("version")
             .output()
             .await
             .context("failed to run installed gopls binary")?;
-        let version_stdout = str::from_utf8(&version_output.stdout)
-            .context("gopls version produced invalid utf8 output")?;
-        let version = GOPLS_VERSION_REGEX
-            .find(version_stdout)
-            .with_context(|| format!("failed to parse golps version output '{version_stdout}'"))?
-            .as_str();
-        let binary_path = container_dir.join(format!("gopls_{version}"));
+        let gopls_version = parse_version_output(&version_output)?;
+        let binary_path = container_dir.join(format!("gopls_{gopls_version}_go_{go_version}"));
         fs::rename(&installed_binary_path, &binary_path).await?;
 
         Ok(LanguageServerBinary {
@@ -183,15 +192,23 @@ impl super::LspAdapter for GoLspAdapter {
         container_dir: PathBuf,
         _: &dyn LspAdapterDelegate,
     ) -> Option<LanguageServerBinary> {
-        get_cached_server_binary(container_dir).await
+        get_cached_server_binary(&container_dir).await
+    }
+}
+
+#[async_trait(?Send)]
+impl LspAdapter for GoLspAdapter {
+    fn name(&self) -> LanguageServerName {
+        Self::SERVER_NAME
     }
 
     async fn initialization_options(
         self: Arc<Self>,
-        _: &Arc<dyn LspAdapterDelegate>,
+        delegate: &Arc<dyn LspAdapterDelegate>,
+        cx: &mut AsyncApp,
     ) -> Result<Option<serde_json::Value>> {
-        Ok(Some(json!({
-            "usePlaceholders": true,
+        let mut default_config = json!({
+            "usePlaceholders": false,
             "hints": {
                 "assignVariableTypes": true,
                 "compositeLiteralFields": true,
@@ -201,7 +218,33 @@ impl super::LspAdapter for GoLspAdapter {
                 "parameterNames": true,
                 "rangeVariableTypes": true
             }
-        })))
+        });
+
+        let project_initialization_options = cx.update(|cx| {
+            language_server_settings(delegate.as_ref(), &self.name(), cx)
+                .and_then(|s| s.initialization_options.clone())
+        });
+
+        if let Some(override_options) = project_initialization_options {
+            merge_json_value_into(override_options, &mut default_config);
+        }
+
+        Ok(Some(default_config))
+    }
+
+    async fn workspace_configuration(
+        self: Arc<Self>,
+        delegate: &Arc<dyn LspAdapterDelegate>,
+        _: Option<Toolchain>,
+        _: Option<lsp::Uri>,
+        cx: &mut AsyncApp,
+    ) -> Result<Value> {
+        Ok(cx
+            .update(|cx| {
+                language_server_settings(delegate.as_ref(), &self.name(), cx)
+                    .and_then(|settings| settings.settings.clone())
+            })
+            .unwrap_or_default())
     }
 
     async fn label_for_completion(
@@ -220,12 +263,16 @@ impl super::LspAdapter for GoLspAdapter {
             Some((lsp::CompletionItemKind::MODULE, detail)) => {
                 let text = format!("{label} {detail}");
                 let source = Rope::from(format!("import {text}").as_str());
-                let runs = language.highlight_text(&source, 7..7 + text.len());
-                return Some(CodeLabel {
-                    text,
-                    runs,
-                    filter_range: 0..label.len(),
-                });
+                let runs = language.highlight_text(&source, 7..7 + text[name_offset..].len());
+                let filter_range = completion
+                    .filter_text
+                    .as_deref()
+                    .and_then(|filter_text| {
+                        text.find(filter_text)
+                            .map(|start| start..start + filter_text.len())
+                    })
+                    .unwrap_or(0..label.len());
+                return Some(CodeLabel::new(text, filter_range, runs));
             }
             Some((
                 lsp::CompletionItemKind::CONSTANT | lsp::CompletionItemKind::VARIABLE,
@@ -236,39 +283,51 @@ impl super::LspAdapter for GoLspAdapter {
                     Rope::from(format!("var {} {}", &text[name_offset..], detail).as_str());
                 let runs = adjust_runs(
                     name_offset,
-                    language.highlight_text(&source, 4..4 + text.len()),
+                    language.highlight_text(&source, 4..4 + text[name_offset..].len()),
                 );
-                return Some(CodeLabel {
-                    text,
-                    runs,
-                    filter_range: 0..label.len(),
-                });
+                let filter_range = completion
+                    .filter_text
+                    .as_deref()
+                    .and_then(|filter_text| {
+                        text.find(filter_text)
+                            .map(|start| start..start + filter_text.len())
+                    })
+                    .unwrap_or(0..label.len());
+                return Some(CodeLabel::new(text, filter_range, runs));
             }
             Some((lsp::CompletionItemKind::STRUCT, _)) => {
                 let text = format!("{label} struct {{}}");
                 let source = Rope::from(format!("type {}", &text[name_offset..]).as_str());
                 let runs = adjust_runs(
                     name_offset,
-                    language.highlight_text(&source, 5..5 + text.len()),
+                    language.highlight_text(&source, 5..5 + text[name_offset..].len()),
                 );
-                return Some(CodeLabel {
-                    text,
-                    runs,
-                    filter_range: 0..label.len(),
-                });
+                let filter_range = completion
+                    .filter_text
+                    .as_deref()
+                    .and_then(|filter_text| {
+                        text.find(filter_text)
+                            .map(|start| start..start + filter_text.len())
+                    })
+                    .unwrap_or(0..label.len());
+                return Some(CodeLabel::new(text, filter_range, runs));
             }
             Some((lsp::CompletionItemKind::INTERFACE, _)) => {
                 let text = format!("{label} interface {{}}");
                 let source = Rope::from(format!("type {}", &text[name_offset..]).as_str());
                 let runs = adjust_runs(
                     name_offset,
-                    language.highlight_text(&source, 5..5 + text.len()),
+                    language.highlight_text(&source, 5..5 + text[name_offset..].len()),
                 );
-                return Some(CodeLabel {
-                    text,
-                    runs,
-                    filter_range: 0..label.len(),
-                });
+                let filter_range = completion
+                    .filter_text
+                    .as_deref()
+                    .and_then(|filter_text| {
+                        text.find(filter_text)
+                            .map(|start| start..start + filter_text.len())
+                    })
+                    .unwrap_or(0..label.len());
+                return Some(CodeLabel::new(text, filter_range, runs));
             }
             Some((lsp::CompletionItemKind::FIELD, detail)) => {
                 let text = format!("{label} {detail}");
@@ -276,13 +335,17 @@ impl super::LspAdapter for GoLspAdapter {
                     Rope::from(format!("type T struct {{ {} }}", &text[name_offset..]).as_str());
                 let runs = adjust_runs(
                     name_offset,
-                    language.highlight_text(&source, 16..16 + text.len()),
+                    language.highlight_text(&source, 16..16 + text[name_offset..].len()),
                 );
-                return Some(CodeLabel {
-                    text,
-                    runs,
-                    filter_range: 0..label.len(),
-                });
+                let filter_range = completion
+                    .filter_text
+                    .as_deref()
+                    .and_then(|filter_text| {
+                        text.find(filter_text)
+                            .map(|start| start..start + filter_text.len())
+                    })
+                    .unwrap_or(0..label.len());
+                return Some(CodeLabel::new(text, filter_range, runs));
             }
             Some((lsp::CompletionItemKind::FUNCTION | lsp::CompletionItemKind::METHOD, detail)) => {
                 if let Some(signature) = detail.strip_prefix("func") {
@@ -290,13 +353,17 @@ impl super::LspAdapter for GoLspAdapter {
                     let source = Rope::from(format!("func {} {{}}", &text[name_offset..]).as_str());
                     let runs = adjust_runs(
                         name_offset,
-                        language.highlight_text(&source, 5..5 + text.len()),
+                        language.highlight_text(&source, 5..5 + text[name_offset..].len()),
                     );
-                    return Some(CodeLabel {
-                        filter_range: 0..label.len(),
-                        text,
-                        runs,
-                    });
+                    let filter_range = completion
+                        .filter_text
+                        .as_deref()
+                        .and_then(|filter_text| {
+                            text.find(filter_text)
+                                .map(|start| start..start + filter_text.len())
+                        })
+                        .unwrap_or(0..label.len());
+                    return Some(CodeLabel::new(text, filter_range, runs));
                 }
             }
             _ => {}
@@ -306,11 +373,11 @@ impl super::LspAdapter for GoLspAdapter {
 
     async fn label_for_symbol(
         &self,
-        name: &str,
-        kind: lsp::SymbolKind,
+        symbol: &language::Symbol,
         language: &Arc<Language>,
     ) -> Option<CodeLabel> {
-        let (text, filter_range, display_range) = match kind {
+        let name = &symbol.name;
+        let (text, filter_range, display_range) = match symbol.kind {
             lsp::SymbolKind::METHOD | lsp::SymbolKind::FUNCTION => {
                 let text = format!("func {} () {{}}", name);
                 let filter_range = 5..5 + name.len();
@@ -356,39 +423,54 @@ impl super::LspAdapter for GoLspAdapter {
             _ => return None,
         };
 
-        Some(CodeLabel {
-            runs: language.highlight_text(&text.as_str().into(), display_range.clone()),
-            text: text[display_range].to_string(),
+        Some(CodeLabel::new(
+            text[display_range.clone()].to_string(),
             filter_range,
-        })
+            language.highlight_text(&text.as_str().into(), display_range),
+        ))
+    }
+
+    fn diagnostic_message_to_markdown(&self, message: &str) -> Option<String> {
+        static REGEX: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"(?m)\n\s*").expect("Failed to create REGEX"));
+        Some(REGEX.replace_all(message, "\n\n").to_string())
     }
 }
 
-async fn get_cached_server_binary(container_dir: PathBuf) -> Option<LanguageServerBinary> {
+fn parse_version_output(output: &Output) -> Result<&str> {
+    let version_stdout =
+        str::from_utf8(&output.stdout).context("version command produced invalid utf8 output")?;
+
+    let version = VERSION_REGEX
+        .find(version_stdout)
+        .with_context(|| format!("failed to parse version output '{version_stdout}'"))?
+        .as_str();
+
+    Ok(version)
+}
+
+async fn get_cached_server_binary(container_dir: &Path) -> Option<LanguageServerBinary> {
     maybe!(async {
         let mut last_binary_path = None;
-        let mut entries = fs::read_dir(&container_dir).await?;
+        let mut entries = fs::read_dir(container_dir).await?;
         while let Some(entry) = entries.next().await {
             let entry = entry?;
             if entry.file_type().await?.is_file()
                 && entry
                     .file_name()
                     .to_str()
-                    .map_or(false, |name| name.starts_with("gopls_"))
+                    .is_some_and(|name| name.starts_with("gopls_"))
             {
                 last_binary_path = Some(entry.path());
             }
         }
 
-        if let Some(path) = last_binary_path {
-            Ok(LanguageServerBinary {
-                path,
-                arguments: server_binary_arguments(),
-                env: None,
-            })
-        } else {
-            Err(anyhow!("no cached binary"))
-        }
+        let path = last_binary_path.context("no cached binary")?;
+        anyhow::Ok(LanguageServerBinary {
+            path,
+            arguments: server_binary_arguments(),
+            env: None,
+        })
     })
     .await
     .log_err()
@@ -412,16 +494,22 @@ const GO_MODULE_ROOT_TASK_VARIABLE: VariableName =
     VariableName::Custom(Cow::Borrowed("GO_MODULE_ROOT"));
 const GO_SUBTEST_NAME_TASK_VARIABLE: VariableName =
     VariableName::Custom(Cow::Borrowed("GO_SUBTEST_NAME"));
+const GO_TABLE_TEST_CASE_NAME_TASK_VARIABLE: VariableName =
+    VariableName::Custom(Cow::Borrowed("GO_TABLE_TEST_CASE_NAME"));
+const GO_SUITE_NAME_TASK_VARIABLE: VariableName =
+    VariableName::Custom(Cow::Borrowed("GO_SUITE_NAME"));
 
 impl ContextProvider for GoContextProvider {
     fn build_context(
         &self,
         variables: &TaskVariables,
-        location: &Location,
-        _: Option<&HashMap<String, String>>,
-        cx: &mut gpui::AppContext,
-    ) -> Result<TaskVariables> {
+        location: ContextLocation<'_>,
+        _: Option<HashMap<String, String>>,
+        _: Arc<dyn LanguageToolchainStore>,
+        cx: &mut gpui::App,
+    ) -> Task<Result<TaskVariables>> {
         let local_abs_path = location
+            .file_location
             .buffer
             .read(cx)
             .file()
@@ -446,7 +534,7 @@ impl ContextProvider for GoContextProvider {
                     })
                     .unwrap_or_else(|| format!("{}", buffer_dir.to_string_lossy()));
 
-                (GO_PACKAGE_TASK_VARIABLE.clone(), package_name.to_string())
+                (GO_PACKAGE_TASK_VARIABLE.clone(), package_name)
             });
 
         let go_module_root_variable = local_abs_path
@@ -457,7 +545,7 @@ impl ContextProvider for GoContextProvider {
                 let module_dir = buffer_dir
                     .ancestors()
                     .find(|dir| dir.join("go.mod").is_file())
-                    .map(|dir| dir.to_string_lossy().to_string())
+                    .map(|dir| dir.to_string_lossy().into_owned())
                     .unwrap_or_else(|| ".".to_string());
 
                 (GO_MODULE_ROOT_TASK_VARIABLE.clone(), module_dir)
@@ -468,22 +556,34 @@ impl ContextProvider for GoContextProvider {
         let go_subtest_variable = extract_subtest_name(_subtest_name.unwrap_or(""))
             .map(|subtest_name| (GO_SUBTEST_NAME_TASK_VARIABLE.clone(), subtest_name));
 
-        Ok(TaskVariables::from_iter(
+        let _table_test_case_name = variables.get(&VariableName::Custom(Cow::Borrowed(
+            "_table_test_case_name",
+        )));
+
+        let go_table_test_case_variable = _table_test_case_name
+            .and_then(extract_subtest_name)
+            .map(|case_name| (GO_TABLE_TEST_CASE_NAME_TASK_VARIABLE.clone(), case_name));
+
+        let _suite_name = variables.get(&VariableName::Custom(Cow::Borrowed("_suite_name")));
+
+        let go_suite_variable = _suite_name
+            .and_then(extract_subtest_name)
+            .map(|suite_name| (GO_SUITE_NAME_TASK_VARIABLE.clone(), suite_name));
+
+        Task::ready(Ok(TaskVariables::from_iter(
             [
                 go_package_variable,
                 go_subtest_variable,
+                go_table_test_case_variable,
+                go_suite_variable,
                 go_module_root_variable,
             ]
             .into_iter()
             .flatten(),
-        ))
+        )))
     }
 
-    fn associated_tasks(
-        &self,
-        _: Option<Arc<dyn language::File>>,
-        _: &AppContext,
-    ) -> Option<TaskTemplates> {
+    fn associated_tasks(&self, _: Option<Arc<dyn File>>, _: &App) -> Task<Option<TaskTemplates>> {
         let package_cwd = if GO_PACKAGE_TASK_VARIABLE.template_value() == "." {
             None
         } else {
@@ -491,7 +591,54 @@ impl ContextProvider for GoContextProvider {
         };
         let module_cwd = Some(GO_MODULE_ROOT_TASK_VARIABLE.template_value());
 
-        Some(TaskTemplates(vec![
+        Task::ready(Some(TaskTemplates(vec![
+            TaskTemplate {
+                label: format!(
+                    "go test {} -v -run Test{}/{}",
+                    GO_PACKAGE_TASK_VARIABLE.template_value(),
+                    GO_SUITE_NAME_TASK_VARIABLE.template_value(),
+                    VariableName::Symbol.template_value(),
+                ),
+                command: "go".into(),
+                args: vec![
+                    "test".into(),
+                    "-v".into(),
+                    "-run".into(),
+                    format!(
+                        "\\^Test{}\\$/\\^{}\\$",
+                        GO_SUITE_NAME_TASK_VARIABLE.template_value(),
+                        VariableName::Symbol.template_value(),
+                    ),
+                ],
+                cwd: package_cwd.clone(),
+                tags: vec!["go-testify-suite".to_owned()],
+                ..TaskTemplate::default()
+            },
+            TaskTemplate {
+                label: format!(
+                    "go test {} -v -run {}/{}",
+                    GO_PACKAGE_TASK_VARIABLE.template_value(),
+                    VariableName::Symbol.template_value(),
+                    GO_TABLE_TEST_CASE_NAME_TASK_VARIABLE.template_value(),
+                ),
+                command: "go".into(),
+                args: vec![
+                    "test".into(),
+                    "-v".into(),
+                    "-run".into(),
+                    format!(
+                        "\\^{}\\$/\\^{}\\$",
+                        VariableName::Symbol.template_value(),
+                        GO_TABLE_TEST_CASE_NAME_TASK_VARIABLE.template_value(),
+                    ),
+                ],
+                cwd: package_cwd.clone(),
+                tags: vec![
+                    "go-table-test-case".to_owned(),
+                    "go-table-test-case-without-explicit-variable".to_owned(),
+                ],
+                ..TaskTemplate::default()
+            },
             TaskTemplate {
                 label: format!(
                     "go test {} -run {}",
@@ -502,9 +649,25 @@ impl ContextProvider for GoContextProvider {
                 args: vec![
                     "test".into(),
                     "-run".into(),
-                    format!("^{}\\$", VariableName::Symbol.template_value(),),
+                    format!("\\^{}\\$", VariableName::Symbol.template_value(),),
                 ],
                 tags: vec!["go-test".to_owned()],
+                cwd: package_cwd.clone(),
+                ..TaskTemplate::default()
+            },
+            TaskTemplate {
+                label: format!(
+                    "go test {} -run {}",
+                    GO_PACKAGE_TASK_VARIABLE.template_value(),
+                    VariableName::Symbol.template_value(),
+                ),
+                command: "go".into(),
+                args: vec![
+                    "test".into(),
+                    "-run".into(),
+                    format!("\\^{}\\$", VariableName::Symbol.template_value(),),
+                ],
+                tags: vec!["go-example".to_owned()],
                 cwd: package_cwd.clone(),
                 ..TaskTemplate::default()
             },
@@ -535,7 +698,7 @@ impl ContextProvider for GoContextProvider {
                     "-v".into(),
                     "-run".into(),
                     format!(
-                        "^{}\\$/^{}\\$",
+                        "'^{}$/^{}$'",
                         VariableName::Symbol.template_value(),
                         GO_SUBTEST_NAME_TASK_VARIABLE.template_value(),
                     ),
@@ -554,12 +717,29 @@ impl ContextProvider for GoContextProvider {
                 args: vec![
                     "test".into(),
                     "-benchmem".into(),
-                    "-run=^$".into(),
+                    "-run='^$'".into(),
                     "-bench".into(),
-                    format!("^{}\\$", VariableName::Symbol.template_value()),
+                    format!("\\^{}\\$", VariableName::Symbol.template_value()),
                 ],
                 cwd: package_cwd.clone(),
                 tags: vec!["go-benchmark".to_owned()],
+                ..TaskTemplate::default()
+            },
+            TaskTemplate {
+                label: format!(
+                    "go test {} -fuzz=Fuzz -run {}",
+                    GO_PACKAGE_TASK_VARIABLE.template_value(),
+                    VariableName::Symbol.template_value(),
+                ),
+                command: "go".into(),
+                args: vec![
+                    "test".into(),
+                    "-fuzz=Fuzz".into(),
+                    "-run".into(),
+                    format!("\\^{}\\$", VariableName::Symbol.template_value(),),
+                ],
+                tags: vec!["go-fuzz".to_owned()],
+                cwd: package_cwd.clone(),
                 ..TaskTemplate::default()
             },
             TaskTemplate {
@@ -574,7 +754,7 @@ impl ContextProvider for GoContextProvider {
                 label: format!("go generate {}", GO_PACKAGE_TASK_VARIABLE.template_value()),
                 command: "go".into(),
                 args: vec!["generate".into()],
-                cwd: package_cwd.clone(),
+                cwd: package_cwd,
                 tags: vec!["go-generate".to_owned()],
                 ..TaskTemplate::default()
             },
@@ -582,19 +762,28 @@ impl ContextProvider for GoContextProvider {
                 label: "go generate ./...".into(),
                 command: "go".into(),
                 args: vec!["generate".into(), "./...".into()],
-                cwd: module_cwd.clone(),
+                cwd: module_cwd,
                 ..TaskTemplate::default()
             },
-        ]))
+        ])))
     }
 }
 
 fn extract_subtest_name(input: &str) -> Option<String> {
-    let replaced_spaces = input.trim_matches('"').replace(' ', "_");
+    let content = if input.starts_with('`') && input.ends_with('`') {
+        input.trim_matches('`')
+    } else {
+        input.trim_matches('"')
+    };
+
+    let processed = content
+        .chars()
+        .map(|c| if c.is_whitespace() { '_' } else { c })
+        .collect::<String>();
 
     Some(
         GO_ESCAPE_SUBTEST_NAME_REGEX
-            .replace_all(&replaced_spaces, |caps: &regex::Captures| {
+            .replace_all(&processed, |caps: &regex::Captures| {
                 format!("\\{}", &caps[0])
             })
             .to_string(),
@@ -605,7 +794,7 @@ fn extract_subtest_name(input: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::language;
-    use gpui::Hsla;
+    use gpui::{AppContext, Hsla, TestAppContext};
     use theme::SyntaxTheme;
 
     #[gpui::test]
@@ -627,6 +816,7 @@ mod tests {
         let highlight_type = grammar.highlight_id_for_name("type").unwrap();
         let highlight_keyword = grammar.highlight_id_for_name("keyword").unwrap();
         let highlight_number = grammar.highlight_id_for_name("number").unwrap();
+        let highlight_field = grammar.highlight_id_for_name("property").unwrap();
 
         assert_eq!(
             adapter
@@ -640,15 +830,15 @@ mod tests {
                     &language
                 )
                 .await,
-            Some(CodeLabel {
-                text: "Hello(a B) c.D".to_string(),
-                filter_range: 0..5,
-                runs: vec![
+            Some(CodeLabel::new(
+                "Hello(a B) c.D".to_string(),
+                0..5,
+                vec![
                     (0..5, highlight_function),
                     (8..9, highlight_type),
                     (13..14, highlight_type),
-                ],
-            })
+                ]
+            ))
         );
 
         // Nested methods
@@ -664,15 +854,15 @@ mod tests {
                     &language
                 )
                 .await,
-            Some(CodeLabel {
-                text: "one.two.Three() [3]interface{}".to_string(),
-                filter_range: 0..13,
-                runs: vec![
+            Some(CodeLabel::new(
+                "one.two.Three() [3]interface{}".to_string(),
+                0..13,
+                vec![
                     (8..13, highlight_function),
                     (17..18, highlight_number),
                     (19..28, highlight_keyword),
                 ],
-            })
+            ))
         );
 
         // Nested fields
@@ -688,11 +878,687 @@ mod tests {
                     &language
                 )
                 .await,
-            Some(CodeLabel {
-                text: "two.Three a.Bcd".to_string(),
-                filter_range: 0..9,
-                runs: vec![(12..15, highlight_type)],
-            })
+            Some(CodeLabel::new(
+                "two.Three a.Bcd".to_string(),
+                0..9,
+                vec![(4..9, highlight_field), (12..15, highlight_type)],
+            ))
         );
+    }
+
+    #[gpui::test]
+    fn test_go_test_main_ignored(cx: &mut TestAppContext) {
+        let language = language("go", tree_sitter_go::LANGUAGE.into());
+
+        let example_test = r#"
+        package main
+
+        func TestMain(m *testing.M) {
+            os.Exit(m.Run())
+        }
+        "#;
+
+        let buffer =
+            cx.new(|cx| crate::Buffer::local(example_test, cx).with_language(language.clone(), cx));
+        cx.executor().run_until_parked();
+
+        let runnables: Vec<_> = buffer.update(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            snapshot.runnable_ranges(0..example_test.len()).collect()
+        });
+
+        let tag_strings: Vec<String> = runnables
+            .iter()
+            .flat_map(|r| &r.runnable.tags)
+            .map(|tag| tag.0.to_string())
+            .collect();
+
+        assert!(
+            !tag_strings.contains(&"go-test".to_string()),
+            "Should NOT find go-test tag, found: {:?}",
+            tag_strings
+        );
+    }
+
+    #[gpui::test]
+    fn test_testify_suite_detection(cx: &mut TestAppContext) {
+        let language = language("go", tree_sitter_go::LANGUAGE.into());
+
+        let testify_suite = r#"
+        package main
+
+        import (
+            "testing"
+
+            "github.com/stretchr/testify/suite"
+        )
+
+        type ExampleSuite struct {
+            suite.Suite
+        }
+
+        func TestExampleSuite(t *testing.T) {
+            suite.Run(t, new(ExampleSuite))
+        }
+
+        func (s *ExampleSuite) TestSomething_Success() {
+            // test code
+        }
+        "#;
+
+        let buffer = cx
+            .new(|cx| crate::Buffer::local(testify_suite, cx).with_language(language.clone(), cx));
+        cx.executor().run_until_parked();
+
+        let runnables: Vec<_> = buffer.update(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            snapshot.runnable_ranges(0..testify_suite.len()).collect()
+        });
+
+        let tag_strings: Vec<String> = runnables
+            .iter()
+            .flat_map(|r| &r.runnable.tags)
+            .map(|tag| tag.0.to_string())
+            .collect();
+
+        assert!(
+            tag_strings.contains(&"go-test".to_string()),
+            "Should find go-test tag, found: {:?}",
+            tag_strings
+        );
+        assert!(
+            tag_strings.contains(&"go-testify-suite".to_string()),
+            "Should find go-testify-suite tag, found: {:?}",
+            tag_strings
+        );
+    }
+
+    #[gpui::test]
+    fn test_go_runnable_detection(cx: &mut TestAppContext) {
+        let language = language("go", tree_sitter_go::LANGUAGE.into());
+
+        let interpreted_string_subtest = r#"
+        package main
+
+        import "testing"
+
+        func TestExample(t *testing.T) {
+            t.Run("subtest with double quotes", func(t *testing.T) {
+                // test code
+            })
+        }
+        "#;
+
+        let raw_string_subtest = r#"
+        package main
+
+        import "testing"
+
+        func TestExample(t *testing.T) {
+            t.Run(`subtest with
+            multiline
+            backticks`, func(t *testing.T) {
+                // test code
+            })
+        }
+        "#;
+
+        let buffer = cx.new(|cx| {
+            crate::Buffer::local(interpreted_string_subtest, cx).with_language(language.clone(), cx)
+        });
+        cx.executor().run_until_parked();
+
+        let runnables: Vec<_> = buffer.update(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            snapshot
+                .runnable_ranges(0..interpreted_string_subtest.len())
+                .collect()
+        });
+
+        let tag_strings: Vec<String> = runnables
+            .iter()
+            .flat_map(|r| &r.runnable.tags)
+            .map(|tag| tag.0.to_string())
+            .collect();
+
+        assert!(
+            tag_strings.contains(&"go-test".to_string()),
+            "Should find go-test tag, found: {:?}",
+            tag_strings
+        );
+        assert!(
+            tag_strings.contains(&"go-subtest".to_string()),
+            "Should find go-subtest tag, found: {:?}",
+            tag_strings
+        );
+
+        let buffer = cx.new(|cx| {
+            crate::Buffer::local(raw_string_subtest, cx).with_language(language.clone(), cx)
+        });
+        cx.executor().run_until_parked();
+
+        let runnables: Vec<_> = buffer.update(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            snapshot
+                .runnable_ranges(0..raw_string_subtest.len())
+                .collect()
+        });
+
+        let tag_strings: Vec<String> = runnables
+            .iter()
+            .flat_map(|r| &r.runnable.tags)
+            .map(|tag| tag.0.to_string())
+            .collect();
+
+        assert!(
+            tag_strings.contains(&"go-test".to_string()),
+            "Should find go-test tag, found: {:?}",
+            tag_strings
+        );
+        assert!(
+            tag_strings.contains(&"go-subtest".to_string()),
+            "Should find go-subtest tag, found: {:?}",
+            tag_strings
+        );
+    }
+
+    #[gpui::test]
+    fn test_go_example_test_detection(cx: &mut TestAppContext) {
+        let language = language("go", tree_sitter_go::LANGUAGE.into());
+
+        let example_test = r#"
+        package main
+
+        import "fmt"
+
+        func Example() {
+            fmt.Println("Hello, world!")
+            // Output: Hello, world!
+        }
+        "#;
+
+        let buffer =
+            cx.new(|cx| crate::Buffer::local(example_test, cx).with_language(language.clone(), cx));
+        cx.executor().run_until_parked();
+
+        let runnables: Vec<_> = buffer.update(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            snapshot.runnable_ranges(0..example_test.len()).collect()
+        });
+
+        let tag_strings: Vec<String> = runnables
+            .iter()
+            .flat_map(|r| &r.runnable.tags)
+            .map(|tag| tag.0.to_string())
+            .collect();
+
+        assert!(
+            tag_strings.contains(&"go-example".to_string()),
+            "Should find go-example tag, found: {:?}",
+            tag_strings
+        );
+    }
+
+    #[gpui::test]
+    fn test_go_table_test_slice_detection(cx: &mut TestAppContext) {
+        let language = language("go", tree_sitter_go::LANGUAGE.into());
+
+        let table_test = r#"
+        package main
+
+        import "testing"
+
+        func TestExample(t *testing.T) {
+            _ = "some random string"
+
+            testCases := []struct{
+                name string
+                anotherStr string
+            }{
+                {
+                    name: "test case 1",
+                    anotherStr: "foo",
+                },
+                {
+                    name: "test case 2",
+                    anotherStr: "bar",
+                },
+                {
+                    name: "test case 3",
+                    anotherStr: "baz",
+                },
+            }
+
+            notATableTest := []struct{
+                name string
+            }{
+                {
+                    name: "some string",
+                },
+                {
+                    name: "some other string",
+                },
+            }
+
+            for _, tc := range testCases {
+                t.Run(tc.name, func(t *testing.T) {
+                    // test code here
+                })
+            }
+        }
+        "#;
+
+        let buffer =
+            cx.new(|cx| crate::Buffer::local(table_test, cx).with_language(language.clone(), cx));
+        cx.executor().run_until_parked();
+
+        let runnables: Vec<_> = buffer.update(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            snapshot.runnable_ranges(0..table_test.len()).collect()
+        });
+
+        let tag_strings: Vec<String> = runnables
+            .iter()
+            .flat_map(|r| &r.runnable.tags)
+            .map(|tag| tag.0.to_string())
+            .collect();
+
+        assert!(
+            tag_strings.contains(&"go-test".to_string()),
+            "Should find go-test tag, found: {:?}",
+            tag_strings
+        );
+        assert!(
+            tag_strings.contains(&"go-table-test-case".to_string()),
+            "Should find go-table-test-case tag, found: {:?}",
+            tag_strings
+        );
+
+        let go_test_count = tag_strings.iter().filter(|&tag| tag == "go-test").count();
+        // This is currently broken; see #39148
+        // let go_table_test_count = tag_strings
+        //     .iter()
+        //     .filter(|&tag| tag == "go-table-test-case")
+        //     .count();
+
+        assert!(
+            go_test_count == 1,
+            "Should find exactly 1 go-test, found: {}",
+            go_test_count
+        );
+        // assert!(
+        //     go_table_test_count == 3,
+        //     "Should find exactly 3 go-table-test-case, found: {}",
+        //     go_table_test_count
+        // );
+    }
+
+    #[gpui::test]
+    fn test_go_table_test_slice_without_explicit_variable_detection(cx: &mut TestAppContext) {
+        let language = language("go", tree_sitter_go::LANGUAGE.into());
+
+        let table_test = r#"
+        package main
+
+        import "testing"
+
+        func TestExample(t *testing.T) {
+            for _, tc := range []struct{
+                name string
+                anotherStr string
+            }{
+                {
+                    name: "test case 1",
+                    anotherStr: "foo",
+                },
+                {
+                    name: "test case 2",
+                    anotherStr: "bar",
+                },
+                {
+                    name: "test case 3",
+                    anotherStr: "baz",
+                },
+            } {
+                t.Run(tc.name, func(t *testing.T) {
+                    // test code here
+                })
+            }
+        }
+        "#;
+
+        let buffer =
+            cx.new(|cx| crate::Buffer::local(table_test, cx).with_language(language.clone(), cx));
+        cx.executor().run_until_parked();
+
+        let runnables: Vec<_> = buffer.update(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            snapshot.runnable_ranges(0..table_test.len()).collect()
+        });
+
+        let tag_strings: Vec<String> = runnables
+            .iter()
+            .flat_map(|r| &r.runnable.tags)
+            .map(|tag| tag.0.to_string())
+            .collect();
+
+        assert!(
+            tag_strings.contains(&"go-test".to_string()),
+            "Should find go-test tag, found: {:?}",
+            tag_strings
+        );
+        assert!(
+            tag_strings.contains(&"go-table-test-case-without-explicit-variable".to_string()),
+            "Should find go-table-test-case-without-explicit-variable tag, found: {:?}",
+            tag_strings
+        );
+
+        let go_test_count = tag_strings.iter().filter(|&tag| tag == "go-test").count();
+
+        assert!(
+            go_test_count == 1,
+            "Should find exactly 1 go-test, found: {}",
+            go_test_count
+        );
+    }
+
+    #[gpui::test]
+    fn test_go_table_test_map_without_explicit_variable_detection(cx: &mut TestAppContext) {
+        let language = language("go", tree_sitter_go::LANGUAGE.into());
+
+        let table_test = r#"
+        package main
+
+        import "testing"
+
+        func TestExample(t *testing.T) {
+            for name, tc := range map[string]struct {
+          		someStr string
+          		fail    bool
+           	}{
+          		"test failure": {
+         			someStr: "foo",
+         			fail:    true,
+          		},
+          		"test success": {
+         			someStr: "bar",
+         			fail:    false,
+          		},
+           	} {
+                t.Run(name, func(t *testing.T) {
+                    // test code here
+                })
+            }
+        }
+        "#;
+
+        let buffer =
+            cx.new(|cx| crate::Buffer::local(table_test, cx).with_language(language.clone(), cx));
+        cx.executor().run_until_parked();
+
+        let runnables: Vec<_> = buffer.update(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            snapshot.runnable_ranges(0..table_test.len()).collect()
+        });
+
+        let tag_strings: Vec<String> = runnables
+            .iter()
+            .flat_map(|r| &r.runnable.tags)
+            .map(|tag| tag.0.to_string())
+            .collect();
+
+        assert!(
+            tag_strings.contains(&"go-test".to_string()),
+            "Should find go-test tag, found: {:?}",
+            tag_strings
+        );
+        assert!(
+            tag_strings.contains(&"go-table-test-case-without-explicit-variable".to_string()),
+            "Should find go-table-test-case-without-explicit-variable tag, found: {:?}",
+            tag_strings
+        );
+
+        let go_test_count = tag_strings.iter().filter(|&tag| tag == "go-test").count();
+        let go_table_test_count = tag_strings
+            .iter()
+            .filter(|&tag| tag == "go-table-test-case-without-explicit-variable")
+            .count();
+
+        assert!(
+            go_test_count == 1,
+            "Should find exactly 1 go-test, found: {}",
+            go_test_count
+        );
+        assert!(
+            go_table_test_count == 2,
+            "Should find exactly 2 go-table-test-case-without-explicit-variable, found: {}",
+            go_table_test_count
+        );
+    }
+
+    #[gpui::test]
+    fn test_go_table_test_slice_ignored(cx: &mut TestAppContext) {
+        let language = language("go", tree_sitter_go::LANGUAGE.into());
+
+        let table_test = r#"
+        package main
+
+        func Example() {
+            _ = "some random string"
+
+            notATableTest := []struct{
+                name string
+            }{
+                {
+                    name: "some string",
+                },
+                {
+                    name: "some other string",
+                },
+            }
+        }
+        "#;
+
+        let buffer =
+            cx.new(|cx| crate::Buffer::local(table_test, cx).with_language(language.clone(), cx));
+        cx.executor().run_until_parked();
+
+        let runnables: Vec<_> = buffer.update(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            snapshot.runnable_ranges(0..table_test.len()).collect()
+        });
+
+        let tag_strings: Vec<String> = runnables
+            .iter()
+            .flat_map(|r| &r.runnable.tags)
+            .map(|tag| tag.0.to_string())
+            .collect();
+
+        assert!(
+            !tag_strings.contains(&"go-test".to_string()),
+            "Should find go-test tag, found: {:?}",
+            tag_strings
+        );
+        assert!(
+            !tag_strings.contains(&"go-table-test-case".to_string()),
+            "Should find go-table-test-case tag, found: {:?}",
+            tag_strings
+        );
+    }
+
+    #[gpui::test]
+    fn test_go_table_test_map_detection(cx: &mut TestAppContext) {
+        let language = language("go", tree_sitter_go::LANGUAGE.into());
+
+        let table_test = r#"
+        package main
+
+        import "testing"
+
+        func TestExample(t *testing.T) {
+            _ = "some random string"
+
+           	testCases := map[string]struct {
+          		someStr string
+          		fail    bool
+           	}{
+          		"test failure": {
+         			someStr: "foo",
+         			fail:    true,
+          		},
+          		"test success": {
+         			someStr: "bar",
+         			fail:    false,
+          		},
+           	}
+
+           	notATableTest := map[string]struct {
+          		someStr string
+           	}{
+          		"some string": {
+         			someStr: "foo",
+          		},
+          		"some other string": {
+         			someStr: "bar",
+          		},
+           	}
+
+            for name, tc := range testCases {
+                t.Run(name, func(t *testing.T) {
+                    // test code here
+                })
+            }
+        }
+        "#;
+
+        let buffer =
+            cx.new(|cx| crate::Buffer::local(table_test, cx).with_language(language.clone(), cx));
+        cx.executor().run_until_parked();
+
+        let runnables: Vec<_> = buffer.update(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            snapshot.runnable_ranges(0..table_test.len()).collect()
+        });
+
+        let tag_strings: Vec<String> = runnables
+            .iter()
+            .flat_map(|r| &r.runnable.tags)
+            .map(|tag| tag.0.to_string())
+            .collect();
+
+        assert!(
+            tag_strings.contains(&"go-test".to_string()),
+            "Should find go-test tag, found: {:?}",
+            tag_strings
+        );
+        assert!(
+            tag_strings.contains(&"go-table-test-case".to_string()),
+            "Should find go-table-test-case tag, found: {:?}",
+            tag_strings
+        );
+
+        let go_test_count = tag_strings.iter().filter(|&tag| tag == "go-test").count();
+        let go_table_test_count = tag_strings
+            .iter()
+            .filter(|&tag| tag == "go-table-test-case")
+            .count();
+
+        assert!(
+            go_test_count == 1,
+            "Should find exactly 1 go-test, found: {}",
+            go_test_count
+        );
+        assert!(
+            go_table_test_count == 2,
+            "Should find exactly 2 go-table-test-case, found: {}",
+            go_table_test_count
+        );
+    }
+
+    #[gpui::test]
+    fn test_go_table_test_map_ignored(cx: &mut TestAppContext) {
+        let language = language("go", tree_sitter_go::LANGUAGE.into());
+
+        let table_test = r#"
+        package main
+
+        func Example() {
+            _ = "some random string"
+
+           	notATableTest := map[string]struct {
+          		someStr string
+           	}{
+          		"some string": {
+         			someStr: "foo",
+          		},
+          		"some other string": {
+         			someStr: "bar",
+          		},
+           	}
+        }
+        "#;
+
+        let buffer =
+            cx.new(|cx| crate::Buffer::local(table_test, cx).with_language(language.clone(), cx));
+        cx.executor().run_until_parked();
+
+        let runnables: Vec<_> = buffer.update(cx, |buffer, _| {
+            let snapshot = buffer.snapshot();
+            snapshot.runnable_ranges(0..table_test.len()).collect()
+        });
+
+        let tag_strings: Vec<String> = runnables
+            .iter()
+            .flat_map(|r| &r.runnable.tags)
+            .map(|tag| tag.0.to_string())
+            .collect();
+
+        assert!(
+            !tag_strings.contains(&"go-test".to_string()),
+            "Should find go-test tag, found: {:?}",
+            tag_strings
+        );
+        assert!(
+            !tag_strings.contains(&"go-table-test-case".to_string()),
+            "Should find go-table-test-case tag, found: {:?}",
+            tag_strings
+        );
+    }
+
+    #[test]
+    fn test_extract_subtest_name() {
+        // Interpreted string literal
+        let input_double_quoted = r#""subtest with double quotes""#;
+        let result = extract_subtest_name(input_double_quoted);
+        assert_eq!(result, Some(r#"subtest_with_double_quotes"#.to_string()));
+
+        let input_double_quoted_with_backticks = r#""test with `backticks` inside""#;
+        let result = extract_subtest_name(input_double_quoted_with_backticks);
+        assert_eq!(result, Some(r#"test_with_`backticks`_inside"#.to_string()));
+
+        // Raw string literal
+        let input_with_backticks = r#"`subtest with backticks`"#;
+        let result = extract_subtest_name(input_with_backticks);
+        assert_eq!(result, Some(r#"subtest_with_backticks"#.to_string()));
+
+        let input_raw_with_quotes = r#"`test with "quotes" and other chars`"#;
+        let result = extract_subtest_name(input_raw_with_quotes);
+        assert_eq!(
+            result,
+            Some(r#"test_with_\"quotes\"_and_other_chars"#.to_string())
+        );
+
+        let input_multiline = r#"`subtest with
+        multiline
+        backticks`"#;
+        let result = extract_subtest_name(input_multiline);
+        assert_eq!(
+            result,
+            Some(r#"subtest_with_________multiline_________backticks"#.to_string())
+        );
+
+        let input_with_double_quotes = r#"`test with "double quotes"`"#;
+        let result = extract_subtest_name(input_with_double_quotes);
+        assert_eq!(result, Some(r#"test_with_\"double_quotes\""#.to_string()));
     }
 }

@@ -1,8 +1,8 @@
 use crate::db::{ChannelId, ChannelRole, UserId};
-use anyhow::{anyhow, Result};
+use anyhow::{Context as _, Result};
 use collections::{BTreeMap, HashMap, HashSet};
 use rpc::ConnectionId;
-use semantic_version::SemanticVersion;
+use semver::Version;
 use serde::Serialize;
 use std::fmt;
 use tracing::instrument;
@@ -19,8 +19,8 @@ struct ConnectedPrincipal {
     connection_ids: HashSet<ConnectionId>,
 }
 
-#[derive(Copy, Clone, Debug, Serialize, PartialOrd, PartialEq, Eq, Ord)]
-pub struct ZedVersion(pub SemanticVersion);
+#[derive(Clone, Debug, Serialize, PartialOrd, PartialEq, Eq, Ord)]
+pub struct ZedVersion(pub Version);
 
 impl fmt::Display for ZedVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -30,7 +30,19 @@ impl fmt::Display for ZedVersion {
 
 impl ZedVersion {
     pub fn can_collaborate(&self) -> bool {
-        self.0 >= SemanticVersion::new(0, 157, 0)
+        // v0.204.1 was the first version after the auto-update bug.
+        // We reject any clients older than that to hope we can persuade them to upgrade.
+        if self.0 < Version::new(0, 204, 1) {
+            return false;
+        }
+
+        // Since we hotfixed the changes to no longer connect to Collab automatically to Preview, we also need to reject
+        // versions in the range [v0.199.0, v0.199.1].
+        if self.0 >= Version::new(0, 199, 0) && self.0 < Version::new(0, 199, 2) {
+            return false;
+        }
+
+        true
     }
 }
 
@@ -77,7 +89,7 @@ impl ConnectionPool {
         let connection = self
             .connections
             .get_mut(&connection_id)
-            .ok_or_else(|| anyhow!("no such connection"))?;
+            .context("no such connection")?;
 
         let user_id = connection.user_id;
 
@@ -156,15 +168,16 @@ impl ConnectionPool {
             .is_empty()
     }
 
-    #[cfg(test)]
+    #[cfg(feature = "test-support")]
     pub fn check_invariants(&self) {
         for (connection_id, connection) in &self.connections {
-            assert!(self
-                .connected_users
-                .get(&connection.user_id)
-                .unwrap()
-                .connection_ids
-                .contains(connection_id));
+            assert!(
+                self.connected_users
+                    .get(&connection.user_id)
+                    .unwrap()
+                    .connection_ids
+                    .contains(connection_id)
+            );
         }
 
         for (user_id, state) in &self.connected_users {

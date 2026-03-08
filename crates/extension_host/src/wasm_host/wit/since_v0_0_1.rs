@@ -1,14 +1,15 @@
-use super::latest;
-use crate::wasm_host::wit::since_v0_0_4;
+use super::{latest, since_v0_6_0};
 use crate::wasm_host::WasmState;
+use crate::wasm_host::wit::since_v0_0_4;
 use anyhow::Result;
-use async_trait::async_trait;
-use language::{LanguageServerBinaryStatus, LspAdapterDelegate};
-use semantic_version::SemanticVersion;
+use extension::{ExtensionLanguageServerProxy, WorktreeDelegate};
+use gpui::BackgroundExecutor;
+use language::BinaryStatus;
+use semver::Version;
 use std::sync::{Arc, OnceLock};
 use wasmtime::component::{Linker, Resource};
 
-pub const MIN_VERSION: SemanticVersion = SemanticVersion::new(0, 0, 1);
+pub const MIN_VERSION: Version = Version::new(0, 0, 1);
 
 wasmtime::component::bindgen!({
     async: true,
@@ -16,16 +17,16 @@ wasmtime::component::bindgen!({
     path: "../extension_api/wit/since_v0.0.1",
     with: {
          "worktree": ExtensionWorktree,
-         "zed:extension/github": latest::zed::extension::github,
+         "zed:extension/github": since_v0_6_0::zed::extension::github,
          "zed:extension/platform": latest::zed::extension::platform,
     },
 });
 
-pub type ExtensionWorktree = Arc<dyn LspAdapterDelegate>;
+pub type ExtensionWorktree = Arc<dyn WorktreeDelegate>;
 
-pub fn linker() -> &'static Linker<WasmState> {
+pub fn linker(executor: &BackgroundExecutor) -> &'static Linker<WasmState> {
     static LINKER: OnceLock<Linker<WasmState>> = OnceLock::new();
-    LINKER.get_or_init(|| super::new_linker(Extension::add_to_linker))
+    LINKER.get_or_init(|| super::new_linker(executor, Extension::add_to_linker))
 }
 
 impl From<DownloadedFileType> for latest::DownloadedFileType {
@@ -58,11 +59,10 @@ impl From<Command> for latest::Command {
     }
 }
 
-#[async_trait]
 impl HostWorktree for WasmState {
     async fn read_text_file(
         &mut self,
-        delegate: Resource<Arc<dyn LspAdapterDelegate>>,
+        delegate: Resource<Arc<dyn WorktreeDelegate>>,
         path: String,
     ) -> wasmtime::Result<Result<String, String>> {
         latest::HostWorktree::read_text_file(self, delegate, path).await
@@ -70,25 +70,24 @@ impl HostWorktree for WasmState {
 
     async fn shell_env(
         &mut self,
-        delegate: Resource<Arc<dyn LspAdapterDelegate>>,
+        delegate: Resource<Arc<dyn WorktreeDelegate>>,
     ) -> wasmtime::Result<EnvVars> {
         latest::HostWorktree::shell_env(self, delegate).await
     }
 
     async fn which(
         &mut self,
-        delegate: Resource<Arc<dyn LspAdapterDelegate>>,
+        delegate: Resource<Arc<dyn WorktreeDelegate>>,
         binary_name: String,
     ) -> wasmtime::Result<Option<String>> {
         latest::HostWorktree::which(self, delegate, binary_name).await
     }
 
-    fn drop(&mut self, _worktree: Resource<Worktree>) -> Result<()> {
+    async fn drop(&mut self, _worktree: Resource<Worktree>) -> Result<()> {
         Ok(())
     }
 }
 
-#[async_trait]
 impl ExtensionImports for WasmState {
     async fn node_binary_path(&mut self) -> wasmtime::Result<Result<String, String>> {
         latest::nodejs::Host::node_binary_path(self).await
@@ -121,7 +120,7 @@ impl ExtensionImports for WasmState {
         repo: String,
         options: GithubReleaseOptions,
     ) -> wasmtime::Result<Result<GithubRelease, String>> {
-        latest::zed::extension::github::Host::latest_github_release(self, repo, options).await
+        since_v0_6_0::zed::extension::github::Host::latest_github_release(self, repo, options).await
     }
 
     async fn current_platform(&mut self) -> Result<(Os, Architecture)> {
@@ -134,22 +133,17 @@ impl ExtensionImports for WasmState {
         status: LanguageServerInstallationStatus,
     ) -> wasmtime::Result<()> {
         let status = match status {
-            LanguageServerInstallationStatus::CheckingForUpdate => {
-                LanguageServerBinaryStatus::CheckingForUpdate
-            }
-            LanguageServerInstallationStatus::Downloading => {
-                LanguageServerBinaryStatus::Downloading
-            }
+            LanguageServerInstallationStatus::CheckingForUpdate => BinaryStatus::CheckingForUpdate,
+            LanguageServerInstallationStatus::Downloading => BinaryStatus::Downloading,
             LanguageServerInstallationStatus::Cached
-            | LanguageServerInstallationStatus::Downloaded => LanguageServerBinaryStatus::None,
-            LanguageServerInstallationStatus::Failed(error) => {
-                LanguageServerBinaryStatus::Failed { error }
-            }
+            | LanguageServerInstallationStatus::Downloaded => BinaryStatus::None,
+            LanguageServerInstallationStatus::Failed(error) => BinaryStatus::Failed { error },
         };
 
         self.host
-            .registration_hooks
-            .update_lsp_status(lsp::LanguageServerName(server_name.into()), status);
+            .proxy
+            .update_language_server_status(lsp::LanguageServerName(server_name.into()), status);
+
         Ok(())
     }
 

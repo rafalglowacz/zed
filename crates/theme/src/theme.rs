@@ -11,6 +11,8 @@
 mod default_colors;
 mod fallback_themes;
 mod font_family_cache;
+mod icon_theme;
+mod icon_theme_schema;
 mod registry;
 mod scale;
 mod schema;
@@ -20,23 +22,36 @@ mod styles;
 use std::path::Path;
 use std::sync::Arc;
 
-use ::settings::{Settings, SettingsStore};
+use ::settings::DEFAULT_DARK_THEME;
+use ::settings::IntoGpui;
+use ::settings::Settings;
+use ::settings::SettingsStore;
 use anyhow::Result;
+use fallback_themes::apply_status_color_defaults;
 use fs::Fs;
+use gpui::BorrowAppContext;
+use gpui::Global;
 use gpui::{
-    px, AppContext, AssetSource, HighlightStyle, Hsla, Pixels, Refineable, SharedString,
-    WindowAppearance, WindowBackgroundAppearance,
+    App, AssetSource, HighlightStyle, Hsla, Pixels, Refineable, SharedString, WindowAppearance,
+    WindowBackgroundAppearance, px,
 };
 use serde::Deserialize;
 use uuid::Uuid;
 
 pub use crate::default_colors::*;
+use crate::fallback_themes::apply_theme_color_defaults;
 pub use crate::font_family_cache::*;
+pub use crate::icon_theme::*;
+pub use crate::icon_theme_schema::*;
 pub use crate::registry::*;
 pub use crate::scale::*;
 pub use crate::schema::*;
 pub use crate::settings::*;
 pub use crate::styles::*;
+pub use ::settings::{
+    FontStyleContent, HighlightStyleContent, StatusColorsContent, ThemeColorsContent,
+    ThemeStyleContent,
+};
 
 /// Defines window border radius for platforms that use client side decorations.
 pub const CLIENT_SIDE_DECORATION_ROUNDING: Pixels = px(10.0);
@@ -71,7 +86,16 @@ impl From<WindowAppearance> for Appearance {
     }
 }
 
-/// Which themes should be loaded. This is used primarlily for testing.
+impl From<Appearance> for ThemeAppearanceMode {
+    fn from(value: Appearance) -> Self {
+        match value {
+            Appearance::Light => Self::Light,
+            Appearance::Dark => Self::Dark,
+        }
+    }
+}
+
+/// Which themes should be loaded. This is used primarily for testing.
 pub enum LoadThemes {
     /// Only load the base theme.
     ///
@@ -83,7 +107,8 @@ pub enum LoadThemes {
 }
 
 /// Initialize the theme system.
-pub fn init(themes_to_load: LoadThemes, cx: &mut AppContext) {
+pub fn init(themes_to_load: LoadThemes, cx: &mut App) {
+    SystemAppearance::init(cx);
     let (assets, load_user_themes) = match themes_to_load {
         LoadThemes::JustBase => (Box::new(()) as Box<dyn AssetSource>, false),
         LoadThemes::All(assets) => (assets, true),
@@ -94,15 +119,68 @@ pub fn init(themes_to_load: LoadThemes, cx: &mut AppContext) {
         ThemeRegistry::global(cx).load_bundled_themes();
     }
 
-    ThemeSettings::register(cx);
     FontFamilyCache::init_global(cx);
 
-    let mut prev_buffer_font_size = ThemeSettings::get_global(cx).buffer_font_size;
+    let theme = GlobalTheme::configured_theme(cx);
+    let icon_theme = GlobalTheme::configured_icon_theme(cx);
+    cx.set_global(GlobalTheme { theme, icon_theme });
+
+    let settings = ThemeSettings::get_global(cx);
+
+    let mut prev_buffer_font_size_settings = settings.buffer_font_size_settings();
+    let mut prev_ui_font_size_settings = settings.ui_font_size_settings();
+    let mut prev_agent_ui_font_size_settings = settings.agent_ui_font_size_settings();
+    let mut prev_agent_buffer_font_size_settings = settings.agent_buffer_font_size_settings();
+    let mut prev_theme_name = settings.theme.name(SystemAppearance::global(cx).0);
+    let mut prev_icon_theme_name = settings.icon_theme.name(SystemAppearance::global(cx).0);
+    let mut prev_theme_overrides = (
+        settings.experimental_theme_overrides.clone(),
+        settings.theme_overrides.clone(),
+    );
+
     cx.observe_global::<SettingsStore>(move |cx| {
-        let buffer_font_size = ThemeSettings::get_global(cx).buffer_font_size;
-        if buffer_font_size != prev_buffer_font_size {
-            prev_buffer_font_size = buffer_font_size;
+        let settings = ThemeSettings::get_global(cx);
+
+        let buffer_font_size_settings = settings.buffer_font_size_settings();
+        let ui_font_size_settings = settings.ui_font_size_settings();
+        let agent_ui_font_size_settings = settings.agent_ui_font_size_settings();
+        let agent_buffer_font_size_settings = settings.agent_buffer_font_size_settings();
+        let theme_name = settings.theme.name(SystemAppearance::global(cx).0);
+        let icon_theme_name = settings.icon_theme.name(SystemAppearance::global(cx).0);
+        let theme_overrides = (
+            settings.experimental_theme_overrides.clone(),
+            settings.theme_overrides.clone(),
+        );
+
+        if buffer_font_size_settings != prev_buffer_font_size_settings {
+            prev_buffer_font_size_settings = buffer_font_size_settings;
             reset_buffer_font_size(cx);
+        }
+
+        if ui_font_size_settings != prev_ui_font_size_settings {
+            prev_ui_font_size_settings = ui_font_size_settings;
+            reset_ui_font_size(cx);
+        }
+
+        if agent_ui_font_size_settings != prev_agent_ui_font_size_settings {
+            prev_agent_ui_font_size_settings = agent_ui_font_size_settings;
+            reset_agent_ui_font_size(cx);
+        }
+
+        if agent_buffer_font_size_settings != prev_agent_buffer_font_size_settings {
+            prev_agent_buffer_font_size_settings = agent_buffer_font_size_settings;
+            reset_agent_buffer_font_size(cx);
+        }
+
+        if theme_name != prev_theme_name || theme_overrides != prev_theme_overrides {
+            prev_theme_name = theme_name;
+            prev_theme_overrides = theme_overrides;
+            GlobalTheme::reload_theme(cx);
+        }
+
+        if icon_theme_name != prev_icon_theme_name {
+            prev_icon_theme_name = icon_theme_name;
+            GlobalTheme::reload_icon_theme(cx);
         }
     })
     .detach();
@@ -114,9 +192,9 @@ pub trait ActiveTheme {
     fn theme(&self) -> &Arc<Theme>;
 }
 
-impl ActiveTheme for AppContext {
+impl ActiveTheme for App {
     fn theme(&self) -> &Arc<Theme> {
-        &ThemeSettings::get_global(self).active_theme
+        GlobalTheme::theme(self)
     }
 }
 
@@ -151,23 +229,28 @@ impl ThemeFamily {
             AppearanceContent::Dark => Appearance::Dark,
         };
 
-        let mut refined_theme_colors = match theme.appearance {
-            AppearanceContent::Light => ThemeColors::light(),
-            AppearanceContent::Dark => ThemeColors::dark(),
-        };
-        refined_theme_colors.refine(&theme.style.theme_colors_refinement());
-
         let mut refined_status_colors = match theme.appearance {
             AppearanceContent::Light => StatusColors::light(),
             AppearanceContent::Dark => StatusColors::dark(),
         };
-        refined_status_colors.refine(&theme.style.status_colors_refinement());
+        let mut status_colors_refinement = status_colors_refinement(&theme.style.status);
+        apply_status_color_defaults(&mut status_colors_refinement);
+        refined_status_colors.refine(&status_colors_refinement);
 
         let mut refined_player_colors = match theme.appearance {
             AppearanceContent::Light => PlayerColors::light(),
             AppearanceContent::Dark => PlayerColors::dark(),
         };
         refined_player_colors.merge(&theme.style.players);
+
+        let mut refined_theme_colors = match theme.appearance {
+            AppearanceContent::Light => ThemeColors::light(),
+            AppearanceContent::Dark => ThemeColors::dark(),
+        };
+        let mut theme_colors_refinement =
+            theme_colors_refinement(&theme.style.colors, &status_colors_refinement);
+        apply_theme_color_defaults(&mut theme_colors_refinement, &refined_player_colors);
+        refined_theme_colors.refine(&theme_colors_refinement);
 
         let mut refined_accent_colors = match theme.appearance {
             AppearanceContent::Light => AccentColors::light(),
@@ -191,8 +274,8 @@ impl ThemeFamily {
                             .background_color
                             .as_ref()
                             .and_then(|color| try_parse_color(color).ok()),
-                        font_style: highlight.font_style.map(Into::into),
-                        font_weight: highlight.font_weight.map(Into::into),
+                        font_style: highlight.font_style.map(|s| s.into_gpui()),
+                        font_weight: highlight.font_weight.map(|w| w.into_gpui()),
                         ..Default::default()
                     },
                 )
@@ -203,7 +286,7 @@ impl ThemeFamily {
         let window_background_appearance = theme
             .style
             .window_background_appearance
-            .map(Into::into)
+            .map(|w| w.into_gpui())
             .unwrap_or_default();
 
         Theme {
@@ -230,9 +313,9 @@ pub fn refine_theme_family(theme_family_content: ThemeFamilyContent) -> ThemeFam
     let author = theme_family_content.author.clone();
 
     let mut theme_family = ThemeFamily {
-        id: id.clone(),
-        name: name.clone().into(),
-        author: author.clone().into(),
+        id,
+        name: name.into(),
+        author: author.into(),
         themes: vec![],
         scales: default_color_scales(),
     };
@@ -249,7 +332,7 @@ pub fn refine_theme_family(theme_family_content: ThemeFamilyContent) -> ThemeFam
 }
 
 /// A theme is the primary mechanism for defining the appearance of the UI.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Theme {
     /// The unique identifier for the theme.
     pub id: String,
@@ -315,20 +398,28 @@ impl Theme {
     pub fn window_background_appearance(&self) -> WindowBackgroundAppearance {
         self.styles.window_background_appearance
     }
-}
 
-/// Compounds a color with an alpha value.
-/// TODO: Replace this with a method on Hsla.
-pub fn color_alpha(color: Hsla, alpha: f32) -> Hsla {
-    let mut color = color;
-    color.a = alpha;
-    color
+    /// Darkens the color by reducing its lightness.
+    /// The resulting lightness is clamped to ensure it doesn't go below 0.0.
+    ///
+    /// The first value darkens light appearance mode, the second darkens appearance dark mode.
+    ///
+    /// Note: This is a tentative solution and may be replaced with a more robust color system.
+    pub fn darken(&self, color: Hsla, light_amount: f32, dark_amount: f32) -> Hsla {
+        let amount = match self.appearance {
+            Appearance::Light => light_amount,
+            Appearance::Dark => dark_amount,
+        };
+        let mut hsla = color;
+        hsla.l = (hsla.l - amount).max(0.0);
+        hsla
+    }
 }
 
 /// Asynchronously reads the user theme from the specified path.
 pub async fn read_user_theme(theme_path: &Path, fs: Arc<dyn Fs>) -> Result<ThemeFamilyContent> {
-    let reader = fs.open_sync(theme_path).await?;
-    let theme_family: ThemeFamilyContent = serde_json_lenient::from_reader(reader)?;
+    let bytes = fs.load_bytes(theme_path).await?;
+    let theme_family: ThemeFamilyContent = serde_json_lenient::from_slice(&bytes)?;
 
     for theme in &theme_family.themes {
         if theme
@@ -345,4 +436,94 @@ pub async fn read_user_theme(theme_path: &Path, fs: Arc<dyn Fs>) -> Result<Theme
     }
 
     Ok(theme_family)
+}
+
+/// Asynchronously reads the icon theme from the specified path.
+pub async fn read_icon_theme(
+    icon_theme_path: &Path,
+    fs: Arc<dyn Fs>,
+) -> Result<IconThemeFamilyContent> {
+    let bytes = fs.load_bytes(icon_theme_path).await?;
+    let icon_theme_family: IconThemeFamilyContent = serde_json_lenient::from_slice(&bytes)?;
+
+    Ok(icon_theme_family)
+}
+
+/// The active theme
+pub struct GlobalTheme {
+    theme: Arc<Theme>,
+    icon_theme: Arc<IconTheme>,
+}
+impl Global for GlobalTheme {}
+
+impl GlobalTheme {
+    fn configured_theme(cx: &mut App) -> Arc<Theme> {
+        let themes = ThemeRegistry::default_global(cx);
+        let theme_settings = ThemeSettings::get_global(cx);
+        let system_appearance = SystemAppearance::global(cx);
+
+        let theme_name = theme_settings.theme.name(*system_appearance);
+
+        let theme = match themes.get(&theme_name.0) {
+            Ok(theme) => theme,
+            Err(err) => {
+                if themes.extensions_loaded() {
+                    log::error!("{err}");
+                }
+                themes
+                    .get(default_theme(*system_appearance))
+                    // fallback for tests.
+                    .unwrap_or_else(|_| themes.get(DEFAULT_DARK_THEME).unwrap())
+            }
+        };
+        theme_settings.apply_theme_overrides(theme)
+    }
+
+    /// Reloads the current theme.
+    ///
+    /// Reads the [`ThemeSettings`] to know which theme should be loaded,
+    /// taking into account the current [`SystemAppearance`].
+    pub fn reload_theme(cx: &mut App) {
+        let theme = Self::configured_theme(cx);
+        cx.update_global::<Self, _>(|this, _| this.theme = theme);
+        cx.refresh_windows();
+    }
+
+    fn configured_icon_theme(cx: &mut App) -> Arc<IconTheme> {
+        let themes = ThemeRegistry::default_global(cx);
+        let theme_settings = ThemeSettings::get_global(cx);
+        let system_appearance = SystemAppearance::global(cx);
+
+        let icon_theme_name = theme_settings.icon_theme.name(*system_appearance);
+
+        match themes.get_icon_theme(&icon_theme_name.0) {
+            Ok(theme) => theme,
+            Err(err) => {
+                if themes.extensions_loaded() {
+                    log::error!("{err}");
+                }
+                themes.get_icon_theme(DEFAULT_ICON_THEME_NAME).unwrap()
+            }
+        }
+    }
+
+    /// Reloads the current icon theme.
+    ///
+    /// Reads the [`ThemeSettings`] to know which icon theme should be loaded,
+    /// taking into account the current [`SystemAppearance`].
+    pub fn reload_icon_theme(cx: &mut App) {
+        let icon_theme = Self::configured_icon_theme(cx);
+        cx.update_global::<Self, _>(|this, _| this.icon_theme = icon_theme);
+        cx.refresh_windows();
+    }
+
+    /// the active theme
+    pub fn theme(cx: &App) -> &Arc<Theme> {
+        &cx.global::<Self>().theme
+    }
+
+    /// the active icon theme
+    pub fn icon_theme(cx: &App) -> &Arc<IconTheme> {
+        &cx.global::<Self>().icon_theme
+    }
 }

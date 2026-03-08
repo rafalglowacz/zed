@@ -1,14 +1,14 @@
 use crate::{
-    matcher::{Match, MatchCandidate, Matcher},
     CharBag,
+    matcher::{MatchCandidate, Matcher},
 };
 use gpui::BackgroundExecutor;
 use std::{
-    borrow::Cow,
+    borrow::Borrow,
     cmp::{self, Ordering},
     iter,
     ops::Range,
-    sync::atomic::AtomicBool,
+    sync::atomic::{self, AtomicBool},
 };
 
 #[derive(Clone, Debug)]
@@ -18,33 +18,23 @@ pub struct StringMatchCandidate {
     pub char_bag: CharBag,
 }
 
-impl Match for StringMatch {
-    fn score(&self) -> f64 {
-        self.score
-    }
-
-    fn set_positions(&mut self, positions: Vec<usize>) {
-        self.positions = positions;
-    }
-}
-
 impl StringMatchCandidate {
-    pub fn new(id: usize, string: String) -> Self {
+    pub fn new(id: usize, string: &str) -> Self {
         Self {
             id,
-            char_bag: CharBag::from(string.as_str()),
-            string,
+            string: string.into(),
+            char_bag: string.into(),
         }
     }
 }
 
-impl<'a> MatchCandidate for &'a StringMatchCandidate {
+impl MatchCandidate for &StringMatchCandidate {
     fn has_chars(&self, bag: CharBag) -> bool {
         self.char_bag.is_superset(bag)
     }
 
-    fn to_string(&self) -> Cow<'a, str> {
-        self.string.as_str().into()
+    fn candidate_chars(&self) -> impl Iterator<Item = char> {
+        self.string.chars()
     }
 }
 
@@ -61,10 +51,24 @@ impl StringMatch {
         let mut positions = self.positions.iter().peekable();
         iter::from_fn(move || {
             if let Some(start) = positions.next().copied() {
-                let mut end = start + self.char_len_at_index(start);
+                let Some(char_len) = self.char_len_at_index(start) else {
+                    log::error!(
+                        "Invariant violation: Index {start} out of range or not on a utf-8 boundary in string {:?}",
+                        self.string
+                    );
+                    return None;
+                };
+                let mut end = start + char_len;
                 while let Some(next_start) = positions.peek() {
                     if end == **next_start {
-                        end += self.char_len_at_index(end);
+                        let Some(char_len) = self.char_len_at_index(end) else {
+                            log::error!(
+                                "Invariant violation: Index {end} out of range or not on a utf-8 boundary in string {:?}",
+                                self.string
+                            );
+                            return None;
+                        };
+                        end += char_len;
                         positions.next();
                     } else {
                         break;
@@ -77,8 +81,12 @@ impl StringMatch {
         })
     }
 
-    fn char_len_at_index(&self, ix: usize) -> usize {
-        self.string[ix..].chars().next().unwrap().len_utf8()
+    /// Gets the byte length of the utf-8 character at a byte offset. If the index is out of range
+    /// or not on a utf-8 boundary then None is returned.
+    fn char_len_at_index(&self, ix: usize) -> Option<usize> {
+        self.string
+            .get(ix..)
+            .and_then(|slice| slice.chars().next().map(|char| char.len_utf8()))
     }
 }
 
@@ -105,14 +113,18 @@ impl Ord for StringMatch {
     }
 }
 
-pub async fn match_strings(
-    candidates: &[StringMatchCandidate],
+pub async fn match_strings<T>(
+    candidates: &[T],
     query: &str,
     smart_case: bool,
+    penalize_length: bool,
     max_results: usize,
     cancel_flag: &AtomicBool,
     executor: BackgroundExecutor,
-) -> Vec<StringMatch> {
+) -> Vec<StringMatch>
+where
+    T: Borrow<StringMatchCandidate> + Sync,
+{
     if candidates.is_empty() || max_results == 0 {
         return Default::default();
     }
@@ -121,10 +133,10 @@ pub async fn match_strings(
         return candidates
             .iter()
             .map(|candidate| StringMatch {
-                candidate_id: candidate.id,
+                candidate_id: candidate.borrow().id,
                 score: 0.,
                 positions: Default::default(),
-                string: candidate.string.clone(),
+                string: candidate.borrow().string.clone(),
             })
             .collect();
     }
@@ -137,7 +149,7 @@ pub async fn match_strings(
     let query_char_bag = CharBag::from(&lowercase_query[..]);
 
     let num_cpus = executor.num_cpus().min(candidates.len());
-    let segment_size = (candidates.len() + num_cpus - 1) / num_cpus;
+    let segment_size = candidates.len().div_ceil(num_cpus);
     let mut segment_results = (0..num_cpus)
         .map(|_| Vec::with_capacity(max_results.min(candidates.len())))
         .collect::<Vec<_>>();
@@ -154,19 +166,21 @@ pub async fn match_strings(
                         lowercase_query,
                         query_char_bag,
                         smart_case,
-                        max_results,
+                        penalize_length,
                     );
 
                     matcher.match_candidates(
                         &[],
                         &[],
-                        candidates[segment_start..segment_end].iter(),
+                        candidates[segment_start..segment_end]
+                            .iter()
+                            .map(|c| c.borrow()),
                         results,
                         cancel_flag,
-                        |candidate, score| StringMatch {
+                        |candidate: &&StringMatchCandidate, score, positions| StringMatch {
                             candidate_id: candidate.id,
                             score,
-                            positions: Vec::new(),
+                            positions: positions.clone(),
                             string: candidate.string.to_string(),
                         },
                     );
@@ -175,13 +189,11 @@ pub async fn match_strings(
         })
         .await;
 
-    let mut results = Vec::new();
-    for segment_result in segment_results {
-        if results.is_empty() {
-            results = segment_result;
-        } else {
-            util::extend_sorted(&mut results, segment_result, max_results, |a, b| b.cmp(a));
-        }
+    if cancel_flag.load(atomic::Ordering::Acquire) {
+        return Vec::new();
     }
+
+    let mut results = segment_results.concat();
+    util::truncate_to_bottom_n_sorted_by(&mut results, max_results, &|a, b| b.cmp(a));
     results
 }

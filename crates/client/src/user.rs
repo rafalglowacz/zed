@@ -1,22 +1,35 @@
-use super::{proto, Client, Status, TypedEnvelope};
-use anyhow::{anyhow, Context, Result};
+use super::{Client, Status, TypedEnvelope, proto};
+use anyhow::{Context as _, Result};
 use chrono::{DateTime, Utc};
-use collections::{hash_map::Entry, HashMap, HashSet};
-use feature_flags::FeatureFlagAppExt;
-use futures::{channel::mpsc, Future, StreamExt};
-use gpui::{
-    AppContext, AsyncAppContext, EventEmitter, Model, ModelContext, SharedString, SharedUri, Task,
-    WeakModel,
+use cloud_api_client::websocket_protocol::MessageToClient;
+use cloud_api_client::{
+    GetAuthenticatedUserResponse, Organization, OrganizationId, Plan, PlanInfo,
 };
+use cloud_llm_client::{
+    EDIT_PREDICTIONS_USAGE_AMOUNT_HEADER_NAME, EDIT_PREDICTIONS_USAGE_LIMIT_HEADER_NAME, UsageLimit,
+};
+use collections::{HashMap, HashSet, hash_map::Entry};
+use derive_more::Deref;
+use feature_flags::FeatureFlagAppExt;
+use futures::{Future, StreamExt, channel::mpsc};
+use gpui::{
+    App, AsyncApp, Context, Entity, EventEmitter, SharedString, SharedUri, Task, WeakEntity,
+};
+use http_client::http::{HeaderMap, HeaderValue};
 use postage::{sink::Sink, watch};
 use rpc::proto::{RequestMessage, UsersResponse};
-use std::sync::{Arc, Weak};
+use std::{
+    str::FromStr as _,
+    sync::{Arc, Weak},
+};
 use text::ReplicaId;
-use util::TryFutureExt as _;
+use util::{ResultExt, TryFutureExt as _};
 
 pub type UserId = u64;
 
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
+#[derive(
+    Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy, serde::Serialize, serde::Deserialize,
+)]
 pub struct ChannelId(pub u64);
 
 impl std::fmt::Display for ChannelId {
@@ -28,10 +41,11 @@ impl std::fmt::Display for ChannelId {
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
 pub struct ProjectId(pub u64);
 
-#[derive(
-    Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy, serde::Serialize, serde::Deserialize,
-)]
-pub struct DevServerProjectId(pub u64);
+impl ProjectId {
+    pub fn to_proto(self) -> u64 {
+        self.0
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ParticipantIndex(pub u32);
@@ -39,8 +53,9 @@ pub struct ParticipantIndex(pub u32);
 #[derive(Default, Debug)]
 pub struct User {
     pub id: UserId,
-    pub github_login: String,
+    pub github_login: SharedString,
     pub avatar_uri: SharedUri,
+    pub name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,6 +64,8 @@ pub struct Collaborator {
     pub replica_id: ReplicaId,
     pub user_id: UserId,
     pub is_host: bool,
+    pub committer_name: Option<String>,
+    pub committer_email: Option<String>,
 }
 
 impl PartialOrd for User {
@@ -88,21 +105,24 @@ pub enum ContactRequestStatus {
 
 pub struct UserStore {
     users: HashMap<u64, Arc<User>>,
-    by_github_login: HashMap<String, u64>,
+    by_github_login: HashMap<SharedString, u64>,
     participant_indices: HashMap<u64, ParticipantIndex>,
     update_contacts_tx: mpsc::UnboundedSender<UpdateContacts>,
-    current_plan: Option<proto::Plan>,
+    edit_prediction_usage: Option<EditPredictionUsage>,
+    plan_info: Option<PlanInfo>,
     current_user: watch::Receiver<Option<Arc<User>>>,
-    accepted_tos_at: Option<Option<DateTime<Utc>>>,
+    current_organization: Option<Arc<Organization>>,
+    organizations: Vec<Arc<Organization>>,
+    plans_by_organization: HashMap<OrganizationId, Plan>,
     contacts: Vec<Arc<Contact>>,
     incoming_contact_requests: Vec<Arc<User>>,
     outgoing_contact_requests: Vec<Arc<User>>,
     pending_contact_requests: HashMap<u64, usize>,
-    invite_info: Option<InviteInfo>,
     client: Weak<Client>,
     _maintain_contacts: Task<()>,
     _maintain_current_user: Task<Result<()>>,
-    weak_self: WeakModel<Self>,
+    _handle_sign_out: Task<()>,
+    weak_self: WeakEntity<Self>,
 }
 
 #[derive(Clone)]
@@ -118,6 +138,9 @@ pub enum Event {
     },
     ShowContacts,
     ParticipantIndicesChanged,
+    PrivateUserInfoUpdated,
+    PlanUpdated,
+    OrganizationChanged,
 }
 
 #[derive(Clone, Copy)]
@@ -135,34 +158,50 @@ enum UpdateContacts {
     Clear(postage::barrier::Sender),
 }
 
+#[derive(Debug, Clone, Copy, Deref)]
+pub struct EditPredictionUsage(pub RequestUsage);
+
+#[derive(Debug, Clone, Copy)]
+pub struct RequestUsage {
+    pub limit: UsageLimit,
+    pub amount: i32,
+}
+
 impl UserStore {
-    pub fn new(client: Arc<Client>, cx: &ModelContext<Self>) -> Self {
+    pub fn new(client: Arc<Client>, cx: &Context<Self>) -> Self {
         let (mut current_user_tx, current_user_rx) = watch::channel();
+        let (sign_out_tx, mut sign_out_rx) = mpsc::unbounded();
         let (update_contacts_tx, mut update_contacts_rx) = mpsc::unbounded();
         let rpc_subscriptions = vec![
-            client.add_message_handler(cx.weak_model(), Self::handle_update_plan),
-            client.add_message_handler(cx.weak_model(), Self::handle_update_contacts),
-            client.add_message_handler(cx.weak_model(), Self::handle_update_invite_info),
-            client.add_message_handler(cx.weak_model(), Self::handle_show_contacts),
+            client.add_message_handler(cx.weak_entity(), Self::handle_update_contacts),
+            client.add_message_handler(cx.weak_entity(), Self::handle_show_contacts),
         ];
+
+        client.sign_out_tx.lock().replace(sign_out_tx);
+        client.add_message_to_client_handler({
+            let this = cx.weak_entity();
+            move |message, cx| Self::handle_message_to_client(this.clone(), message, cx)
+        });
+
         Self {
             users: Default::default(),
             by_github_login: Default::default(),
             current_user: current_user_rx,
-            current_plan: None,
-            accepted_tos_at: None,
+            current_organization: None,
+            organizations: Vec::new(),
+            plans_by_organization: HashMap::default(),
+            plan_info: None,
+            edit_prediction_usage: None,
             contacts: Default::default(),
             incoming_contact_requests: Default::default(),
             participant_indices: Default::default(),
             outgoing_contact_requests: Default::default(),
-            invite_info: None,
             client: Arc::downgrade(&client),
             update_contacts_tx,
-            _maintain_contacts: cx.spawn(|this, mut cx| async move {
+            _maintain_contacts: cx.spawn(async move |this, cx| {
                 let _subscriptions = rpc_subscriptions;
                 while let Some(message) = update_contacts_rx.next().await {
-                    if let Ok(task) =
-                        this.update(&mut cx, |this, cx| this.update_contacts(message, cx))
+                    if let Ok(task) = this.update(cx, |this, cx| this.update_contacts(message, cx))
                     {
                         task.log_err().await;
                     } else {
@@ -170,7 +209,7 @@ impl UserStore {
                     }
                 }
             }),
-            _maintain_current_user: cx.spawn(|this, mut cx| async move {
+            _maintain_current_user: cx.spawn(async move |this, cx| {
                 let mut status = client.status();
                 let weak = Arc::downgrade(&client);
                 drop(client);
@@ -180,57 +219,66 @@ impl UserStore {
                         return Ok(());
                     };
                     match status {
-                        Status::Connected { .. } => {
+                        Status::Authenticated
+                        | Status::Reauthenticated
+                        | Status::Connected { .. } => {
                             if let Some(user_id) = client.user_id() {
-                                let fetch_user = if let Ok(fetch_user) = this
-                                    .update(&mut cx, |this, cx| {
-                                        this.get_user(user_id, cx).log_err()
-                                    }) {
-                                    fetch_user
+                                let response = client
+                                    .cloud_client()
+                                    .get_authenticated_user()
+                                    .await
+                                    .log_err();
+
+                                let current_user_and_response = if let Some(response) = response {
+                                    let user = Arc::new(User {
+                                        id: user_id,
+                                        github_login: response.user.github_login.clone().into(),
+                                        avatar_uri: response.user.avatar_url.clone().into(),
+                                        name: response.user.name.clone(),
+                                    });
+
+                                    Some((user, response))
                                 } else {
-                                    break;
+                                    None
                                 };
-                                let fetch_private_user_info =
-                                    client.request(proto::GetPrivateUserInfo {}).log_err();
-                                let (user, info) =
-                                    futures::join!(fetch_user, fetch_private_user_info);
+                                current_user_tx
+                                    .send(
+                                        current_user_and_response
+                                            .as_ref()
+                                            .map(|(user, _)| user.clone()),
+                                    )
+                                    .await
+                                    .ok();
 
                                 cx.update(|cx| {
-                                    if let Some(info) = info {
-                                        let disable_staff = std::env::var("ZED_DISABLE_STAFF")
-                                            .map_or(false, |v| !v.is_empty() && v != "0");
-                                        let staff = info.staff && !disable_staff;
-                                        cx.update_flags(staff, info.flags);
-                                        client.telemetry.set_authenticated_user_info(
-                                            Some(info.metrics_id.clone()),
-                                            staff,
-                                        );
-
-                                        this.update(cx, |this, _| {
-                                            this.set_current_user_accepted_tos_at(
-                                                info.accepted_tos_at,
-                                            );
+                                    if let Some((user, response)) = current_user_and_response {
+                                        this.update(cx, |this, cx| {
+                                            this.by_github_login
+                                                .insert(user.github_login.clone(), user_id);
+                                            this.users.insert(user_id, user);
+                                            this.update_authenticated_user(response, cx)
                                         })
                                     } else {
                                         anyhow::Ok(())
                                     }
-                                })??;
+                                })?;
 
-                                current_user_tx.send(user).await.ok();
-
-                                this.update(&mut cx, |_, cx| cx.notify())?;
+                                this.update(cx, |_, cx| cx.notify())?;
                             }
                         }
                         Status::SignedOut => {
                             current_user_tx.send(None).await.ok();
-                            this.update(&mut cx, |this, cx| {
+                            this.update(cx, |this, cx| {
+                                this.clear_organizations();
+                                this.clear_plan_and_usage();
+                                cx.emit(Event::PrivateUserInfoUpdated);
                                 cx.notify();
                                 this.clear_contacts()
                             })?
                             .await;
                         }
                         Status::ConnectionLost => {
-                            this.update(&mut cx, |this, cx| {
+                            this.update(cx, |this, cx| {
                                 cx.notify();
                                 this.clear_contacts()
                             })?
@@ -241,8 +289,21 @@ impl UserStore {
                 }
                 Ok(())
             }),
+            _handle_sign_out: cx.spawn(async move |this, cx| {
+                while let Some(()) = sign_out_rx.next().await {
+                    let Some(client) = this
+                        .read_with(cx, |this, _cx| this.client.upgrade())
+                        .ok()
+                        .flatten()
+                    else {
+                        break;
+                    };
+
+                    client.sign_out(cx).await;
+                }
+            }),
             pending_contact_requests: Default::default(),
-            weak_self: cx.weak_model(),
+            weak_self: cx.weak_entity(),
         }
     }
 
@@ -252,64 +313,29 @@ impl UserStore {
         self.by_github_login.clear();
     }
 
-    async fn handle_update_invite_info(
-        this: Model<Self>,
-        message: TypedEnvelope<proto::UpdateInviteInfo>,
-        mut cx: AsyncAppContext,
-    ) -> Result<()> {
-        this.update(&mut cx, |this, cx| {
-            this.invite_info = Some(InviteInfo {
-                url: Arc::from(message.payload.url),
-                count: message.payload.count,
-            });
-            cx.notify();
-        })?;
-        Ok(())
-    }
-
     async fn handle_show_contacts(
-        this: Model<Self>,
+        this: Entity<Self>,
         _: TypedEnvelope<proto::ShowContacts>,
-        mut cx: AsyncAppContext,
+        mut cx: AsyncApp,
     ) -> Result<()> {
-        this.update(&mut cx, |_, cx| cx.emit(Event::ShowContacts))?;
+        this.update(&mut cx, |_, cx| cx.emit(Event::ShowContacts));
         Ok(())
-    }
-
-    pub fn invite_info(&self) -> Option<&InviteInfo> {
-        self.invite_info.as_ref()
     }
 
     async fn handle_update_contacts(
-        this: Model<Self>,
+        this: Entity<Self>,
         message: TypedEnvelope<proto::UpdateContacts>,
-        mut cx: AsyncAppContext,
+        cx: AsyncApp,
     ) -> Result<()> {
-        this.update(&mut cx, |this, _| {
+        this.read_with(&cx, |this, _| {
             this.update_contacts_tx
                 .unbounded_send(UpdateContacts::Update(message.payload))
                 .unwrap();
-        })?;
+        });
         Ok(())
     }
 
-    async fn handle_update_plan(
-        this: Model<Self>,
-        message: TypedEnvelope<proto::UpdateUserPlan>,
-        mut cx: AsyncAppContext,
-    ) -> Result<()> {
-        this.update(&mut cx, |this, cx| {
-            this.current_plan = Some(message.payload.plan());
-            cx.notify();
-        })?;
-        Ok(())
-    }
-
-    fn update_contacts(
-        &mut self,
-        message: UpdateContacts,
-        cx: &ModelContext<Self>,
-    ) -> Task<Result<()>> {
+    fn update_contacts(&mut self, message: UpdateContacts, cx: &Context<Self>) -> Task<Result<()>> {
         match message {
             UpdateContacts::Wait(barrier) => {
                 drop(barrier);
@@ -331,35 +357,30 @@ impl UserStore {
                 user_ids.extend(message.outgoing_requests.iter());
 
                 let load_users = self.get_users(user_ids.into_iter().collect(), cx);
-                cx.spawn(|this, mut cx| async move {
+                cx.spawn(async move |this, cx| {
                     load_users.await?;
 
                     // Users are fetched in parallel above and cached in call to get_users
                     // No need to parallelize here
                     let mut updated_contacts = Vec::new();
-                    let this = this
-                        .upgrade()
-                        .ok_or_else(|| anyhow!("can't upgrade user store handle"))?;
+                    let this = this.upgrade().context("can't upgrade user store handle")?;
                     for contact in message.contacts {
-                        updated_contacts.push(Arc::new(
-                            Contact::from_proto(contact, &this, &mut cx).await?,
-                        ));
+                        updated_contacts
+                            .push(Arc::new(Contact::from_proto(contact, &this, cx).await?));
                     }
 
                     let mut incoming_requests = Vec::new();
                     for request in message.incoming_requests {
                         incoming_requests.push({
-                            this.update(&mut cx, |this, cx| {
-                                this.get_user(request.requester_id, cx)
-                            })?
-                            .await?
+                            this.update(cx, |this, cx| this.get_user(request.requester_id, cx))
+                                .await?
                         });
                     }
 
                     let mut outgoing_requests = Vec::new();
                     for requested_user_id in message.outgoing_requests {
                         outgoing_requests.push(
-                            this.update(&mut cx, |this, cx| this.get_user(requested_user_id, cx))?
+                            this.update(cx, |this, cx| this.get_user(requested_user_id, cx))
                                 .await?,
                         );
                     }
@@ -371,7 +392,7 @@ impl UserStore {
                     let removed_outgoing_requests =
                         HashSet::<u64>::from_iter(message.remove_outgoing_requests.iter().copied());
 
-                    this.update(&mut cx, |this, cx| {
+                    this.update(cx, |this, cx| {
                         // Remove contacts
                         this.contacts
                             .retain(|contact| !removed_contacts.contains(&contact.user.id));
@@ -426,7 +447,7 @@ impl UserStore {
                         }
 
                         cx.notify();
-                    })?;
+                    });
 
                     Ok(())
                 })
@@ -483,16 +504,12 @@ impl UserStore {
     pub fn request_contact(
         &mut self,
         responder_id: u64,
-        cx: &mut ModelContext<Self>,
+        cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         self.perform_contact_request(responder_id, proto::RequestContact { responder_id }, cx)
     }
 
-    pub fn remove_contact(
-        &mut self,
-        user_id: u64,
-        cx: &mut ModelContext<Self>,
-    ) -> Task<Result<()>> {
+    pub fn remove_contact(&mut self, user_id: u64, cx: &mut Context<Self>) -> Task<Result<()>> {
         self.perform_contact_request(user_id, proto::RemoveContact { user_id }, cx)
     }
 
@@ -506,7 +523,7 @@ impl UserStore {
         &mut self,
         requester_id: u64,
         accept: bool,
-        cx: &mut ModelContext<Self>,
+        cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         self.perform_contact_request(
             requester_id,
@@ -525,12 +542,12 @@ impl UserStore {
     pub fn dismiss_contact_request(
         &self,
         requester_id: u64,
-        cx: &ModelContext<Self>,
+        cx: &Context<Self>,
     ) -> Task<Result<()>> {
         let client = self.client.upgrade();
-        cx.spawn(move |_, _| async move {
+        cx.spawn(async move |_, _| {
             client
-                .ok_or_else(|| anyhow!("can't upgrade client reference"))?
+                .context("can't upgrade client reference")?
                 .request(proto::RespondToContactRequest {
                     requester_id,
                     response: proto::ContactRequestResponse::Dismiss as i32,
@@ -544,18 +561,18 @@ impl UserStore {
         &mut self,
         user_id: u64,
         request: T,
-        cx: &mut ModelContext<Self>,
+        cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
         let client = self.client.upgrade();
         *self.pending_contact_requests.entry(user_id).or_insert(0) += 1;
         cx.notify();
 
-        cx.spawn(move |this, mut cx| async move {
+        cx.spawn(async move |this, cx| {
             let response = client
-                .ok_or_else(|| anyhow!("can't upgrade client reference"))?
+                .context("can't upgrade client reference")?
                 .request(request)
                 .await;
-            this.update(&mut cx, |this, cx| {
+            this.update(cx, |this, cx| {
                 if let Entry::Occupied(mut request_count) =
                     this.pending_contact_requests.entry(user_id)
                 {
@@ -571,7 +588,7 @@ impl UserStore {
         })
     }
 
-    pub fn clear_contacts(&self) -> impl Future<Output = ()> {
+    pub fn clear_contacts(&self) -> impl Future<Output = ()> + use<> {
         let (tx, mut rx) = postage::barrier::channel();
         self.update_contacts_tx
             .unbounded_send(UpdateContacts::Clear(tx))
@@ -594,14 +611,14 @@ impl UserStore {
     pub fn get_users(
         &self,
         user_ids: Vec<u64>,
-        cx: &ModelContext<Self>,
+        cx: &Context<Self>,
     ) -> Task<Result<Vec<Arc<User>>>> {
         let mut user_ids_to_fetch = user_ids.clone();
         user_ids_to_fetch.retain(|id| !self.users.contains_key(id));
 
-        cx.spawn(|this, mut cx| async move {
+        cx.spawn(async move |this, cx| {
             if !user_ids_to_fetch.is_empty() {
-                this.update(&mut cx, |this, cx| {
+                this.update(cx, |this, cx| {
                     this.load_users(
                         proto::GetUsers {
                             user_ids: user_ids_to_fetch,
@@ -612,14 +629,14 @@ impl UserStore {
                 .await?;
             }
 
-            this.update(&mut cx, |this, _| {
+            this.read_with(cx, |this, _| {
                 user_ids
                     .iter()
                     .map(|user_id| {
                         this.users
                             .get(user_id)
                             .cloned()
-                            .ok_or_else(|| anyhow!("user {} not found", user_id))
+                            .with_context(|| format!("user {user_id} not found"))
                     })
                     .collect()
             })?
@@ -629,7 +646,7 @@ impl UserStore {
     pub fn fuzzy_search_users(
         &self,
         query: String,
-        cx: &ModelContext<Self>,
+        cx: &Context<Self>,
     ) -> Task<Result<Vec<Arc<User>>>> {
         self.load_users(proto::FuzzySearchUsers { query }, cx)
     }
@@ -638,7 +655,7 @@ impl UserStore {
         self.users.get(&user_id).cloned()
     }
 
-    pub fn get_user_optimistic(&self, user_id: u64, cx: &ModelContext<Self>) -> Option<Arc<User>> {
+    pub fn get_user_optimistic(&self, user_id: u64, cx: &Context<Self>) -> Option<Arc<User>> {
         if let Some(user) = self.users.get(&user_id).cloned() {
             return Some(user);
         }
@@ -647,19 +664,19 @@ impl UserStore {
         None
     }
 
-    pub fn get_user(&self, user_id: u64, cx: &ModelContext<Self>) -> Task<Result<Arc<User>>> {
+    pub fn get_user(&self, user_id: u64, cx: &Context<Self>) -> Task<Result<Arc<User>>> {
         if let Some(user) = self.users.get(&user_id).cloned() {
             return Task::ready(Ok(user));
         }
 
         let load_users = self.get_users(vec![user_id], cx);
-        cx.spawn(move |this, mut cx| async move {
+        cx.spawn(async move |this, cx| {
             load_users.await?;
-            this.update(&mut cx, |this, _| {
+            this.read_with(cx, |this, _| {
                 this.users
                     .get(&user_id)
                     .cloned()
-                    .ok_or_else(|| anyhow!("server responded with no users"))
+                    .context("server responded with no users")
             })?
         })
     }
@@ -674,59 +691,183 @@ impl UserStore {
         self.current_user.borrow().clone()
     }
 
-    pub fn current_plan(&self) -> Option<proto::Plan> {
-        self.current_plan
+    pub fn current_organization(&self) -> Option<Arc<Organization>> {
+        self.current_organization.clone()
+    }
+
+    pub fn set_current_organization(
+        &mut self,
+        organization: Arc<Organization>,
+        cx: &mut Context<Self>,
+    ) {
+        let is_same_organization = self
+            .current_organization
+            .as_ref()
+            .is_some_and(|current| current.id == organization.id);
+
+        if !is_same_organization {
+            self.current_organization.replace(organization);
+            cx.emit(Event::OrganizationChanged);
+            cx.notify();
+        }
+    }
+
+    pub fn organizations(&self) -> &Vec<Arc<Organization>> {
+        &self.organizations
+    }
+
+    pub fn plan_for_organization(&self, organization_id: &OrganizationId) -> Option<Plan> {
+        self.plans_by_organization.get(organization_id).copied()
+    }
+
+    pub fn plan(&self) -> Option<Plan> {
+        #[cfg(debug_assertions)]
+        if let Ok(plan) = std::env::var("ZED_SIMULATE_PLAN").as_ref() {
+            use cloud_api_client::Plan;
+
+            return match plan.as_str() {
+                "free" => Some(Plan::ZedFree),
+                "trial" => Some(Plan::ZedProTrial),
+                "pro" => Some(Plan::ZedPro),
+                _ => {
+                    panic!("ZED_SIMULATE_PLAN must be one of 'free', 'trial', or 'pro'");
+                }
+            };
+        }
+
+        if let Some(organization) = &self.current_organization
+            && let Some(plan) = self.plan_for_organization(&organization.id)
+        {
+            return Some(plan);
+        }
+
+        self.plan_info.as_ref().map(|info| info.plan())
+    }
+
+    pub fn subscription_period(&self) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+        self.plan_info
+            .as_ref()
+            .and_then(|plan| plan.subscription_period)
+            .map(|subscription_period| {
+                (
+                    subscription_period.started_at.0,
+                    subscription_period.ended_at.0,
+                )
+            })
+    }
+
+    pub fn trial_started_at(&self) -> Option<DateTime<Utc>> {
+        self.plan_info
+            .as_ref()
+            .and_then(|plan| plan.trial_started_at)
+            .map(|trial_started_at| trial_started_at.0)
+    }
+
+    /// Returns whether the user's account is too new to use the service.
+    pub fn account_too_young(&self) -> bool {
+        self.plan_info
+            .as_ref()
+            .map(|plan| plan.is_account_too_young)
+            .unwrap_or_default()
+    }
+
+    /// Returns whether the current user has overdue invoices and usage should be blocked.
+    pub fn has_overdue_invoices(&self) -> bool {
+        self.plan_info
+            .as_ref()
+            .map(|plan| plan.has_overdue_invoices)
+            .unwrap_or_default()
+    }
+
+    pub fn edit_prediction_usage(&self) -> Option<EditPredictionUsage> {
+        self.edit_prediction_usage
+    }
+
+    pub fn update_edit_prediction_usage(
+        &mut self,
+        usage: EditPredictionUsage,
+        cx: &mut Context<Self>,
+    ) {
+        self.edit_prediction_usage = Some(usage);
+        cx.notify();
+    }
+
+    pub fn clear_organizations(&mut self) {
+        self.organizations.clear();
+        self.current_organization = None;
+    }
+
+    pub fn clear_plan_and_usage(&mut self) {
+        self.plan_info = None;
+        self.edit_prediction_usage = None;
+    }
+
+    fn update_authenticated_user(
+        &mut self,
+        response: GetAuthenticatedUserResponse,
+        cx: &mut Context<Self>,
+    ) {
+        let staff = response.user.is_staff && !*feature_flags::ZED_DISABLE_STAFF;
+        cx.update_flags(staff, response.feature_flags);
+        if let Some(client) = self.client.upgrade() {
+            client
+                .telemetry
+                .set_authenticated_user_info(Some(response.user.metrics_id.clone()), staff);
+        }
+
+        self.organizations = response.organizations.into_iter().map(Arc::new).collect();
+        self.current_organization = self.organizations.first().cloned();
+
+        self.edit_prediction_usage = Some(EditPredictionUsage(RequestUsage {
+            limit: response.plan.usage.edit_predictions.limit,
+            amount: response.plan.usage.edit_predictions.used as i32,
+        }));
+        self.plan_info = Some(response.plan);
+        cx.emit(Event::PrivateUserInfoUpdated);
+    }
+
+    fn handle_message_to_client(this: WeakEntity<Self>, message: &MessageToClient, cx: &App) {
+        cx.spawn(async move |cx| {
+            match message {
+                MessageToClient::UserUpdated => {
+                    let cloud_client = cx
+                        .update(|cx| {
+                            this.read_with(cx, |this, _cx| {
+                                this.client.upgrade().map(|client| client.cloud_client())
+                            })
+                        })?
+                        .ok_or(anyhow::anyhow!("Failed to get Cloud client"))?;
+
+                    let response = cloud_client.get_authenticated_user().await?;
+                    cx.update(|cx| {
+                        this.update(cx, |this, cx| {
+                            this.update_authenticated_user(response, cx);
+                        })
+                    })?;
+                }
+            }
+
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     pub fn watch_current_user(&self) -> watch::Receiver<Option<Arc<User>>> {
         self.current_user.clone()
     }
 
-    pub fn current_user_has_accepted_terms(&self) -> Option<bool> {
-        self.accepted_tos_at
-            .map(|accepted_tos_at| accepted_tos_at.is_some())
-    }
-
-    pub fn accept_terms_of_service(&self, cx: &ModelContext<Self>) -> Task<Result<()>> {
-        if self.current_user().is_none() {
-            return Task::ready(Err(anyhow!("no current user")));
-        };
-
-        let client = self.client.clone();
-        cx.spawn(move |this, mut cx| async move {
-            if let Some(client) = client.upgrade() {
-                let response = client
-                    .request(proto::AcceptTermsOfService {})
-                    .await
-                    .context("error accepting tos")?;
-
-                this.update(&mut cx, |this, _| {
-                    this.set_current_user_accepted_tos_at(Some(response.accepted_tos_at))
-                })
-            } else {
-                Err(anyhow!("client not found"))
-            }
-        })
-    }
-
-    fn set_current_user_accepted_tos_at(&mut self, accepted_tos_at: Option<u64>) {
-        self.accepted_tos_at = Some(
-            accepted_tos_at.and_then(|timestamp| DateTime::from_timestamp(timestamp as i64, 0)),
-        );
-    }
-
     fn load_users(
         &self,
         request: impl RequestMessage<Response = UsersResponse>,
-        cx: &ModelContext<Self>,
+        cx: &Context<Self>,
     ) -> Task<Result<Vec<Arc<User>>>> {
         let client = self.client.clone();
-        cx.spawn(|this, mut cx| async move {
+        cx.spawn(async move |this, cx| {
             if let Some(rpc) = client.upgrade() {
                 let response = rpc.request(request).await.context("error loading users")?;
                 let users = response.users;
 
-                this.update(&mut cx, |this, _| this.insert(users))
+                this.update(cx, |this, _| this.insert(users))
             } else {
                 Ok(Vec::new())
             }
@@ -737,10 +878,10 @@ impl UserStore {
         let mut ret = Vec::with_capacity(users.len());
         for user in users {
             let user = User::new(user);
-            if let Some(old) = self.users.insert(user.id, user.clone()) {
-                if old.github_login != user.github_login {
-                    self.by_github_login.remove(&old.github_login);
-                }
+            if let Some(old) = self.users.insert(user.id, user.clone())
+                && old.github_login != user.github_login
+            {
+                self.by_github_login.remove(&old.github_login);
             }
             self.by_github_login
                 .insert(user.github_login.clone(), user.id);
@@ -752,7 +893,7 @@ impl UserStore {
     pub fn set_participant_indices(
         &mut self,
         participant_indices: HashMap<u64, ParticipantIndex>,
-        cx: &mut ModelContext<Self>,
+        cx: &mut Context<Self>,
     ) {
         if participant_indices != self.participant_indices {
             self.participant_indices = participant_indices;
@@ -767,21 +908,21 @@ impl UserStore {
     pub fn participant_names(
         &self,
         user_ids: impl Iterator<Item = u64>,
-        cx: &AppContext,
+        cx: &App,
     ) -> HashMap<u64, SharedString> {
         let mut ret = HashMap::default();
         let mut missing_user_ids = Vec::new();
         for id in user_ids {
             if let Some(github_login) = self.get_cached_user(id).map(|u| u.github_login.clone()) {
-                ret.insert(id, github_login.into());
+                ret.insert(id, github_login);
             } else {
                 missing_user_ids.push(id)
             }
         }
         if !missing_user_ids.is_empty() {
             let this = self.weak_self.clone();
-            cx.spawn(|mut cx| async move {
-                this.update(&mut cx, |this, cx| this.get_users(missing_user_ids, cx))?
+            cx.spawn(async move |cx| {
+                this.update(cx, |this, cx| this.get_users(missing_user_ids, cx))?
                     .await
             })
             .detach_and_log_err(cx);
@@ -794,8 +935,9 @@ impl User {
     fn new(message: proto::User) -> Arc<Self> {
         Arc::new(User {
             id: message.id,
-            github_login: message.github_login,
+            github_login: message.github_login.into(),
             avatar_uri: message.avatar_url.into(),
+            name: message.name,
         })
     }
 }
@@ -803,13 +945,13 @@ impl User {
 impl Contact {
     async fn from_proto(
         contact: proto::Contact,
-        user_store: &Model<UserStore>,
-        cx: &mut AsyncAppContext,
+        user_store: &Entity<UserStore>,
+        cx: &mut AsyncApp,
     ) -> Result<Self> {
         let user = user_store
             .update(cx, |user_store, cx| {
                 user_store.get_user(contact.user_id, cx)
-            })?
+            })
             .await?;
         Ok(Self {
             user,
@@ -822,10 +964,49 @@ impl Contact {
 impl Collaborator {
     pub fn from_proto(message: proto::Collaborator) -> Result<Self> {
         Ok(Self {
-            peer_id: message.peer_id.ok_or_else(|| anyhow!("invalid peer id"))?,
-            replica_id: message.replica_id as ReplicaId,
+            peer_id: message.peer_id.context("invalid peer id")?,
+            replica_id: ReplicaId::new(message.replica_id as u16),
             user_id: message.user_id as UserId,
             is_host: message.is_host,
+            committer_name: message.committer_name,
+            committer_email: message.committer_email,
         })
+    }
+}
+
+impl RequestUsage {
+    pub fn over_limit(&self) -> bool {
+        match self.limit {
+            UsageLimit::Limited(limit) => self.amount >= limit,
+            UsageLimit::Unlimited => false,
+        }
+    }
+
+    fn from_headers(
+        limit_name: &str,
+        amount_name: &str,
+        headers: &HeaderMap<HeaderValue>,
+    ) -> Result<Self> {
+        let limit = headers
+            .get(limit_name)
+            .with_context(|| format!("missing {limit_name:?} header"))?;
+        let limit = UsageLimit::from_str(limit.to_str()?)?;
+
+        let amount = headers
+            .get(amount_name)
+            .with_context(|| format!("missing {amount_name:?} header"))?;
+        let amount = amount.to_str()?.parse::<i32>()?;
+
+        Ok(Self { limit, amount })
+    }
+}
+
+impl EditPredictionUsage {
+    pub fn from_headers(headers: &HeaderMap<HeaderValue>) -> Result<Self> {
+        Ok(Self(RequestUsage::from_headers(
+            EDIT_PREDICTIONS_USAGE_LIMIT_HEADER_NAME,
+            EDIT_PREDICTIONS_USAGE_AMOUNT_HEADER_NAME,
+            headers,
+        )?))
     }
 }

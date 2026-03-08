@@ -1,4 +1,6 @@
 use crate::db::ExtensionId;
+use cloud_api_types::ExtensionProvides;
+use collections::BTreeSet;
 use sea_orm::entity::prelude::*;
 use time::PrimitiveDateTime;
 
@@ -16,6 +18,68 @@ pub struct Model {
     pub schema_version: i32,
     pub wasm_api_version: Option<String>,
     pub download_count: i64,
+    pub provides_themes: bool,
+    pub provides_icon_themes: bool,
+    pub provides_languages: bool,
+    pub provides_grammars: bool,
+    pub provides_language_servers: bool,
+    pub provides_context_servers: bool,
+    pub provides_agent_servers: bool,
+    pub provides_slash_commands: bool,
+    pub provides_indexed_docs_providers: bool,
+    pub provides_snippets: bool,
+    pub provides_debug_adapters: bool,
+}
+
+impl Model {
+    pub fn provides(&self) -> BTreeSet<ExtensionProvides> {
+        let mut provides = BTreeSet::default();
+        if self.provides_themes {
+            provides.insert(ExtensionProvides::Themes);
+        }
+
+        if self.provides_icon_themes {
+            provides.insert(ExtensionProvides::IconThemes);
+        }
+
+        if self.provides_languages {
+            provides.insert(ExtensionProvides::Languages);
+        }
+
+        if self.provides_grammars {
+            provides.insert(ExtensionProvides::Grammars);
+        }
+
+        if self.provides_language_servers {
+            provides.insert(ExtensionProvides::LanguageServers);
+        }
+
+        if self.provides_context_servers {
+            provides.insert(ExtensionProvides::ContextServers);
+        }
+
+        if self.provides_agent_servers {
+            provides.insert(ExtensionProvides::AgentServers);
+        }
+
+        if self.provides_slash_commands {
+            provides.insert(ExtensionProvides::SlashCommands);
+        }
+
+        if self.provides_indexed_docs_providers {
+            provides.insert(ExtensionProvides::IndexedDocsProviders);
+        }
+
+        if self.provides_snippets {
+            provides.insert(ExtensionProvides::Snippets);
+        }
+
+        if self.provides_debug_adapters {
+            provides.insert(ExtensionProvides::DebugAdapters);
+        }
+
+        provides
+    }
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

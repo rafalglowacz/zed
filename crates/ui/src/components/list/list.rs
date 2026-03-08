@@ -1,16 +1,15 @@
-#![allow(missing_docs)]
-
+use component::{Component, ComponentScope, example_group_with_title, single_example};
 use gpui::AnyElement;
 use smallvec::SmallVec;
 
-use crate::{prelude::*, v_flex, Label, ListHeader};
+use crate::{Label, ListHeader, ListItem, prelude::*};
 
 pub enum EmptyMessage {
     Text(SharedString),
     Element(AnyElement),
 }
 
-#[derive(IntoElement)]
+#[derive(IntoElement, RegisterComponent)]
 pub struct List {
     /// Message to display when the list is empty
     /// Defaults to "No items"
@@ -77,7 +76,7 @@ impl From<AnyElement> for EmptyMessage {
 }
 
 impl RenderOnce for List {
-    fn render(self, cx: &mut WindowContext) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         v_flex()
             .w_full()
             .py(DynamicSpacing::Base04.rems(cx))
@@ -86,9 +85,58 @@ impl RenderOnce for List {
                 (false, _) => this.children(self.children),
                 (true, Some(false)) => this,
                 (true, _) => match self.empty_message {
-                    EmptyMessage::Text(text) => this.child(Label::new(text).color(Color::Muted)),
+                    EmptyMessage::Text(text) => {
+                        this.px_2().child(Label::new(text).color(Color::Muted))
+                    }
                     EmptyMessage::Element(element) => this.child(element),
                 },
             })
+    }
+}
+
+impl Component for List {
+    fn scope() -> ComponentScope {
+        ComponentScope::Layout
+    }
+
+    fn description() -> Option<&'static str> {
+        Some(
+            "A container component for displaying a collection of list items with optional header and empty state.",
+        )
+    }
+
+    fn preview(_window: &mut Window, _cx: &mut App) -> Option<AnyElement> {
+        Some(
+            v_flex()
+                .gap_6()
+                .children(vec![example_group_with_title(
+                    "Basic Lists",
+                    vec![
+                        single_example(
+                            "Simple List",
+                            List::new()
+                                .child(ListItem::new("item1").child(Label::new("Item 1")))
+                                .child(ListItem::new("item2").child(Label::new("Item 2")))
+                                .child(ListItem::new("item3").child(Label::new("Item 3")))
+                                .into_any_element(),
+                        ),
+                        single_example(
+                            "With Header",
+                            List::new()
+                                .header(ListHeader::new("Section Header"))
+                                .child(ListItem::new("item1").child(Label::new("Item 1")))
+                                .child(ListItem::new("item2").child(Label::new("Item 2")))
+                                .into_any_element(),
+                        ),
+                        single_example(
+                            "Empty List",
+                            List::new()
+                                .empty_message("No items to display")
+                                .into_any_element(),
+                        ),
+                    ],
+                )])
+                .into_any_element(),
+        )
     }
 }

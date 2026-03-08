@@ -1,8 +1,13 @@
+---
+title: OCaml
+description: "Configure OCaml language support in Zed, including language servers, formatting, and debugging."
+---
+
 # OCaml
 
-OCaml support is available through the [OCaml extension](https://github.com/zed-industries/zed/tree/main/extensions/ocaml).
+OCaml support is available through the [OCaml extension](https://github.com/zed-extensions/ocaml).
 
-- Tree Sitter: [tree-sitter/tree-sitter-ocaml](https://github.com/tree-sitter/tree-sitter-ocaml)
+- Tree-sitter: [tree-sitter/tree-sitter-ocaml](https://github.com/tree-sitter/tree-sitter-ocaml)
 - Language Server: [ocaml/ocaml-lsp](https://github.com/ocaml/ocaml-lsp)
 
 ## Setup Instructions
@@ -33,4 +38,4 @@ Once you have the cli, simply from a terminal, navigate to your project and run
 zed .
 ```
 
-Voila! You should have Zed running with OCaml support, no additional setup required.
+You should now have Zed running with OCaml support, with no additional setup required.

@@ -19,7 +19,7 @@ impl Role {
         }
     }
 
-    pub fn to_proto(&self) -> proto::LanguageModelRole {
+    pub fn to_proto(self) -> proto::LanguageModelRole {
         match self {
             Role::User => proto::LanguageModelRole::LanguageModelUser,
             Role::Assistant => proto::LanguageModelRole::LanguageModelAssistant,
@@ -42,26 +42,6 @@ impl Display for Role {
             Role::User => write!(f, "user"),
             Role::Assistant => write!(f, "assistant"),
             Role::System => write!(f, "system"),
-        }
-    }
-}
-
-impl From<Role> for ollama::Role {
-    fn from(val: Role) -> Self {
-        match val {
-            Role::User => ollama::Role::User,
-            Role::Assistant => ollama::Role::Assistant,
-            Role::System => ollama::Role::System,
-        }
-    }
-}
-
-impl From<Role> for open_ai::Role {
-    fn from(val: Role) -> Self {
-        match val {
-            Role::User => open_ai::Role::User,
-            Role::Assistant => open_ai::Role::Assistant,
-            Role::System => open_ai::Role::System,
         }
     }
 }

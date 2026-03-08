@@ -1,20 +1,19 @@
-use std::{
-    collections::HashMap,
-    env, fs,
-    path::{Path, PathBuf},
-    process::Command,
-    sync::Arc,
-};
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use ::fs::{copy_recursive, CopyOptions, Fs, RealFs};
-use anyhow::{anyhow, bail, Context, Result};
+use ::fs::{CopyOptions, Fs, RealFs, copy_recursive};
+use anyhow::{Context as _, Result, anyhow, bail};
 use clap::Parser;
-use extension::{
-    extension_builder::{CompileExtensionOptions, ExtensionBuilder},
-    ExtensionManifest,
-};
+use extension::extension_builder::{CompileExtensionOptions, ExtensionBuilder};
+use extension::{ExtensionManifest, ExtensionSnippets};
 use language::LanguageConfig;
 use reqwest_client::ReqwestClient;
+use snippet_provider::file_to_snippets;
+use snippet_provider::format::VsSnippetsFile;
+use tokio::process::Command;
 use tree_sitter::{Language, Query, WasmStore};
 
 #[derive(Parser, Debug)]
@@ -36,7 +35,7 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     let args = Args::parse();
-    let fs = Arc::new(RealFs::default());
+    let fs = Arc::new(RealFs::new(None, gpui_platform::background_executor()));
     let engine = wasmtime::Engine::default();
     let mut wasm_store = WasmStore::new(&engine)?;
 
@@ -73,13 +72,21 @@ async fn main() -> Result<()> {
             &extension_path,
             &mut manifest,
             CompileExtensionOptions { release: true },
+            fs.clone(),
         )
         .await
         .context("failed to compile extension")?;
 
+    let extension_provides = manifest.provides();
+
+    if extension_provides.is_empty() {
+        bail!("extension does not provide any features");
+    }
+
     let grammars = test_grammars(&manifest, &extension_path, &mut wasm_store)?;
     test_languages(&manifest, &extension_path, &grammars)?;
     test_themes(&manifest, &extension_path, fs.clone()).await?;
+    test_snippets(&manifest, &extension_path, fs.clone()).await?;
 
     let archive_dir = output_dir.join("archive");
     fs::remove_dir_all(&archive_dir).ok();
@@ -91,6 +98,7 @@ async fn main() -> Result<()> {
         .current_dir(&output_dir)
         .args(["-czvf", "archive.tar.gz", "-C", "archive", "."])
         .output()
+        .await
         .context("failed to run tar")?;
     if !tar_output.status.success() {
         bail!(
@@ -99,7 +107,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    let manifest_json = serde_json::to_string(&rpc::ExtensionApiManifest {
+    let manifest_json = serde_json::to_string(&cloud_api_types::ExtensionApiManifest {
         name: manifest.name,
         version: manifest.version,
         description: manifest.description,
@@ -107,8 +115,9 @@ async fn main() -> Result<()> {
         schema_version: Some(manifest.schema_version.0),
         repository: manifest
             .repository
-            .ok_or_else(|| anyhow!("missing repository in extension manifest"))?,
+            .context("missing repository in extension manifest")?,
         wasm_api_version: manifest.lib.version.map(|version| version.to_string()),
+        provides: extension_provides,
     })?;
     fs::remove_dir_all(&archive_dir)?;
     fs::write(output_dir.join("manifest.json"), manifest_json.as_bytes())?;
@@ -157,13 +166,56 @@ async fn copy_extension_resources(
         for theme_path in &manifest.themes {
             fs::copy(
                 extension_path.join(theme_path),
-                output_themes_dir.join(
-                    theme_path
-                        .file_name()
-                        .ok_or_else(|| anyhow!("invalid theme path"))?,
-                ),
+                output_themes_dir.join(theme_path.file_name().context("invalid theme path")?),
             )
             .with_context(|| format!("failed to copy theme '{}'", theme_path.display()))?;
+        }
+    }
+
+    if !manifest.icon_themes.is_empty() {
+        let output_icon_themes_dir = output_dir.join("icon_themes");
+        fs::create_dir_all(&output_icon_themes_dir)?;
+        for icon_theme_path in &manifest.icon_themes {
+            fs::copy(
+                extension_path.join(icon_theme_path),
+                output_icon_themes_dir.join(
+                    icon_theme_path
+                        .file_name()
+                        .context("invalid icon theme path")?,
+                ),
+            )
+            .with_context(|| {
+                format!("failed to copy icon theme '{}'", icon_theme_path.display())
+            })?;
+        }
+
+        let output_icons_dir = output_dir.join("icons");
+        fs::create_dir_all(&output_icons_dir)?;
+        copy_recursive(
+            fs.as_ref(),
+            &extension_path.join("icons"),
+            &output_icons_dir,
+            CopyOptions {
+                overwrite: true,
+                ignore_if_exists: false,
+            },
+        )
+        .await
+        .with_context(|| "failed to copy icons")?;
+    }
+
+    for (_, agent_entry) in &manifest.agent_servers {
+        if let Some(icon_path) = &agent_entry.icon {
+            let source_icon = extension_path.join(icon_path);
+            let dest_icon = output_dir.join(icon_path);
+
+            // Create parent directory if needed
+            if let Some(parent) = dest_icon.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            fs::copy(&source_icon, &dest_icon)
+                .with_context(|| format!("failed to copy agent server icon '{}'", icon_path))?;
         }
     }
 
@@ -174,11 +226,8 @@ async fn copy_extension_resources(
             copy_recursive(
                 fs.as_ref(),
                 &extension_path.join(language_path),
-                &output_languages_dir.join(
-                    language_path
-                        .file_name()
-                        .ok_or_else(|| anyhow!("invalid language path"))?,
-                ),
+                &output_languages_dir
+                    .join(language_path.file_name().context("invalid language path")?),
                 CopyOptions {
                     overwrite: true,
                     ignore_if_exists: false,
@@ -187,6 +236,58 @@ async fn copy_extension_resources(
             .await
             .with_context(|| {
                 format!("failed to copy language dir '{}'", language_path.display())
+            })?;
+        }
+    }
+
+    if !manifest.debug_adapters.is_empty() {
+        for (debug_adapter, entry) in &manifest.debug_adapters {
+            let schema_path = entry.schema_path.clone().unwrap_or_else(|| {
+                PathBuf::from("debug_adapter_schemas".to_owned())
+                    .join(debug_adapter.as_ref())
+                    .with_extension("json")
+            });
+            let parent = schema_path
+                .parent()
+                .with_context(|| format!("invalid empty schema path for {debug_adapter}"))?;
+            fs::create_dir_all(output_dir.join(parent))?;
+            copy_recursive(
+                fs.as_ref(),
+                &extension_path.join(&schema_path),
+                &output_dir.join(&schema_path),
+                CopyOptions {
+                    overwrite: true,
+                    ignore_if_exists: false,
+                },
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to copy debug adapter schema '{}'",
+                    schema_path.display()
+                )
+            })?;
+        }
+    }
+
+    if let Some(snippets) = manifest.snippets.as_ref() {
+        for snippets_path in snippets.paths() {
+            let parent = snippets_path.parent();
+            if let Some(parent) = parent.filter(|p| p.components().next().is_some()) {
+                fs::create_dir_all(output_dir.join(parent))?;
+            }
+            copy_recursive(
+                fs.as_ref(),
+                &extension_path.join(&snippets_path),
+                &output_dir.join(&snippets_path),
+                CopyOptions {
+                    overwrite: true,
+                    ignore_if_exists: false,
+                },
+            )
+            .await
+            .with_context(|| {
+                format!("failed to copy snippets from '{}'", snippets_path.display())
             })?;
         }
     }
@@ -229,7 +330,7 @@ fn test_languages(
             Some(
                 grammars
                     .get(name.as_ref())
-                    .ok_or_else(|| anyhow!("grammar not found: '{name}'"))?,
+                    .with_context(|| format!("grammar not found: '{name}'"))?,
             )
         } else {
             None
@@ -240,12 +341,12 @@ fn test_languages(
             let entry = entry?;
             let query_path = entry.path();
             if query_path.extension() == Some("scm".as_ref()) {
-                let grammar = grammar.ok_or_else(|| {
-                    anyhow!(
+                let grammar = grammar.with_context(|| {
+                    format! {
                         "language {} provides query {} but no grammar",
                         config.name,
                         query_path.display()
-                    )
+                    }
                 })?;
 
                 let query_source = fs::read_to_string(&query_path)?;
@@ -268,6 +369,56 @@ async fn test_themes(
         let theme_path = extension_path.join(relative_theme_path);
         let theme_family = theme::read_user_theme(&theme_path, fs.clone()).await?;
         log::info!("loaded theme family {}", theme_family.name);
+
+        for theme in &theme_family.themes {
+            if theme
+                .style
+                .colors
+                .deprecated_scrollbar_thumb_background
+                .is_some()
+            {
+                bail!(
+                    r#"Theme "{theme_name}" is using a deprecated style property: scrollbar_thumb.background. Use `scrollbar.thumb.background` instead."#,
+                    theme_name = theme.name
+                )
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn test_snippets(
+    manifest: &ExtensionManifest,
+    extension_path: &Path,
+    fs: Arc<dyn Fs>,
+) -> Result<()> {
+    for relative_snippet_path in manifest
+        .snippets
+        .as_ref()
+        .map(ExtensionSnippets::paths)
+        .into_iter()
+        .flatten()
+    {
+        let snippet_path = extension_path.join(relative_snippet_path);
+        let snippets_content = fs.load_bytes(&snippet_path).await?;
+        let snippets_file = serde_json_lenient::from_slice::<VsSnippetsFile>(&snippets_content)
+            .with_context(|| anyhow!("Failed to parse snippet file at {snippet_path:?}"))?;
+        let snippet_errors = file_to_snippets(snippets_file, &snippet_path)
+            .flat_map(Result::err)
+            .collect::<Vec<_>>();
+        let error_count = snippet_errors.len();
+
+        anyhow::ensure!(
+            error_count == 0,
+            "Could not parse {error_count} snippet{suffix} in file {snippet_path:?}:\n\n{snippet_errors}",
+            suffix = if error_count == 1 { "" } else { "s" },
+            snippet_errors = snippet_errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     Ok(())

@@ -1,4 +1,4 @@
-use std::cmp::{self, max, min};
+use std::cmp::{self, min};
 use std::iter::repeat;
 
 use alacritty_terminal::grid::Dimensions;
@@ -6,9 +6,9 @@ use alacritty_terminal::grid::Dimensions;
 /// with modifications for our circumstances
 use alacritty_terminal::index::{Column as GridCol, Line as GridLine, Point as AlacPoint, Side};
 use alacritty_terminal::term::TermMode;
-use gpui::{px, Modifiers, MouseButton, MouseMoveEvent, Pixels, Point, ScrollWheelEvent};
+use gpui::{Modifiers, MouseButton, Pixels, Point, ScrollWheelEvent, px};
 
-use crate::TerminalSize;
+use crate::TerminalBounds;
 
 enum MouseFormat {
     Sgr,
@@ -42,14 +42,12 @@ enum AlacMouseButton {
 }
 
 impl AlacMouseButton {
-    fn from_move(e: &MouseMoveEvent) -> Self {
-        match e.pressed_button {
-            Some(b) => match b {
-                gpui::MouseButton::Left => AlacMouseButton::LeftMove,
-                gpui::MouseButton::Middle => AlacMouseButton::MiddleMove,
-                gpui::MouseButton::Right => AlacMouseButton::RightMove,
-                gpui::MouseButton::Navigate(_) => AlacMouseButton::Other,
-            },
+    fn from_move_button(e: Option<MouseButton>) -> Self {
+        match e {
+            Some(gpui::MouseButton::Left) => AlacMouseButton::LeftMove,
+            Some(gpui::MouseButton::Middle) => AlacMouseButton::MiddleMove,
+            Some(gpui::MouseButton::Right) => AlacMouseButton::RightMove,
+            Some(gpui::MouseButton::Navigate(_)) => AlacMouseButton::Other,
             None => AlacMouseButton::NoneMove,
         }
     }
@@ -95,9 +93,51 @@ pub fn scroll_report(
             e.modifiers,
             MouseFormat::from_mode(mode),
         )
-        .map(|report| repeat(report).take(max(scroll_lines, 1) as usize))
+        .map(|report| repeat(report).take(scroll_lines.unsigned_abs() as usize))
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{ScrollDelta, TouchPhase, point};
+
+    #[test]
+    fn scroll_report_repeats_for_negative_scroll_lines() {
+        let grid_point = AlacPoint::new(GridLine(0), GridCol(0));
+
+        let scroll_event = ScrollWheelEvent {
+            delta: ScrollDelta::Lines(point(0., -1.)),
+            touch_phase: TouchPhase::Moved,
+            ..Default::default()
+        };
+
+        let mode = TermMode::MOUSE_MODE;
+        let reports: Vec<Vec<u8>> = scroll_report(grid_point, -3, &scroll_event, mode)
+            .expect("mouse mode should produce a scroll report")
+            .collect();
+
+        assert_eq!(reports.len(), 3);
+    }
+
+    #[test]
+    fn scroll_report_repeats_for_positive_scroll_lines() {
+        let grid_point = AlacPoint::new(GridLine(0), GridCol(0));
+
+        let scroll_event = ScrollWheelEvent {
+            delta: ScrollDelta::Lines(point(0., 1.)),
+            touch_phase: TouchPhase::Moved,
+            ..Default::default()
+        };
+
+        let mode = TermMode::MOUSE_MODE;
+        let reports: Vec<Vec<u8>> = scroll_report(grid_point, 3, &scroll_event, mode)
+            .expect("mouse mode should produce a scroll report")
+            .collect();
+
+        assert_eq!(reports.len(), 3);
     }
 }
 
@@ -134,34 +174,37 @@ pub fn mouse_button_report(
     }
 }
 
-pub fn mouse_moved_report(point: AlacPoint, e: &MouseMoveEvent, mode: TermMode) -> Option<Vec<u8>> {
-    let button = AlacMouseButton::from_move(e);
+pub fn mouse_moved_report(
+    point: AlacPoint,
+    button: Option<MouseButton>,
+    modifiers: Modifiers,
+    mode: TermMode,
+) -> Option<Vec<u8>> {
+    let button = AlacMouseButton::from_move_button(button);
 
     if !button.is_other() && mode.intersects(TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG) {
         //Only drags are reported in drag mode, so block NoneMove.
         if mode.contains(TermMode::MOUSE_DRAG) && matches!(button, AlacMouseButton::NoneMove) {
             None
         } else {
-            mouse_report(
-                point,
-                button,
-                true,
-                e.modifiers,
-                MouseFormat::from_mode(mode),
-            )
+            mouse_report(point, button, true, modifiers, MouseFormat::from_mode(mode))
         }
     } else {
         None
     }
 }
 
-pub fn grid_point(pos: Point<Pixels>, cur_size: TerminalSize, display_offset: usize) -> AlacPoint {
+pub fn grid_point(
+    pos: Point<Pixels>,
+    cur_size: TerminalBounds,
+    display_offset: usize,
+) -> AlacPoint {
     grid_point_and_side(pos, cur_size, display_offset).0
 }
 
 pub fn grid_point_and_side(
     pos: Point<Pixels>,
-    cur_size: TerminalSize,
+    cur_size: TerminalBounds,
     display_offset: usize,
 ) -> (AlacPoint, Side) {
     let mut col = GridCol((pos.x / cur_size.cell_width) as usize);

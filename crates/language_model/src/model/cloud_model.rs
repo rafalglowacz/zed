@@ -1,96 +1,149 @@
-use proto::Plan;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use strum::EnumIter;
-use ui::IconName;
+use std::fmt;
+use std::sync::Arc;
 
-use crate::LanguageModelAvailability;
+use anyhow::{Context as _, Result};
+use client::Client;
+use client::UserStore;
+use cloud_api_client::ClientApiError;
+use cloud_api_types::OrganizationId;
+use cloud_api_types::websocket_protocol::MessageToClient;
+use cloud_llm_client::{EXPIRED_LLM_TOKEN_HEADER_NAME, OUTDATED_LLM_TOKEN_HEADER_NAME};
+use gpui::{
+    App, AppContext as _, Context, Entity, EventEmitter, Global, ReadGlobal as _, Subscription,
+};
+use smol::lock::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard};
+use thiserror::Error;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "provider", rename_all = "lowercase")]
-pub enum CloudModel {
-    Anthropic(anthropic::Model),
-    OpenAi(open_ai::Model),
-    Google(google_ai::Model),
-}
+#[derive(Error, Debug)]
+pub struct PaymentRequiredError;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema, EnumIter)]
-pub enum ZedModel {
-    #[serde(rename = "Qwen/Qwen2-7B-Instruct")]
-    Qwen2_7bInstruct,
-}
-
-impl Default for CloudModel {
-    fn default() -> Self {
-        Self::Anthropic(anthropic::Model::default())
+impl fmt::Display for PaymentRequiredError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "Payment required to use this language model. Please upgrade your account."
+        )
     }
 }
 
-impl CloudModel {
-    pub fn id(&self) -> &str {
-        match self {
-            Self::Anthropic(model) => model.id(),
-            Self::OpenAi(model) => model.id(),
-            Self::Google(model) => model.id(),
+#[derive(Clone, Default)]
+pub struct LlmApiToken(Arc<RwLock<Option<String>>>);
+
+impl LlmApiToken {
+    pub async fn acquire(
+        &self,
+        client: &Arc<Client>,
+        organization_id: Option<OrganizationId>,
+    ) -> Result<String> {
+        let lock = self.0.upgradable_read().await;
+        if let Some(token) = lock.as_ref() {
+            Ok(token.to_string())
+        } else {
+            Self::fetch(
+                RwLockUpgradableReadGuard::upgrade(lock).await,
+                client,
+                organization_id,
+            )
+            .await
         }
     }
 
-    pub fn display_name(&self) -> &str {
-        match self {
-            Self::Anthropic(model) => model.display_name(),
-            Self::OpenAi(model) => model.display_name(),
-            Self::Google(model) => model.display_name(),
-        }
+    pub async fn refresh(
+        &self,
+        client: &Arc<Client>,
+        organization_id: Option<OrganizationId>,
+    ) -> Result<String> {
+        Self::fetch(self.0.write().await, client, organization_id).await
     }
 
-    pub fn icon(&self) -> Option<IconName> {
-        match self {
-            Self::Anthropic(_) => Some(IconName::AiAnthropicHosted),
-            _ => None,
-        }
-    }
+    async fn fetch(
+        mut lock: RwLockWriteGuard<'_, Option<String>>,
+        client: &Arc<Client>,
+        organization_id: Option<OrganizationId>,
+    ) -> Result<String> {
+        let system_id = client
+            .telemetry()
+            .system_id()
+            .map(|system_id| system_id.to_string());
 
-    pub fn max_token_count(&self) -> usize {
-        match self {
-            Self::Anthropic(model) => model.max_token_count(),
-            Self::OpenAi(model) => model.max_token_count(),
-            Self::Google(model) => model.max_token_count(),
-        }
-    }
-
-    /// Returns the availability of this model.
-    pub fn availability(&self) -> LanguageModelAvailability {
-        match self {
-            Self::Anthropic(model) => match model {
-                anthropic::Model::Claude3_5Sonnet => {
-                    LanguageModelAvailability::RequiresPlan(Plan::Free)
+        let result = client
+            .cloud_client()
+            .create_llm_token(system_id, organization_id)
+            .await;
+        match result {
+            Ok(response) => {
+                *lock = Some(response.token.0.clone());
+                Ok(response.token.0)
+            }
+            Err(err) => match err {
+                ClientApiError::Unauthorized => {
+                    client.request_sign_out();
+                    Err(err).context("Failed to create LLM token")
                 }
-                anthropic::Model::Claude3Opus
-                | anthropic::Model::Claude3Sonnet
-                | anthropic::Model::Claude3Haiku
-                | anthropic::Model::Custom { .. } => {
-                    LanguageModelAvailability::RequiresPlan(Plan::ZedPro)
-                }
+                ClientApiError::Other(err) => Err(err),
             },
-            Self::OpenAi(model) => match model {
-                open_ai::Model::ThreePointFiveTurbo
-                | open_ai::Model::Four
-                | open_ai::Model::FourTurbo
-                | open_ai::Model::FourOmni
-                | open_ai::Model::FourOmniMini
-                | open_ai::Model::O1Mini
-                | open_ai::Model::O1Preview
-                | open_ai::Model::Custom { .. } => {
-                    LanguageModelAvailability::RequiresPlan(Plan::ZedPro)
-                }
-            },
-            Self::Google(model) => match model {
-                google_ai::Model::Gemini15Pro
-                | google_ai::Model::Gemini15Flash
-                | google_ai::Model::Custom { .. } => {
-                    LanguageModelAvailability::RequiresPlan(Plan::ZedPro)
-                }
-            },
+        }
+    }
+}
+
+pub trait NeedsLlmTokenRefresh {
+    /// Returns whether the LLM token needs to be refreshed.
+    fn needs_llm_token_refresh(&self) -> bool;
+}
+
+impl NeedsLlmTokenRefresh for http_client::Response<http_client::AsyncBody> {
+    fn needs_llm_token_refresh(&self) -> bool {
+        self.headers().get(EXPIRED_LLM_TOKEN_HEADER_NAME).is_some()
+            || self.headers().get(OUTDATED_LLM_TOKEN_HEADER_NAME).is_some()
+    }
+}
+
+struct GlobalRefreshLlmTokenListener(Entity<RefreshLlmTokenListener>);
+
+impl Global for GlobalRefreshLlmTokenListener {}
+
+pub struct RefreshLlmTokenEvent;
+
+pub struct RefreshLlmTokenListener {
+    _subscription: Subscription,
+}
+
+impl EventEmitter<RefreshLlmTokenEvent> for RefreshLlmTokenListener {}
+
+impl RefreshLlmTokenListener {
+    pub fn register(client: Arc<Client>, user_store: Entity<UserStore>, cx: &mut App) {
+        let listener = cx.new(|cx| RefreshLlmTokenListener::new(client, user_store, cx));
+        cx.set_global(GlobalRefreshLlmTokenListener(listener));
+    }
+
+    pub fn global(cx: &App) -> Entity<Self> {
+        GlobalRefreshLlmTokenListener::global(cx).0.clone()
+    }
+
+    fn new(client: Arc<Client>, user_store: Entity<UserStore>, cx: &mut Context<Self>) -> Self {
+        client.add_message_to_client_handler({
+            let this = cx.entity();
+            move |message, cx| {
+                Self::handle_refresh_llm_token(this.clone(), message, cx);
+            }
+        });
+
+        let subscription = cx.subscribe(&user_store, |_this, _user_store, event, cx| {
+            if matches!(event, client::user::Event::OrganizationChanged) {
+                cx.emit(RefreshLlmTokenEvent);
+            }
+        });
+
+        Self {
+            _subscription: subscription,
+        }
+    }
+
+    fn handle_refresh_llm_token(this: Entity<Self>, message: &MessageToClient, cx: &mut App) {
+        match message {
+            MessageToClient::UserUpdated => {
+                this.update(cx, |_this, cx| cx.emit(RefreshLlmTokenEvent));
+            }
         }
     }
 }

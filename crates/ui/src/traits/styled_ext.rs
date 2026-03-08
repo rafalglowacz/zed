@@ -1,23 +1,28 @@
-use gpui::{hsla, Styled, WindowContext};
+use gpui::{App, Styled, hsla};
 
-use crate::prelude::*;
 use crate::ElevationIndex;
+use crate::prelude::*;
 
-fn elevated<E: Styled>(this: E, cx: &WindowContext, index: ElevationIndex) -> E {
+fn elevated<E: Styled>(this: E, cx: &App, index: ElevationIndex) -> E {
     this.bg(cx.theme().colors().elevated_surface_background)
         .rounded_lg()
         .border_1()
         .border_color(cx.theme().colors().border_variant)
-        .shadow(index.shadow())
+        .shadow(index.shadow(cx))
 }
 
-fn elevated_borderless<E: Styled>(this: E, cx: &WindowContext, index: ElevationIndex) -> E {
+fn elevated_borderless<E: Styled>(this: E, cx: &mut App, index: ElevationIndex) -> E {
     this.bg(cx.theme().colors().elevated_surface_background)
         .rounded_lg()
-        .shadow(index.shadow())
+        .shadow(index.shadow(cx))
 }
 
 /// Extends [`gpui::Styled`] with Zed-specific styling methods.
+// gate on rust-analyzer so rust-analyzer never needs to expand this macro, it takes up to 10 seconds to expand due to inefficiencies in rust-analyzers proc-macro srv
+#[cfg_attr(
+    all(debug_assertions, not(rust_analyzer)),
+    gpui_macros::derive_inspector_reflection
+)]
 pub trait StyledExt: Styled + Sized {
     /// Horizontally stacks elements.
     ///
@@ -38,14 +43,14 @@ pub trait StyledExt: Styled + Sized {
     /// Sets `bg()`, `rounded_lg()`, `border()`, `border_color()`, `shadow()`
     ///
     /// Example Elements: Title Bar, Panel, Tab Bar, Editor
-    fn elevation_1(self, cx: &WindowContext) -> Self {
+    fn elevation_1(self, cx: &App) -> Self {
         elevated(self, cx, ElevationIndex::Surface)
     }
 
-    /// See [`elevation_1`].
+    /// See [`elevation_1`](Self::elevation_1).
     ///
-    /// Renders a borderless version [`elevation_1`].
-    fn elevation_1_borderless(self, cx: &WindowContext) -> Self {
+    /// Renders a borderless version [`elevation_1`](Self::elevation_1).
+    fn elevation_1_borderless(self, cx: &mut App) -> Self {
         elevated_borderless(self, cx, ElevationIndex::Surface)
     }
 
@@ -54,14 +59,14 @@ pub trait StyledExt: Styled + Sized {
     /// Sets `bg()`, `rounded_lg()`, `border()`, `border_color()`, `shadow()`
     ///
     /// Examples: Notifications, Palettes, Detached/Floating Windows, Detached/Floating Panels
-    fn elevation_2(self, cx: &WindowContext) -> Self {
+    fn elevation_2(self, cx: &App) -> Self {
         elevated(self, cx, ElevationIndex::ElevatedSurface)
     }
 
-    /// See [`elevation_2`].
+    /// See [`elevation_2`](Self::elevation_2).
     ///
-    /// Renders a borderless version [`elevation_2`].
-    fn elevation_2_borderless(self, cx: &WindowContext) -> Self {
+    /// Renders a borderless version [`elevation_2`](Self::elevation_2).
+    fn elevation_2_borderless(self, cx: &mut App) -> Self {
         elevated_borderless(self, cx, ElevationIndex::ElevatedSurface)
     }
 
@@ -74,24 +79,24 @@ pub trait StyledExt: Styled + Sized {
     /// Sets `bg()`, `rounded_lg()`, `border()`, `border_color()`, `shadow()`
     ///
     /// Examples: Settings Modal, Channel Management, Wizards/Setup UI, Dialogs
-    fn elevation_3(self, cx: &WindowContext) -> Self {
+    fn elevation_3(self, cx: &App) -> Self {
         elevated(self, cx, ElevationIndex::ModalSurface)
     }
 
-    /// See [`elevation_3`].
+    /// See [`elevation_3`](Self::elevation_3).
     ///
-    /// Renders a borderless version [`elevation_3`].
-    fn elevation_3_borderless(self, cx: &WindowContext) -> Self {
+    /// Renders a borderless version [`elevation_3`](Self::elevation_3).
+    fn elevation_3_borderless(self, cx: &mut App) -> Self {
         elevated_borderless(self, cx, ElevationIndex::ModalSurface)
     }
 
     /// The theme's primary border color.
-    fn border_primary(self, cx: &WindowContext) -> Self {
+    fn border_primary(self, cx: &mut App) -> Self {
         self.border_color(cx.theme().colors().border)
     }
 
     /// The theme's secondary or muted border color.
-    fn border_muted(self, cx: &WindowContext) -> Self {
+    fn border_muted(self, cx: &mut App) -> Self {
         self.border_color(cx.theme().colors().border_variant)
     }
 

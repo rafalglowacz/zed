@@ -1,27 +1,132 @@
 pub mod blame;
 pub mod commit;
-pub mod diff;
 mod hosting_provider;
 mod remote;
 pub mod repository;
+pub mod stash;
 pub mod status;
-
-use anyhow::{anyhow, Context, Result};
-use serde::{Deserialize, Serialize};
-use std::ffi::OsStr;
-use std::fmt;
-use std::str::FromStr;
-use std::sync::LazyLock;
 
 pub use crate::hosting_provider::*;
 pub use crate::remote::*;
+use anyhow::{Context as _, Result};
 pub use git2 as libgit;
+use gpui::{Action, actions};
+pub use repository::RemoteCommandOutput;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
 
-pub static DOT_GIT: LazyLock<&'static OsStr> = LazyLock::new(|| OsStr::new(".git"));
-pub static COOKIES: LazyLock<&'static OsStr> = LazyLock::new(|| OsStr::new("cookies"));
-pub static FSMONITOR_DAEMON: LazyLock<&'static OsStr> =
-    LazyLock::new(|| OsStr::new("fsmonitor--daemon"));
-pub static GITIGNORE: LazyLock<&'static OsStr> = LazyLock::new(|| OsStr::new(".gitignore"));
+pub const DOT_GIT: &str = ".git";
+pub const GITIGNORE: &str = ".gitignore";
+pub const FSMONITOR_DAEMON: &str = "fsmonitor--daemon";
+pub const LFS_DIR: &str = "lfs";
+pub const COMMIT_MESSAGE: &str = "COMMIT_EDITMSG";
+pub const INDEX_LOCK: &str = "index.lock";
+pub const REPO_EXCLUDE: &str = "info/exclude";
+
+actions!(
+    git,
+    [
+        // per-hunk
+        /// Toggles the staged state of the hunk or status entry at cursor.
+        ToggleStaged,
+        /// Stage status entries between an anchor entry and the cursor.
+        StageRange,
+        /// Stages the current hunk and moves to the next one.
+        StageAndNext,
+        /// Unstages the current hunk and moves to the next one.
+        UnstageAndNext,
+        /// Restores the selected hunks to their original state.
+        #[action(deprecated_aliases = ["editor::RevertSelectedHunks"])]
+        Restore,
+        // per-file
+        /// Shows git blame information for the current file.
+        #[action(deprecated_aliases = ["editor::ToggleGitBlame"])]
+        Blame,
+        /// Shows the git history for the current file.
+        FileHistory,
+        /// Stages the current file.
+        StageFile,
+        /// Unstages the current file.
+        UnstageFile,
+        // repo-wide
+        /// Stages all changes in the repository.
+        StageAll,
+        /// Unstages all changes in the repository.
+        UnstageAll,
+        /// Stashes all changes in the repository, including untracked files.
+        StashAll,
+        /// Pops the most recent stash.
+        StashPop,
+        /// Apply the most recent stash.
+        StashApply,
+        /// Restores all tracked files to their last committed state.
+        RestoreTrackedFiles,
+        /// Moves all untracked files to trash.
+        TrashUntrackedFiles,
+        /// Undoes the last commit, keeping changes in the working directory.
+        Uncommit,
+        /// Pushes commits to the remote repository.
+        Push,
+        /// Pushes commits to a specific remote branch.
+        PushTo,
+        /// Force pushes commits to the remote repository.
+        ForcePush,
+        /// Pulls changes from the remote repository.
+        Pull,
+        /// Pulls changes from the remote repository with rebase.
+        PullRebase,
+        /// Fetches changes from the remote repository.
+        Fetch,
+        /// Fetches changes from a specific remote.
+        FetchFrom,
+        /// Creates a new commit with staged changes.
+        Commit,
+        /// Amends the last commit with staged changes.
+        Amend,
+        /// Enable the --signoff option.
+        Signoff,
+        /// Cancels the current git operation.
+        Cancel,
+        /// Expands the commit message editor.
+        ExpandCommitEditor,
+        /// Generates a commit message using AI.
+        GenerateCommitMessage,
+        /// Initializes a new git repository.
+        Init,
+        /// Opens all modified files in the editor.
+        OpenModifiedFiles,
+        /// Clones a repository.
+        Clone,
+        /// Adds a file to .gitignore.
+        AddToGitignore,
+    ]
+);
+
+/// Renames a git branch.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = git)]
+#[serde(deny_unknown_fields)]
+pub struct RenameBranch {
+    /// The branch to rename.
+    ///
+    /// Default: the current branch.
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+/// Restores a file to its last committed state, discarding local changes.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, JsonSchema, Action)]
+#[action(namespace = git, deprecated_aliases = ["editor::RevertFile"])]
+#[serde(deny_unknown_fields)]
+pub struct RestoreFile {
+    #[serde(default)]
+    pub skip_prompt: bool,
+}
+
+/// The length of a Git short SHA.
+pub const SHORT_SHA_LENGTH: usize = 7;
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub struct Oid(libgit::Oid);
@@ -30,6 +135,13 @@ impl Oid {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let oid = libgit::Oid::from_bytes(bytes).context("failed to parse bytes into git oid")?;
         Ok(Self(oid))
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn random(rng: &mut impl rand::Rng) -> Self {
+        let mut bytes = [0; 20];
+        rng.fill(&mut bytes);
+        Self::from_bytes(&bytes).unwrap()
     }
 
     pub fn as_bytes(&self) -> &[u8] {
@@ -42,7 +154,7 @@ impl Oid {
 
     /// Returns this [`Oid`] as a short SHA.
     pub fn display_short(&self) -> String {
-        self.to_string().chars().take(7).collect()
+        self.to_string().chars().take(SHORT_SHA_LENGTH).collect()
     }
 }
 
@@ -51,7 +163,7 @@ impl FromStr for Oid {
 
     fn from_str(s: &str) -> std::prelude::v1::Result<Self, Self::Err> {
         libgit::Oid::from_str(s)
-            .map_err(|error| anyhow!("failed to parse git oid: {}", error))
+            .context("parsing git oid")
             .map(Self)
     }
 }
@@ -114,5 +226,30 @@ impl From<Oid> for usize {
         u64_bytes.copy_from_slice(&bytes[..8]);
 
         u64::from_ne_bytes(u64_bytes) as usize
+    }
+}
+
+#[repr(i32)]
+#[derive(Copy, Clone, Debug)]
+pub enum RunHook {
+    PreCommit,
+}
+
+impl RunHook {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::PreCommit => "pre-commit",
+        }
+    }
+
+    pub fn to_proto(&self) -> i32 {
+        *self as i32
+    }
+
+    pub fn from_proto(value: i32) -> Option<Self> {
+        match value {
+            0 => Some(Self::PreCommit),
+            _ => None,
+        }
     }
 }

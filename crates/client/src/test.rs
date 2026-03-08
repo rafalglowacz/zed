@@ -1,20 +1,20 @@
 use crate::{Client, Connection, Credentials, EstablishConnectionError, UserStore};
-use anyhow::{anyhow, Result};
-use chrono::Duration;
-use futures::{stream::BoxStream, StreamExt};
-use gpui::{BackgroundExecutor, Context, Model, TestAppContext};
-use parking_lot::Mutex;
-use rpc::{
-    proto::{self, GetPrivateUserInfo, GetPrivateUserInfoResponse},
-    ConnectionId, Peer, Receipt, TypedEnvelope,
+use anyhow::{Context as _, Result, anyhow};
+use cloud_api_client::{
+    AuthenticatedUser, GetAuthenticatedUserResponse, KnownOrUnknown, Plan, PlanInfo,
 };
+use cloud_llm_client::{CurrentUsage, UsageData, UsageLimit};
+use futures::{StreamExt, stream::BoxStream};
+use gpui::{AppContext as _, Entity, TestAppContext};
+use http_client::{AsyncBody, Method, Request, http};
+use parking_lot::Mutex;
+use rpc::{ConnectionId, Peer, Receipt, TypedEnvelope, proto};
 use std::sync::Arc;
 
 pub struct FakeServer {
     peer: Arc<Peer>,
     state: Arc<Mutex<FakeServerState>>,
     user_id: u64,
-    executor: BackgroundExecutor,
 }
 
 #[derive(Default)]
@@ -36,16 +36,53 @@ impl FakeServer {
             peer: Peer::new(0),
             state: Default::default(),
             user_id: client_user_id,
-            executor: cx.executor(),
         };
 
+        client.http_client().as_fake().replace_handler({
+            let state = server.state.clone();
+            move |old_handler, req| {
+                let state = state.clone();
+                let old_handler = old_handler.clone();
+                async move {
+                    match (req.method(), req.uri().path()) {
+                        (&Method::GET, "/client/users/me") => {
+                            let credentials = parse_authorization_header(&req);
+                            if credentials
+                                != Some(Credentials {
+                                    user_id: client_user_id,
+                                    access_token: state.lock().access_token.to_string(),
+                                })
+                            {
+                                return Ok(http_client::Response::builder()
+                                    .status(401)
+                                    .body("Unauthorized".into())
+                                    .unwrap());
+                            }
+
+                            Ok(http_client::Response::builder()
+                                .status(200)
+                                .body(
+                                    serde_json::to_string(&make_get_authenticated_user_response(
+                                        client_user_id as i32,
+                                        format!("user-{client_user_id}"),
+                                    ))
+                                    .unwrap()
+                                    .into(),
+                                )
+                                .unwrap())
+                        }
+                        _ => old_handler(req).await,
+                    }
+                }
+            }
+        });
         client
             .override_authenticate({
                 let state = Arc::downgrade(&server.state);
                 move |cx| {
                     let state = state.clone();
-                    cx.spawn(move |_| async move {
-                        let state = state.upgrade().ok_or_else(|| anyhow!("server dropped"))?;
+                    cx.spawn(async move |_| {
+                        let state = state.upgrade().context("server dropped")?;
                         let mut state = state.lock();
                         state.auth_count += 1;
                         let access_token = state.access_token.to_string();
@@ -63,9 +100,9 @@ impl FakeServer {
                     let peer = peer.clone();
                     let state = state.clone();
                     let credentials = credentials.clone();
-                    cx.spawn(move |cx| async move {
-                        let state = state.upgrade().ok_or_else(|| anyhow!("server dropped"))?;
-                        let peer = peer.upgrade().ok_or_else(|| anyhow!("server dropped"))?;
+                    cx.spawn(async move |cx| {
+                        let state = state.upgrade().context("server dropped")?;
+                        let peer = peer.upgrade().context("server dropped")?;
                         if state.lock().forbid_connections {
                             Err(EstablishConnectionError::Other(anyhow!(
                                 "server is forbidding connections"
@@ -85,7 +122,7 @@ impl FakeServer {
                             Connection::in_memory(cx.background_executor().clone());
                         let (connection_id, io, incoming) =
                             peer.add_test_connection(server_conn, cx.background_executor().clone());
-                        cx.background_executor().spawn(io).detach();
+                        cx.background_spawn(io).detach();
                         {
                             let mut state = state.lock();
                             state.connection_id = Some(connection_id);
@@ -105,8 +142,9 @@ impl FakeServer {
             });
 
         client
-            .authenticate_and_connect(false, &cx.to_async())
+            .connect(false, &cx.to_async())
             .await
+            .into_response()
             .unwrap();
 
         server
@@ -143,52 +181,26 @@ impl FakeServer {
 
     #[allow(clippy::await_holding_lock)]
     pub async fn receive<M: proto::EnvelopedMessage>(&self) -> Result<TypedEnvelope<M>> {
-        self.executor.start_waiting();
+        let message = self
+            .state
+            .lock()
+            .incoming
+            .as_mut()
+            .expect("not connected")
+            .next()
+            .await
+            .context("other half hung up")?;
+        let type_name = message.payload_type_name();
+        let message = message.into_any();
 
-        loop {
-            let message = self
-                .state
-                .lock()
-                .incoming
-                .as_mut()
-                .expect("not connected")
-                .next()
-                .await
-                .ok_or_else(|| anyhow!("other half hung up"))?;
-            self.executor.finish_waiting();
-            let type_name = message.payload_type_name();
-            let message = message.into_any();
-
-            if message.is::<TypedEnvelope<M>>() {
-                return Ok(*message.downcast().unwrap());
-            }
-
-            let accepted_tos_at = chrono::Utc::now()
-                .checked_sub_signed(Duration::hours(5))
-                .expect("failed to build accepted_tos_at")
-                .timestamp() as u64;
-
-            if message.is::<TypedEnvelope<GetPrivateUserInfo>>() {
-                self.respond(
-                    message
-                        .downcast::<TypedEnvelope<GetPrivateUserInfo>>()
-                        .unwrap()
-                        .receipt(),
-                    GetPrivateUserInfoResponse {
-                        metrics_id: "the-metrics-id".into(),
-                        staff: false,
-                        flags: Default::default(),
-                        accepted_tos_at: Some(accepted_tos_at),
-                    },
-                );
-                continue;
-            }
-
-            panic!(
-                "fake server received unexpected message type: {:?}",
-                type_name
-            );
+        if message.is::<TypedEnvelope<M>>() {
+            return Ok(*message.downcast().unwrap());
         }
+
+        panic!(
+            "fake server received unexpected message type: {:?}",
+            type_name
+        );
     }
 
     pub fn respond<T: proto::RequestMessage>(&self, receipt: Receipt<T>, response: T::Response) {
@@ -203,8 +215,8 @@ impl FakeServer {
         &self,
         client: Arc<Client>,
         cx: &mut TestAppContext,
-    ) -> Model<UserStore> {
-        let user_store = cx.new_model(|cx| UserStore::new(client, cx));
+    ) -> Entity<UserStore> {
+        let user_store = cx.new(|cx| UserStore::new(client, cx));
         assert_eq!(
             self.receive::<proto::GetUsers>()
                 .await
@@ -220,5 +232,52 @@ impl FakeServer {
 impl Drop for FakeServer {
     fn drop(&mut self) {
         self.disconnect();
+    }
+}
+
+pub fn parse_authorization_header(req: &Request<AsyncBody>) -> Option<Credentials> {
+    let mut auth_header = req
+        .headers()
+        .get(http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .split_whitespace();
+    let user_id = auth_header.next()?.parse().ok()?;
+    let access_token = auth_header.next()?;
+    Some(Credentials {
+        user_id,
+        access_token: access_token.to_string(),
+    })
+}
+
+pub fn make_get_authenticated_user_response(
+    user_id: i32,
+    github_login: String,
+) -> GetAuthenticatedUserResponse {
+    GetAuthenticatedUserResponse {
+        user: AuthenticatedUser {
+            id: user_id,
+            metrics_id: format!("metrics-id-{user_id}"),
+            avatar_url: "".to_string(),
+            github_login,
+            name: None,
+            is_staff: false,
+            accepted_tos_at: None,
+        },
+        feature_flags: vec![],
+        organizations: vec![],
+        plan: PlanInfo {
+            plan: KnownOrUnknown::Known(Plan::ZedPro),
+            subscription_period: None,
+            usage: CurrentUsage {
+                edit_predictions: UsageData {
+                    used: 250,
+                    limit: UsageLimit::Unlimited,
+                },
+            },
+            trial_started_at: None,
+            is_account_too_young: false,
+            has_overdue_invoices: false,
+        },
     }
 }

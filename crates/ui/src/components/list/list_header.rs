@@ -1,13 +1,12 @@
-#![allow(missing_docs)]
-
 use std::sync::Arc;
 
-use crate::{h_flex, prelude::*, Disclosure, Label};
+use crate::{Disclosure, prelude::*};
+use component::{Component, ComponentScope, example_group_with_title, single_example};
 use gpui::{AnyElement, ClickEvent};
 use settings::Settings;
 use theme::ThemeSettings;
 
-#[derive(IntoElement)]
+#[derive(IntoElement, RegisterComponent)]
 pub struct ListHeader {
     /// The label of the header.
     label: SharedString,
@@ -20,7 +19,7 @@ pub struct ListHeader {
     /// It will obscure the `end_slot` when visible.
     end_hover_slot: Option<AnyElement>,
     toggle: Option<bool>,
-    on_toggle: Option<Arc<dyn Fn(&ClickEvent, &mut WindowContext) + 'static>>,
+    on_toggle: Option<Arc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>>,
     inset: bool,
     selected: bool,
 }
@@ -46,7 +45,7 @@ impl ListHeader {
 
     pub fn on_toggle(
         mut self,
-        on_toggle: impl Fn(&ClickEvent, &mut WindowContext) + 'static,
+        on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     ) -> Self {
         self.on_toggle = Some(Arc::new(on_toggle));
         self
@@ -73,15 +72,15 @@ impl ListHeader {
     }
 }
 
-impl Selectable for ListHeader {
-    fn selected(mut self, selected: bool) -> Self {
+impl Toggleable for ListHeader {
+    fn toggle_state(mut self, selected: bool) -> Self {
         self.selected = selected;
         self
     }
 }
 
 impl RenderOnce for ListHeader {
-    fn render(self, cx: &mut WindowContext) -> impl IntoElement {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         let ui_density = ThemeSettings::get_global(cx).ui_density;
 
         h_flex()
@@ -109,7 +108,8 @@ impl RenderOnce for ListHeader {
                         h_flex()
                             .gap(DynamicSpacing::Base04.rems(cx))
                             .children(self.toggle.map(|is_open| {
-                                Disclosure::new("toggle", is_open).on_toggle(self.on_toggle.clone())
+                                Disclosure::new("toggle", is_open)
+                                    .on_toggle_expanded(self.on_toggle.clone())
                             }))
                             .child(
                                 div()
@@ -120,7 +120,9 @@ impl RenderOnce for ListHeader {
                                     .children(self.start_slot)
                                     .child(Label::new(self.label.clone()).color(Color::Muted))
                                     .when_some(self.on_toggle, |this, on_toggle| {
-                                        this.on_click(move |event, cx| on_toggle(event, cx))
+                                        this.on_click(move |event, window, cx| {
+                                            on_toggle(event, window, cx)
+                                        })
                                     }),
                             ),
                     )
@@ -135,5 +137,82 @@ impl RenderOnce for ListHeader {
                         )
                     }),
             )
+    }
+}
+
+impl Component for ListHeader {
+    fn scope() -> ComponentScope {
+        ComponentScope::DataDisplay
+    }
+
+    fn description() -> Option<&'static str> {
+        Some(
+            "A header component for lists with support for icons, actions, and collapsible sections.",
+        )
+    }
+
+    fn preview(_window: &mut Window, _cx: &mut App) -> Option<AnyElement> {
+        Some(
+            v_flex()
+                .gap_6()
+                .children(vec![
+                    example_group_with_title(
+                        "Basic Headers",
+                        vec![
+                            single_example(
+                                "Simple",
+                                ListHeader::new("Section Header").into_any_element(),
+                            ),
+                            single_example(
+                                "With Icon",
+                                ListHeader::new("Files")
+                                    .start_slot(Icon::new(IconName::File))
+                                    .into_any_element(),
+                            ),
+                            single_example(
+                                "With End Slot",
+                                ListHeader::new("Recent")
+                                    .end_slot(Label::new("5").color(Color::Muted))
+                                    .into_any_element(),
+                            ),
+                        ],
+                    ),
+                    example_group_with_title(
+                        "Collapsible Headers",
+                        vec![
+                            single_example(
+                                "Expanded",
+                                ListHeader::new("Expanded Section")
+                                    .toggle(Some(true))
+                                    .into_any_element(),
+                            ),
+                            single_example(
+                                "Collapsed",
+                                ListHeader::new("Collapsed Section")
+                                    .toggle(Some(false))
+                                    .into_any_element(),
+                            ),
+                        ],
+                    ),
+                    example_group_with_title(
+                        "States",
+                        vec![
+                            single_example(
+                                "Selected",
+                                ListHeader::new("Selected Header")
+                                    .toggle_state(true)
+                                    .into_any_element(),
+                            ),
+                            single_example(
+                                "Inset",
+                                ListHeader::new("Inset Header")
+                                    .inset(true)
+                                    .into_any_element(),
+                            ),
+                        ],
+                    ),
+                ])
+                .into_any_element(),
+        )
     }
 }

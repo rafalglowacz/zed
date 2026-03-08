@@ -1,91 +1,80 @@
 mod ids;
-mod queries;
+pub mod queries;
 mod tables;
-#[cfg(test)]
-pub mod tests;
 
-use crate::{executor::Executor, Error, Result};
-use anyhow::anyhow;
-use collections::{BTreeMap, HashMap, HashSet};
+use crate::{Error, Result};
+use anyhow::{Context as _, anyhow};
+use cloud_api_types::{ExtensionMetadata, ExtensionProvides};
+use collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use dashmap::DashMap;
 use futures::StreamExt;
-use rand::{prelude::StdRng, Rng, SeedableRng};
+use project_repository_statuses::StatusKind;
 use rpc::{
+    ConnectionId,
     proto::{self},
-    ConnectionId, ExtensionMetadata,
 };
 use sea_orm::{
-    entity::prelude::*,
-    sea_query::{Alias, Expr, OnConflict},
-    ActiveValue, Condition, ConnectionTrait, DatabaseConnection, DatabaseTransaction, DbErr,
+    ActiveValue, Condition, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
     FromQueryResult, IntoActiveModel, IsolationLevel, JoinType, QueryOrder, QuerySelect, Statement,
     TransactionTrait,
+    entity::prelude::*,
+    sea_query::{Alias, Expr, OnConflict},
 };
-use semantic_version::SemanticVersion;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::ops::RangeInclusive;
 use std::{
-    fmt::Write as _,
     future::Future,
     marker::PhantomData,
     ops::{Deref, DerefMut},
     rc::Rc,
     sync::Arc,
-    time::Duration,
 };
 use time::PrimitiveDateTime;
 use tokio::sync::{Mutex, OwnedMutexGuard};
+use util::paths::PathStyle;
 use worktree_settings_file::LocalSettingsKind;
 
-#[cfg(test)]
-pub use tests::TestDb;
-
 pub use ids::*;
-pub use queries::billing_customers::{CreateBillingCustomerParams, UpdateBillingCustomerParams};
-pub use queries::billing_preferences::{
-    CreateBillingPreferencesParams, UpdateBillingPreferencesParams,
-};
-pub use queries::billing_subscriptions::{
-    CreateBillingSubscriptionParams, UpdateBillingSubscriptionParams,
-};
-pub use queries::contributors::ContributorSelector;
-pub use queries::processed_stripe_events::CreateProcessedStripeEventParams;
 pub use sea_orm::ConnectOptions;
 pub use tables::user::Model as User;
 pub use tables::*;
 
+#[cfg(feature = "test-support")]
+pub struct DatabaseTestOptions {
+    pub executor: gpui::BackgroundExecutor,
+    pub runtime: tokio::runtime::Runtime,
+    pub query_failure_probability: parking_lot::Mutex<f64>,
+}
+
 /// Database gives you a handle that lets you access the database.
 /// It handles pooling internally.
 pub struct Database {
-    options: ConnectOptions,
-    pool: DatabaseConnection,
+    pub options: ConnectOptions,
+    pub pool: DatabaseConnection,
     rooms: DashMap<RoomId, Arc<Mutex<()>>>,
     projects: DashMap<ProjectId, Arc<Mutex<()>>>,
-    rng: Mutex<StdRng>,
-    executor: Executor,
     notification_kinds_by_id: HashMap<NotificationKindId, &'static str>,
     notification_kinds_by_name: HashMap<String, NotificationKindId>,
-    #[cfg(test)]
-    runtime: Option<tokio::runtime::Runtime>,
+    #[cfg(feature = "test-support")]
+    pub test_options: Option<DatabaseTestOptions>,
 }
 
 // The `Database` type has so many methods that its impl blocks are split into
 // separate files in the `queries` folder.
 impl Database {
     /// Connects to the database with the given options
-    pub async fn new(options: ConnectOptions, executor: Executor) -> Result<Self> {
+    pub async fn new(options: ConnectOptions) -> Result<Self> {
         sqlx::any::install_default_drivers();
         Ok(Self {
             options: options.clone(),
             pool: sea_orm::Database::connect(options).await?,
             rooms: DashMap::with_capacity(16384),
             projects: DashMap::with_capacity(16384),
-            rng: Mutex::new(StdRng::seed_from_u64(0)),
             notification_kinds_by_id: HashMap::default(),
             notification_kinds_by_name: HashMap::default(),
-            executor,
-            #[cfg(test)]
-            runtime: None,
+            #[cfg(feature = "test-support")]
+            test_options: None,
         })
     }
 
@@ -93,54 +82,19 @@ impl Database {
         &self.options
     }
 
-    #[cfg(test)]
+    #[cfg(feature = "test-support")]
     pub fn reset(&self) {
         self.rooms.clear();
         self.projects.clear();
     }
 
-    /// Transaction runs things in a transaction. If you want to call other methods
-    /// and pass the transaction around you need to reborrow the transaction at each
-    /// call site with: `&*tx`.
     pub async fn transaction<F, Fut, T>(&self, f: F) -> Result<T>
     where
         F: Send + Fn(TransactionHandle) -> Fut,
         Fut: Send + Future<Output = Result<T>>,
     {
         let body = async {
-            let mut i = 0;
-            loop {
-                let (tx, result) = self.with_transaction(&f).await?;
-                match result {
-                    Ok(result) => match tx.commit().await.map_err(Into::into) {
-                        Ok(()) => return Ok(result),
-                        Err(error) => {
-                            if !self.retry_on_serialization_error(&error, i).await {
-                                return Err(error);
-                            }
-                        }
-                    },
-                    Err(error) => {
-                        tx.rollback().await?;
-                        if !self.retry_on_serialization_error(&error, i).await {
-                            return Err(error);
-                        }
-                    }
-                }
-                i += 1;
-            }
-        };
-
-        self.run(body).await
-    }
-
-    pub async fn weak_transaction<F, Fut, T>(&self, f: F) -> Result<T>
-    where
-        F: Send + Fn(TransactionHandle) -> Fut,
-        Fut: Send + Future<Output = Result<T>>,
-    {
-        let body = async {
-            let (tx, result) = self.with_weak_transaction(&f).await?;
+            let (tx, result) = self.with_transaction(&f).await?;
             match result {
                 Ok(result) => match tx.commit().await.map_err(Into::into) {
                     Ok(()) => Ok(result),
@@ -166,44 +120,28 @@ impl Database {
         Fut: Send + Future<Output = Result<Option<(RoomId, T)>>>,
     {
         let body = async {
-            let mut i = 0;
-            loop {
-                let (tx, result) = self.with_transaction(&f).await?;
-                match result {
-                    Ok(Some((room_id, data))) => {
-                        let lock = self.rooms.entry(room_id).or_default().clone();
-                        let _guard = lock.lock_owned().await;
-                        match tx.commit().await.map_err(Into::into) {
-                            Ok(()) => {
-                                return Ok(Some(TransactionGuard {
-                                    data,
-                                    _guard,
-                                    _not_send: PhantomData,
-                                }));
-                            }
-                            Err(error) => {
-                                if !self.retry_on_serialization_error(&error, i).await {
-                                    return Err(error);
-                                }
-                            }
-                        }
-                    }
-                    Ok(None) => match tx.commit().await.map_err(Into::into) {
-                        Ok(()) => return Ok(None),
-                        Err(error) => {
-                            if !self.retry_on_serialization_error(&error, i).await {
-                                return Err(error);
-                            }
-                        }
-                    },
-                    Err(error) => {
-                        tx.rollback().await?;
-                        if !self.retry_on_serialization_error(&error, i).await {
-                            return Err(error);
-                        }
+            let (tx, result) = self.with_transaction(&f).await?;
+            match result {
+                Ok(Some((room_id, data))) => {
+                    let lock = self.rooms.entry(room_id).or_default().clone();
+                    let _guard = lock.lock_owned().await;
+                    match tx.commit().await.map_err(Into::into) {
+                        Ok(()) => Ok(Some(TransactionGuard {
+                            data,
+                            _guard,
+                            _not_send: PhantomData,
+                        })),
+                        Err(error) => Err(error),
                     }
                 }
-                i += 1;
+                Ok(None) => match tx.commit().await.map_err(Into::into) {
+                    Ok(()) => Ok(None),
+                    Err(error) => Err(error),
+                },
+                Err(error) => {
+                    tx.rollback().await?;
+                    Err(error)
+                }
             }
         };
 
@@ -221,38 +159,26 @@ impl Database {
     {
         let room_id = Database::room_id_for_project(self, project_id).await?;
         let body = async {
-            let mut i = 0;
-            loop {
-                let lock = if let Some(room_id) = room_id {
-                    self.rooms.entry(room_id).or_default().clone()
-                } else {
-                    self.projects.entry(project_id).or_default().clone()
-                };
-                let _guard = lock.lock_owned().await;
-                let (tx, result) = self.with_transaction(&f).await?;
-                match result {
-                    Ok(data) => match tx.commit().await.map_err(Into::into) {
-                        Ok(()) => {
-                            return Ok(TransactionGuard {
-                                data,
-                                _guard,
-                                _not_send: PhantomData,
-                            });
-                        }
-                        Err(error) => {
-                            if !self.retry_on_serialization_error(&error, i).await {
-                                return Err(error);
-                            }
-                        }
-                    },
-                    Err(error) => {
-                        tx.rollback().await?;
-                        if !self.retry_on_serialization_error(&error, i).await {
-                            return Err(error);
-                        }
-                    }
+            let lock = if let Some(room_id) = room_id {
+                self.rooms.entry(room_id).or_default().clone()
+            } else {
+                self.projects.entry(project_id).or_default().clone()
+            };
+            let _guard = lock.lock_owned().await;
+            let (tx, result) = self.with_transaction(&f).await?;
+            match result {
+                Ok(data) => match tx.commit().await.map_err(Into::into) {
+                    Ok(()) => Ok(TransactionGuard {
+                        data,
+                        _guard,
+                        _not_send: PhantomData,
+                    }),
+                    Err(error) => Err(error),
+                },
+                Err(error) => {
+                    tx.rollback().await?;
+                    Err(error)
                 }
-                i += 1;
             }
         };
 
@@ -272,34 +198,22 @@ impl Database {
         Fut: Send + Future<Output = Result<T>>,
     {
         let body = async {
-            let mut i = 0;
-            loop {
-                let lock = self.rooms.entry(room_id).or_default().clone();
-                let _guard = lock.lock_owned().await;
-                let (tx, result) = self.with_transaction(&f).await?;
-                match result {
-                    Ok(data) => match tx.commit().await.map_err(Into::into) {
-                        Ok(()) => {
-                            return Ok(TransactionGuard {
-                                data,
-                                _guard,
-                                _not_send: PhantomData,
-                            });
-                        }
-                        Err(error) => {
-                            if !self.retry_on_serialization_error(&error, i).await {
-                                return Err(error);
-                            }
-                        }
-                    },
-                    Err(error) => {
-                        tx.rollback().await?;
-                        if !self.retry_on_serialization_error(&error, i).await {
-                            return Err(error);
-                        }
-                    }
+            let lock = self.rooms.entry(room_id).or_default().clone();
+            let _guard = lock.lock_owned().await;
+            let (tx, result) = self.with_transaction(&f).await?;
+            match result {
+                Ok(data) => match tx.commit().await.map_err(Into::into) {
+                    Ok(()) => Ok(TransactionGuard {
+                        data,
+                        _guard,
+                        _not_send: PhantomData,
+                    }),
+                    Err(error) => Err(error),
+                },
+                Err(error) => {
+                    tx.rollback().await?;
+                    Err(error)
                 }
-                i += 1;
             }
         };
 
@@ -313,40 +227,14 @@ impl Database {
     {
         let tx = self
             .pool
-            .begin_with_config(Some(IsolationLevel::Serializable), None)
-            .await?;
-
-        let mut tx = Arc::new(Some(tx));
-        let result = f(TransactionHandle(tx.clone())).await;
-        let Some(tx) = Arc::get_mut(&mut tx).and_then(|tx| tx.take()) else {
-            return Err(anyhow!(
-                "couldn't complete transaction because it's still in use"
-            ))?;
-        };
-
-        Ok((tx, result))
-    }
-
-    async fn with_weak_transaction<F, Fut, T>(
-        &self,
-        f: &F,
-    ) -> Result<(DatabaseTransaction, Result<T>)>
-    where
-        F: Send + Fn(TransactionHandle) -> Fut,
-        Fut: Send + Future<Output = Result<T>>,
-    {
-        let tx = self
-            .pool
             .begin_with_config(Some(IsolationLevel::ReadCommitted), None)
             .await?;
 
         let mut tx = Arc::new(Some(tx));
         let result = f(TransactionHandle(tx.clone())).await;
-        let Some(tx) = Arc::get_mut(&mut tx).and_then(|tx| tx.take()) else {
-            return Err(anyhow!(
-                "couldn't complete transaction because it's still in use"
-            ))?;
-        };
+        let tx = Arc::get_mut(&mut tx)
+            .and_then(|tx| tx.take())
+            .context("couldn't complete transaction because it's still in use")?;
 
         Ok((tx, result))
     }
@@ -355,59 +243,22 @@ impl Database {
     where
         F: Future<Output = Result<T>>,
     {
-        #[cfg(test)]
+        #[cfg(feature = "test-support")]
         {
-            if let Executor::Deterministic(executor) = &self.executor {
-                executor.simulate_random_delay().await;
+            let test_options = self.test_options.as_ref().unwrap();
+            test_options.executor.simulate_random_delay().await;
+            let fail_probability = *test_options.query_failure_probability.lock();
+            if test_options.executor.rng().random_bool(fail_probability) {
+                return Err(anyhow!("simulated query failure"))?;
             }
 
-            self.runtime.as_ref().unwrap().block_on(future)
+            test_options.runtime.block_on(future)
         }
 
-        #[cfg(not(test))]
+        #[cfg(not(feature = "test-support"))]
         {
             future.await
         }
-    }
-
-    async fn retry_on_serialization_error(&self, error: &Error, prev_attempt_count: usize) -> bool {
-        // If the error is due to a failure to serialize concurrent transactions, then retry
-        // this transaction after a delay. With each subsequent retry, double the delay duration.
-        // Also vary the delay randomly in order to ensure different database connections retry
-        // at different times.
-        const SLEEPS: [f32; 10] = [10., 20., 40., 80., 160., 320., 640., 1280., 2560., 5120.];
-        if is_serialization_error(error) && prev_attempt_count < SLEEPS.len() {
-            let base_delay = SLEEPS[prev_attempt_count];
-            let randomized_delay = base_delay * self.rng.lock().await.gen_range(0.5..=2.0);
-            log::warn!(
-                "retrying transaction after serialization error. delay: {} ms.",
-                randomized_delay
-            );
-            self.executor
-                .sleep(Duration::from_millis(randomized_delay as u64))
-                .await;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-fn is_serialization_error(error: &Error) -> bool {
-    const SERIALIZATION_FAILURE_CODE: &str = "40001";
-    match error {
-        Error::Database(
-            DbErr::Exec(sea_orm::RuntimeErr::SqlxError(error))
-            | DbErr::Query(sea_orm::RuntimeErr::SqlxError(error)),
-        ) if error
-            .as_database_error()
-            .and_then(|error| error.code())
-            .as_deref()
-            == Some(SERIALIZATION_FAILURE_CODE) =>
-        {
-            true
-        }
-        _ => false,
     }
 }
 
@@ -526,9 +377,6 @@ pub struct NewUserParams {
 #[derive(Debug)]
 pub struct NewUserResult {
     pub user_id: UserId,
-    pub metrics_id: String,
-    pub inviting_user_id: Option<UserId>,
-    pub signup_device_id: Option<String>,
 }
 
 /// The result of updating a channel membership.
@@ -541,7 +389,7 @@ pub struct MembershipUpdated {
 
 /// The result of setting a member's role.
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant)]
+
 pub enum SetMemberRoleResult {
     InviteUpdated(Channel),
     MembershipUpdated(MembershipUpdated),
@@ -573,6 +421,7 @@ pub struct Channel {
     pub visibility: ChannelVisibility,
     /// parent_path is the channel ids from the root to this one (not including this one)
     pub parent_path: Vec<ChannelId>,
+    pub channel_order: i32,
 }
 
 impl Channel {
@@ -582,6 +431,7 @@ impl Channel {
             visibility: value.visibility,
             name: value.clone().name,
             parent_path: value.ancestors().collect(),
+            channel_order: value.channel_order,
         }
     }
 
@@ -591,7 +441,12 @@ impl Channel {
             name: self.name.clone(),
             visibility: self.visibility.into(),
             parent_path: self.parent_path.iter().map(|c| c.to_proto()).collect(),
+            channel_order: self.channel_order,
         }
+    }
+
+    pub fn root_id(&self) -> ChannelId {
+        self.parent_path.first().copied().unwrap_or(self.id)
     }
 }
 
@@ -620,9 +475,7 @@ pub struct ChannelsForUser {
     pub invited_channels: Vec<Channel>,
 
     pub observed_buffer_versions: Vec<proto::ChannelBufferVersion>,
-    pub observed_channel_messages: Vec<proto::ChannelMessageId>,
     pub latest_buffer_versions: Vec<proto::ChannelBufferVersion>,
-    pub latest_channel_messages: Vec<proto::ChannelMessageId>,
 }
 
 #[derive(Debug)]
@@ -656,11 +509,19 @@ pub struct RejoinedProject {
     pub old_connection_id: ConnectionId,
     pub collaborators: Vec<ProjectCollaborator>,
     pub worktrees: Vec<RejoinedWorktree>,
-    pub language_servers: Vec<proto::LanguageServer>,
+    pub updated_repositories: Vec<proto::UpdateRepository>,
+    pub removed_repositories: Vec<u64>,
+    pub language_servers: Vec<LanguageServer>,
 }
 
 impl RejoinedProject {
     pub fn to_proto(&self) -> proto::RejoinedProject {
+        let (language_servers, language_server_capabilities) = self
+            .language_servers
+            .clone()
+            .into_iter()
+            .map(|server| (server.server, server.capabilities))
+            .unzip();
         proto::RejoinedProject {
             id: self.id.to_proto(),
             worktrees: self
@@ -678,7 +539,8 @@ impl RejoinedProject {
                 .iter()
                 .map(|collaborator| collaborator.to_proto())
                 .collect(),
-            language_servers: self.language_servers.clone(),
+            language_servers,
+            language_server_capabilities,
         }
     }
 }
@@ -724,7 +586,9 @@ pub struct Project {
     pub role: ChannelRole,
     pub collaborators: Vec<ProjectCollaborator>,
     pub worktrees: BTreeMap<u64, Worktree>,
-    pub language_servers: Vec<proto::LanguageServer>,
+    pub repositories: Vec<proto::UpdateRepository>,
+    pub language_servers: Vec<LanguageServer>,
+    pub path_style: PathStyle,
 }
 
 pub struct ProjectCollaborator {
@@ -732,6 +596,8 @@ pub struct ProjectCollaborator {
     pub user_id: UserId,
     pub replica_id: ReplicaId,
     pub is_host: bool,
+    pub committer_name: Option<String>,
+    pub committer_email: Option<String>,
 }
 
 impl ProjectCollaborator {
@@ -741,8 +607,16 @@ impl ProjectCollaborator {
             replica_id: self.replica_id.0 as u32,
             user_id: self.user_id.to_proto(),
             is_host: self.is_host,
+            committer_name: self.committer_name.clone(),
+            committer_email: self.committer_email.clone(),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct LanguageServer {
+    pub server: proto::LanguageServer,
+    pub capabilities: String,
 }
 
 #[derive(Debug)]
@@ -758,7 +632,7 @@ pub struct Worktree {
     pub root_name: String,
     pub visible: bool,
     pub entries: Vec<proto::Entry>,
-    pub repository_entries: BTreeMap<u64, proto::RepositoryEntry>,
+    pub legacy_repository_entries: BTreeMap<u64, proto::RepositoryEntry>,
     pub diagnostic_summaries: Vec<proto::DiagnosticSummary>,
     pub settings_files: Vec<WorktreeSettingsFile>,
     pub scan_id: u64,
@@ -770,6 +644,7 @@ pub struct WorktreeSettingsFile {
     pub path: String,
     pub content: String,
     pub kind: LocalSettingsKind,
+    pub outside_worktree: bool,
 }
 
 pub struct NewExtensionVersion {
@@ -780,12 +655,13 @@ pub struct NewExtensionVersion {
     pub repository: String,
     pub schema_version: i32,
     pub wasm_api_version: Option<String>,
+    pub provides: BTreeSet<ExtensionProvides>,
     pub published_at: PrimitiveDateTime,
 }
 
 pub struct ExtensionVersionConstraints {
     pub schema_versions: RangeInclusive<i32>,
-    pub wasm_api_versions: RangeInclusive<SemanticVersion>,
+    pub wasm_api_versions: RangeInclusive<semver::Version>,
 }
 
 impl LocalSettingsKind {
@@ -794,14 +670,105 @@ impl LocalSettingsKind {
             proto::LocalSettingsKind::Settings => Self::Settings,
             proto::LocalSettingsKind::Tasks => Self::Tasks,
             proto::LocalSettingsKind::Editorconfig => Self::Editorconfig,
+            proto::LocalSettingsKind::Debug => Self::Debug,
         }
     }
 
-    pub fn to_proto(&self) -> proto::LocalSettingsKind {
+    pub fn to_proto(self) -> proto::LocalSettingsKind {
         match self {
             Self::Settings => proto::LocalSettingsKind::Settings,
             Self::Tasks => proto::LocalSettingsKind::Tasks,
             Self::Editorconfig => proto::LocalSettingsKind::Editorconfig,
+            Self::Debug => proto::LocalSettingsKind::Debug,
         }
     }
+}
+
+fn db_status_to_proto(
+    entry: project_repository_statuses::Model,
+) -> anyhow::Result<proto::StatusEntry> {
+    use proto::git_file_status::{Tracked, Unmerged, Variant};
+
+    let (simple_status, variant) =
+        match (entry.status_kind, entry.first_status, entry.second_status) {
+            (StatusKind::Untracked, None, None) => (
+                proto::GitStatus::Added as i32,
+                Variant::Untracked(Default::default()),
+            ),
+            (StatusKind::Ignored, None, None) => (
+                proto::GitStatus::Added as i32,
+                Variant::Ignored(Default::default()),
+            ),
+            (StatusKind::Unmerged, Some(first_head), Some(second_head)) => (
+                proto::GitStatus::Conflict as i32,
+                Variant::Unmerged(Unmerged {
+                    first_head,
+                    second_head,
+                }),
+            ),
+            (StatusKind::Tracked, Some(index_status), Some(worktree_status)) => {
+                let simple_status = if worktree_status != proto::GitStatus::Unmodified as i32 {
+                    worktree_status
+                } else if index_status != proto::GitStatus::Unmodified as i32 {
+                    index_status
+                } else {
+                    proto::GitStatus::Unmodified as i32
+                };
+                (
+                    simple_status,
+                    Variant::Tracked(Tracked {
+                        index_status,
+                        worktree_status,
+                    }),
+                )
+            }
+            _ => {
+                anyhow::bail!("Unexpected combination of status fields: {entry:?}");
+            }
+        };
+    Ok(proto::StatusEntry {
+        repo_path: entry.repo_path,
+        simple_status,
+        status: Some(proto::GitFileStatus {
+            variant: Some(variant),
+        }),
+        diff_stat_added: entry.lines_added.map(|v| v as u32),
+        diff_stat_deleted: entry.lines_deleted.map(|v| v as u32),
+    })
+}
+
+fn proto_status_to_db(
+    status_entry: proto::StatusEntry,
+) -> (String, StatusKind, Option<i32>, Option<i32>) {
+    use proto::git_file_status::{Tracked, Unmerged, Variant};
+
+    let (status_kind, first_status, second_status) = status_entry
+        .status
+        .clone()
+        .and_then(|status| status.variant)
+        .map_or(
+            (StatusKind::Untracked, None, None),
+            |variant| match variant {
+                Variant::Untracked(_) => (StatusKind::Untracked, None, None),
+                Variant::Ignored(_) => (StatusKind::Ignored, None, None),
+                Variant::Unmerged(Unmerged {
+                    first_head,
+                    second_head,
+                }) => (StatusKind::Unmerged, Some(first_head), Some(second_head)),
+                Variant::Tracked(Tracked {
+                    index_status,
+                    worktree_status,
+                }) => (
+                    StatusKind::Tracked,
+                    Some(index_status),
+                    Some(worktree_status),
+                ),
+            },
+        );
+    (
+        status_entry.repo_path,
+        status_kind,
+        first_status,
+        second_status,
+    )
 }

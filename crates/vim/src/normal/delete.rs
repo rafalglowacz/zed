@@ -1,92 +1,124 @@
-use crate::{motion::Motion, object::Object, Vim};
+use crate::{
+    Vim,
+    motion::{Motion, MotionKind},
+    object::Object,
+    state::Mode,
+};
 use collections::{HashMap, HashSet};
 use editor::{
-    display_map::{DisplaySnapshot, ToDisplayPoint},
-    scroll::Autoscroll,
     Bias, DisplayPoint,
+    display_map::{DisplaySnapshot, ToDisplayPoint},
 };
+use gpui::{Context, Window};
 use language::{Point, Selection};
 use multi_buffer::MultiBufferRow;
-use ui::ViewContext;
 
 impl Vim {
     pub fn delete_motion(
         &mut self,
         motion: Motion,
         times: Option<usize>,
-        cx: &mut ViewContext<Self>,
+        forced_motion: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         self.stop_recording(cx);
         self.update_editor(cx, |vim, editor, cx| {
-            let text_layout_details = editor.text_layout_details(cx);
-            editor.transact(cx, |editor, cx| {
+            let text_layout_details = editor.text_layout_details(window, cx);
+            editor.transact(window, cx, |editor, window, cx| {
                 editor.set_clip_at_line_ends(false, cx);
                 let mut original_columns: HashMap<_, _> = Default::default();
-                editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
-                    s.move_with(|map, selection| {
+                let mut motion_kind = None;
+                let mut ranges_to_copy = Vec::new();
+                editor.change_selections(Default::default(), window, cx, |s| {
+                    s.move_with(&mut |map, selection| {
                         let original_head = selection.head();
                         original_columns.insert(selection.id, original_head.column());
-                        motion.expand_selection(map, selection, times, true, &text_layout_details);
+                        let kind = motion.expand_selection(
+                            map,
+                            selection,
+                            times,
+                            &text_layout_details,
+                            forced_motion,
+                        );
+                        ranges_to_copy
+                            .push(selection.start.to_point(map)..selection.end.to_point(map));
 
-                        match motion {
-                            // Motion::NextWordStart on an empty line should delete it.
-                            Motion::NextWordStart { .. } => {
-                                if selection.is_empty()
-                                    && map
-                                        .buffer_snapshot
-                                        .line_len(MultiBufferRow(selection.start.to_point(map).row))
-                                        == 0
-                                {
-                                    selection.end = map
-                                        .buffer_snapshot
-                                        .clip_point(
-                                            Point::new(selection.start.to_point(map).row + 1, 0),
-                                            Bias::Left,
-                                        )
-                                        .to_display_point(map)
-                                }
+                        // When deleting line-wise, we always want to delete a newline.
+                        // If there is one after the current line, it goes; otherwise we
+                        // pick the one before.
+                        if kind == Some(MotionKind::Linewise) {
+                            let start = selection.start.to_point(map);
+                            let end = selection.end.to_point(map);
+                            if end.row < map.buffer_snapshot().max_point().row {
+                                selection.end = Point::new(end.row + 1, 0).to_display_point(map)
+                            } else if start.row > 0 {
+                                selection.start = Point::new(
+                                    start.row - 1,
+                                    map.buffer_snapshot()
+                                        .line_len(MultiBufferRow(start.row - 1)),
+                                )
+                                .to_display_point(map)
                             }
-                            Motion::EndOfDocument {} => {
-                                // Deleting until the end of the document includes the last line, including
-                                // soft-wrapped lines.
-                                selection.end = map.max_point()
-                            }
-                            _ => {}
+                        }
+                        if let Some(kind) = kind {
+                            motion_kind.get_or_insert(kind);
                         }
                     });
                 });
-                vim.copy_selections_content(editor, motion.linewise(), cx);
-                editor.insert("", cx);
+                let Some(kind) = motion_kind else { return };
+                vim.copy_ranges(editor, kind, false, ranges_to_copy, window, cx);
+                editor.delete_selections_with_linked_edits(window, cx);
 
                 // Fixup cursor position after the deletion
                 editor.set_clip_at_line_ends(true, cx);
-                editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
-                    s.move_with(|map, selection| {
+                editor.change_selections(Default::default(), window, cx, |s| {
+                    s.move_with(&mut |map, selection| {
                         let mut cursor = selection.head();
-                        if motion.linewise() {
-                            if let Some(column) = original_columns.get(&selection.id) {
-                                *cursor.column_mut() = *column
-                            }
+                        if kind.linewise()
+                            && let Some(column) = original_columns.get(&selection.id)
+                        {
+                            *cursor.column_mut() = *column
                         }
                         cursor = map.clip_point(cursor, Bias::Left);
                         selection.collapse_to(cursor, selection.goal)
                     });
                 });
+                editor.refresh_edit_prediction(true, false, window, cx);
             });
         });
     }
 
-    pub fn delete_object(&mut self, object: Object, around: bool, cx: &mut ViewContext<Self>) {
+    pub fn delete_object(
+        &mut self,
+        object: Object,
+        around: bool,
+        times: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.stop_recording(cx);
         self.update_editor(cx, |vim, editor, cx| {
-            editor.transact(cx, |editor, cx| {
+            editor.transact(window, cx, |editor, window, cx| {
                 editor.set_clip_at_line_ends(false, cx);
                 // Emulates behavior in vim where if we expanded backwards to include a newline
                 // the cursor gets set back to the start of the line
                 let mut should_move_to_start: HashSet<_> = Default::default();
-                editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
-                    s.move_with(|map, selection| {
-                        object.expand_selection(map, selection, around);
+
+                // Emulates behavior in vim where after deletion the cursor should try to move
+                // to the same column it was before deletion if the line is not empty or only
+                // contains whitespace
+                let mut column_before_move: HashMap<_, _> = Default::default();
+                let target_mode = object.target_visual_mode(vim.mode, around);
+
+                editor.change_selections(Default::default(), window, cx, |s| {
+                    s.move_with(&mut |map, selection| {
+                        let cursor_point = selection.head().to_point(map);
+                        if target_mode == Mode::VisualLine {
+                            column_before_move.insert(selection.id, cursor_point.column);
+                        }
+
+                        object.expand_selection(map, selection, around, times);
                         let offset_range = selection.map(|p| p.to_offset(map, Bias::Left)).range();
                         let mut move_selection_start_to_previous_line =
                             |map: &DisplaySnapshot, selection: &mut Selection<DisplayPoint>| {
@@ -136,21 +168,31 @@ impl Vim {
                         }
                     });
                 });
-                vim.copy_selections_content(editor, false, cx);
-                editor.insert("", cx);
+                vim.copy_selections_content(editor, MotionKind::Exclusive, window, cx);
+                editor.delete_selections_with_linked_edits(window, cx);
 
                 // Fixup cursor position after the deletion
                 editor.set_clip_at_line_ends(true, cx);
-                editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
-                    s.move_with(|map, selection| {
+                editor.change_selections(Default::default(), window, cx, |s| {
+                    s.move_with(&mut |map, selection| {
                         let mut cursor = selection.head();
                         if should_move_to_start.contains(&selection.id) {
                             *cursor.column_mut() = 0;
+                        } else if let Some(column) = column_before_move.get(&selection.id)
+                            && *column > 0
+                        {
+                            let mut cursor_point = cursor.to_point(map);
+                            cursor_point.column = *column;
+                            cursor = map
+                                .buffer_snapshot()
+                                .clip_point(cursor_point, Bias::Left)
+                                .to_display_point(map);
                         }
                         cursor = map.clip_point(cursor, Bias::Left);
                         selection.collapse_to(cursor, selection.goal)
                     });
                 });
+                editor.refresh_edit_prediction(true, false, window, cx);
             });
         });
     }
@@ -162,7 +204,7 @@ fn move_selection_end_to_next_line(map: &DisplaySnapshot, selection: &mut Select
 }
 
 fn ends_at_eof(map: &DisplaySnapshot, selection: &mut Selection<DisplayPoint>) -> bool {
-    selection.end.to_point(map) == map.buffer_snapshot.max_point()
+    selection.end.to_point(map) == map.buffer_snapshot().max_point()
 }
 
 #[cfg(test)]
@@ -333,6 +375,29 @@ mod test {
     }
 
     #[gpui::test]
+    async fn test_delete_end_of_paragraph(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.simulate(
+            "d }",
+            indoc! {"
+            ˇhello world.
+
+            hello world."},
+        )
+        .await
+        .assert_matches();
+
+        cx.simulate(
+            "d }",
+            indoc! {"
+            ˇhello world.
+            hello world."},
+        )
+        .await
+        .assert_matches();
+    }
+
+    #[gpui::test]
     async fn test_delete_0(cx: &mut gpui::TestAppContext) {
         let mut cx = NeovimBackedTestContext::new(cx).await;
         cx.simulate(
@@ -481,6 +546,41 @@ mod test {
     }
 
     #[gpui::test]
+    async fn test_delete_to_line(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        cx.simulate(
+            "d 3 shift-g",
+            indoc! {"
+            The quick
+            brownˇ fox
+            jumps over
+            the lazy"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d 3 shift-g",
+            indoc! {"
+            The quick
+            brown fox
+            jumps over
+            the lˇazy"},
+        )
+        .await
+        .assert_matches();
+        cx.simulate(
+            "d 2 shift-g",
+            indoc! {"
+            The quick
+            brown fox
+            jumps over
+            ˇ"},
+        )
+        .await
+        .assert_matches();
+    }
+
+    #[gpui::test]
     async fn test_delete_gg(cx: &mut gpui::TestAppContext) {
         let mut cx = NeovimBackedTestContext::new(cx).await;
         cx.simulate(
@@ -601,5 +701,63 @@ mod test {
         let mut cx = NeovimBackedTestContext::new(cx).await;
         cx.simulate("d t x", "ˇax").await.assert_matches();
         cx.simulate("d t x", "aˇx").await.assert_matches();
+    }
+
+    #[gpui::test]
+    async fn test_delete_sentence(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+        // cx.simulate(
+        //     "d )",
+        //     indoc! {"
+        //     Fiˇrst. Second. Third.
+        //     Fourth.
+        //     "},
+        // )
+        // .await
+        // .assert_matches();
+
+        // cx.simulate(
+        //     "d )",
+        //     indoc! {"
+        //     First. Secˇond. Third.
+        //     Fourth.
+        //     "},
+        // )
+        // .await
+        // .assert_matches();
+
+        // // Two deletes
+        // cx.simulate(
+        //     "d ) d )",
+        //     indoc! {"
+        //     First. Second. Thirˇd.
+        //     Fourth.
+        //     "},
+        // )
+        // .await
+        // .assert_matches();
+
+        // Should delete whole line if done on first column
+        cx.simulate(
+            "d )",
+            indoc! {"
+            ˇFirst.
+            Fourth.
+            "},
+        )
+        .await
+        .assert_matches();
+
+        // Backwards it should also delete the whole first line
+        cx.simulate(
+            "d (",
+            indoc! {"
+            First.
+            ˇSecond.
+            Fourth.
+            "},
+        )
+        .await
+        .assert_matches();
     }
 }

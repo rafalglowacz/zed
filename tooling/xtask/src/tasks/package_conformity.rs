@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context as _, Result};
 use cargo_toml::{Dependency, Manifest};
 use clap::Parser;
 
@@ -21,13 +21,11 @@ pub fn run_package_conformity(_args: PackageConformityArgs) -> Result<()> {
             .manifest_path
             .parent()
             .and_then(|parent| parent.parent())
-            .map_or(false, |grandparent_dir| {
-                grandparent_dir.ends_with("extensions")
-            });
+            .is_some_and(|grandparent_dir| grandparent_dir.ends_with("extensions"));
 
         let cargo_toml = read_cargo_toml(&package.manifest_path)?;
 
-        let is_using_workspace_lints = cargo_toml.lints.map_or(false, |lints| lints.workspace);
+        let is_using_workspace_lints = cargo_toml.lints.is_some_and(|lints| lints.workspace);
         if !is_using_workspace_lints {
             eprintln!(
                 "{package:?} is not using workspace lints",
@@ -36,7 +34,7 @@ pub fn run_package_conformity(_args: PackageConformityArgs) -> Result<()> {
         }
 
         // Extensions should not use workspace dependencies.
-        if is_extension {
+        if is_extension || package.name == "zed_extension_api" {
             continue;
         }
 
@@ -73,5 +71,5 @@ fn read_cargo_toml(path: impl AsRef<Path>) -> Result<Manifest> {
     let path = path.as_ref();
     let cargo_toml_bytes = fs::read(path)?;
     Manifest::from_slice(&cargo_toml_bytes)
-        .with_context(|| anyhow!("failed to read Cargo.toml at {path:?}"))
+        .with_context(|| format!("reading Cargo.toml at {path:?}"))
 }

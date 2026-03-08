@@ -6,9 +6,11 @@ use std::{
 
 use bytes::Bytes;
 use futures::AsyncRead;
+use http_body::{Body, Frame};
+use serde::Serialize;
 
 /// Based on the implementation of AsyncBody in
-/// https://github.com/sagebind/isahc/blob/5c533f1ef4d6bdf1fd291b5103c22110f41d0bf0/src/body/mod.rs
+/// <https://github.com/sagebind/isahc/blob/5c533f1ef4d6bdf1fd291b5103c22110f41d0bf0/src/body/mod.rs>.
 pub struct AsyncBody(pub Inner);
 
 pub enum Inner {
@@ -39,7 +41,7 @@ impl AsyncBody {
     }
 
     pub fn from_bytes(bytes: Bytes) -> Self {
-        Self(Inner::Bytes(Cursor::new(bytes.clone())))
+        Self(Inner::Bytes(Cursor::new(bytes)))
     }
 }
 
@@ -87,6 +89,19 @@ impl From<&'static str> for AsyncBody {
     }
 }
 
+/// Newtype wrapper that serializes a value as JSON into an `AsyncBody`.
+pub struct Json<T: Serialize>(pub T);
+
+impl<T: Serialize> From<Json<T>> for AsyncBody {
+    fn from(json: Json<T>) -> Self {
+        Self::from_bytes(
+            serde_json::to_vec(&json.0)
+                .expect("failed to serialize JSON")
+                .into(),
+        )
+    }
+}
+
 impl<T: Into<Self>> From<Option<T>> for AsyncBody {
     fn from(body: Option<T>) -> Self {
         match body {
@@ -111,6 +126,27 @@ impl futures::AsyncRead for AsyncBody {
             Inner::AsyncReader(async_reader) => {
                 AsyncRead::poll_read(async_reader.as_mut(), cx, buf)
             }
+        }
+    }
+}
+
+impl Body for AsyncBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let mut buffer = vec![0; 8192];
+        match AsyncRead::poll_read(self.as_mut(), cx, &mut buffer) {
+            Poll::Ready(Ok(0)) => Poll::Ready(None),
+            Poll::Ready(Ok(n)) => {
+                let data = Bytes::copy_from_slice(&buffer[..n]);
+                Poll::Ready(Some(Ok(Frame::data(data))))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Some(Err(e))),
+            Poll::Pending => Poll::Pending,
         }
     }
 }

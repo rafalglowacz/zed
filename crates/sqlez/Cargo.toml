@@ -1,8 +1,8 @@
 [package]
 name = "sqlez"
 version = "0.1.0"
-edition = "2021"
-publish = false
+edition.workspace = true
+publish.workspace = true
 license = "GPL-3.0-or-later"
 
 [lints]
@@ -13,7 +13,8 @@ anyhow.workspace = true
 collections.workspace = true
 futures.workspace = true
 indoc.workspace = true
-libsqlite3-sys = { version = "0.28", features = ["bundled"] }
+libsqlite3-sys.workspace = true
+log.workspace = true
 parking_lot.workspace = true
 smol.workspace = true
 sqlformat.workspace = true

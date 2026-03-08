@@ -1,20 +1,34 @@
 mod assertions;
 mod marked_text;
 
-use git2;
-use std::{
-    ffi::OsStr,
-    path::{Path, PathBuf},
-};
-use tempfile::TempDir;
-
 pub use assertions::*;
 pub use marked_text::*;
 
-pub fn temp_tree(tree: serde_json::Value) -> TempDir {
-    let dir = TempDir::new().unwrap();
-    write_tree(dir.path(), tree);
-    dir
+use git2;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use tempfile::TempDir;
+
+pub struct TempTree {
+    _temp_dir: TempDir,
+    path: PathBuf,
+}
+
+impl TempTree {
+    pub fn new(tree: serde_json::Value) -> Self {
+        let dir = TempDir::new().unwrap();
+        let path = std::fs::canonicalize(dir.path()).unwrap();
+        write_tree(path.as_path(), tree);
+
+        Self {
+            _temp_dir: dir,
+            path,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        self.path.as_path()
+    }
 }
 
 fn write_tree(path: &Path, tree: serde_json::Value) {
@@ -29,6 +43,7 @@ fn write_tree(path: &Path, tree: serde_json::Value) {
                 Value::Object(_) => {
                     fs::create_dir(&path).unwrap();
 
+                    #[cfg(not(target_family = "wasm"))]
                     if path.file_name() == Some(OsStr::new(".git")) {
                         git2::Repository::init(path.parent().unwrap()).unwrap();
                     }

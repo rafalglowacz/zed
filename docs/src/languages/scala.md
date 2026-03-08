@@ -1,9 +1,14 @@
+---
+title: Scala
+description: "Configure Scala language support in Zed, including language servers, formatting, and debugging."
+---
+
 # Scala
 
 Scala language support in Zed is provided by the community-maintained [Scala extension](https://github.com/scalameta/metals-zed).
 Report issues to: [https://github.com/scalameta/metals-zed/issues](https://github.com/scalameta/metals-zed/issues)
 
-- Tree Sitter: [tree-sitter/tree-sitter-scala](https://github.com/tree-sitter/tree-sitter-scala)
+- Tree-sitter: [tree-sitter/tree-sitter-scala](https://github.com/tree-sitter/tree-sitter-scala)
 - Language Server: [scalameta/metals](https://github.com/scalameta/metals)
 
 ## Setup

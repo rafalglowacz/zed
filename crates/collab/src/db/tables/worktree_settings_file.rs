@@ -12,6 +12,7 @@ pub struct Model {
     pub path: String,
     pub content: String,
     pub kind: LocalSettingsKind,
+    pub outside_worktree: bool,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -32,4 +33,6 @@ pub enum LocalSettingsKind {
     Tasks,
     #[sea_orm(string_value = "editorconfig")]
     Editorconfig,
+    #[sea_orm(string_value = "debug")]
+    Debug,
 }

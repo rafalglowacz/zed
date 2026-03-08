@@ -1,15 +1,21 @@
-use crate::actions::FormatSelections;
 use crate::{
-    actions::Format, selections_collection::SelectionsCollection, Copy, CopyPermalinkToLine, Cut,
-    DisplayPoint, DisplaySnapshot, Editor, EditorMode, FindAllReferences, GoToDeclaration,
-    GoToDefinition, GoToImplementation, GoToTypeDefinition, Paste, Rename, RevealInFileManager,
-    SelectMode, ToDisplayPoint, ToggleCodeActions,
+    Copy, CopyAndTrim, CopyPermalinkToLine, Cut, DisplayPoint, DisplaySnapshot, Editor,
+    EvaluateSelectedText, FindAllReferences, GoToDeclaration, GoToDefinition, GoToImplementation,
+    GoToTypeDefinition, Paste, Rename, RevealInFileManager, RunToCursor, SelectMode,
+    SelectionEffects, SelectionExt, ToDisplayPoint, ToggleCodeActions,
+    actions::{Format, FormatSelections},
+    selections_collection::SelectionsCollection,
 };
 use gpui::prelude::FluentBuilder;
-use gpui::{DismissEvent, Pixels, Point, Subscription, View, ViewContext};
+use gpui::{Context, DismissEvent, Entity, Focusable as _, Pixels, Point, Subscription, Window};
+use project::DisableAiSettings;
 use std::ops::Range;
 use text::PointUtf16;
 use workspace::OpenInTerminal;
+use zed_actions::agent::AddSelectionToThread;
+use zed_actions::preview::{
+    markdown::OpenPreview as OpenMarkdownPreview, svg::OpenPreview as OpenSvgPreview,
+};
 
 #[derive(Debug)]
 pub enum MenuPosition {
@@ -20,15 +26,15 @@ pub enum MenuPosition {
     /// Disappears when the position is no longer visible.
     PinnedToEditor {
         source: multi_buffer::Anchor,
-        offset_x: Pixels,
-        offset_y: Pixels,
+        offset: Point<Pixels>,
     },
 }
 
 pub struct MouseContextMenu {
     pub(crate) position: MenuPosition,
-    pub(crate) context_menu: View<ui::ContextMenu>,
-    _subscription: Subscription,
+    pub(crate) context_menu: Entity<ui::ContextMenu>,
+    _dismiss_subscription: Subscription,
+    _cursor_move_subscription: Subscription,
 }
 
 impl std::fmt::Debug for MouseContextMenu {
@@ -45,59 +51,94 @@ impl MouseContextMenu {
         editor: &mut Editor,
         source: multi_buffer::Anchor,
         position: Point<Pixels>,
-        context_menu: View<ui::ContextMenu>,
-        cx: &mut ViewContext<Editor>,
+        context_menu: Entity<ui::ContextMenu>,
+        window: &mut Window,
+        cx: &mut Context<Editor>,
     ) -> Option<Self> {
-        let context_menu_focus = context_menu.focus_handle(cx);
-        cx.focus(&context_menu_focus);
-
-        let _subscription = cx.subscribe(
-            &context_menu,
-            move |editor, _, _event: &DismissEvent, cx| {
-                editor.mouse_context_menu.take();
-                if context_menu_focus.contains_focused(cx) {
-                    editor.focus(cx);
-                }
-            },
-        );
-
-        let editor_snapshot = editor.snapshot(cx);
-        let source_point = editor.to_pixel_point(source, &editor_snapshot, cx)?;
-        let offset = position - source_point;
-
-        Some(Self {
-            position: MenuPosition::PinnedToEditor {
-                source,
-                offset_x: offset.x,
-                offset_y: offset.y,
-            },
+        let editor_snapshot = editor.snapshot(window, cx);
+        let content_origin = editor.last_bounds?.origin
+            + Point {
+                x: editor.gutter_dimensions.width,
+                y: Pixels::ZERO,
+            };
+        let source_position = editor.to_pixel_point(source, &editor_snapshot, window, cx)?;
+        let menu_position = MenuPosition::PinnedToEditor {
+            source,
+            offset: position - (source_position + content_origin),
+        };
+        Some(MouseContextMenu::new(
+            editor,
+            menu_position,
             context_menu,
-            _subscription,
-        })
+            window,
+            cx,
+        ))
     }
 
-    pub(crate) fn pinned_to_screen(
-        position: Point<Pixels>,
-        context_menu: View<ui::ContextMenu>,
-        cx: &mut ViewContext<Editor>,
+    pub(crate) fn new(
+        editor: &Editor,
+        position: MenuPosition,
+        context_menu: Entity<ui::ContextMenu>,
+        window: &mut Window,
+        cx: &mut Context<Editor>,
     ) -> Self {
         let context_menu_focus = context_menu.focus_handle(cx);
-        cx.focus(&context_menu_focus);
 
-        let _subscription = cx.subscribe(
-            &context_menu,
-            move |editor, _, _event: &DismissEvent, cx| {
+        // Since `ContextMenu` is rendered in a deferred fashion its focus
+        // handle is not linked to the Editor's until after the deferred draw
+        // callback runs.
+        // We need to wait for that to happen before focusing it, so that
+        // calling `contains_focused` on the editor's focus handle returns
+        // `true` when the `ContextMenu` is focused.
+        let focus_handle = context_menu_focus.clone();
+        cx.on_next_frame(window, move |_, window, cx| {
+            cx.on_next_frame(window, move |_, window, cx| {
+                window.focus(&focus_handle, cx);
+            });
+        });
+
+        let _dismiss_subscription = cx.subscribe_in(&context_menu, window, {
+            let context_menu_focus = context_menu_focus.clone();
+            move |editor, _, _event: &DismissEvent, window, cx| {
                 editor.mouse_context_menu.take();
-                if context_menu_focus.contains_focused(cx) {
-                    editor.focus(cx);
+                if context_menu_focus.contains_focused(window, cx) {
+                    window.focus(&editor.focus_handle(cx), cx);
+                }
+            }
+        });
+
+        let selection_init = editor.selections.newest_anchor().clone();
+
+        let _cursor_move_subscription = cx.subscribe_in(
+            &cx.entity(),
+            window,
+            move |editor, _, event: &crate::EditorEvent, window, cx| {
+                let crate::EditorEvent::SelectionsChanged { local: true } = event else {
+                    return;
+                };
+                let display_snapshot = &editor
+                    .display_map
+                    .update(cx, |display_map, cx| display_map.snapshot(cx));
+                let selection_init_range = selection_init.display_range(display_snapshot);
+                let selection_now_range = editor
+                    .selections
+                    .newest_anchor()
+                    .display_range(display_snapshot);
+                if selection_now_range == selection_init_range {
+                    return;
+                }
+                editor.mouse_context_menu.take();
+                if context_menu_focus.contains_focused(window, cx) {
+                    window.focus(&editor.focus_handle(cx), cx);
                 }
             },
         );
 
         Self {
-            position: MenuPosition::PinnedToScreen(position),
+            position,
             context_menu,
-            _subscription,
+            _dismiss_subscription,
+            _cursor_move_subscription,
         }
     }
 }
@@ -106,12 +147,9 @@ fn display_ranges<'a>(
     display_map: &'a DisplaySnapshot,
     selections: &'a SelectionsCollection,
 ) -> impl Iterator<Item = Range<DisplayPoint>> + 'a {
-    let pending = selections
-        .pending
-        .as_ref()
-        .map(|pending| &pending.selection);
+    let pending = selections.pending_anchor();
     selections
-        .disjoint
+        .disjoint_anchors()
         .iter()
         .chain(pending)
         .map(move |s| s.start.to_display_point(display_map)..s.end.to_display_point(display_map))
@@ -119,66 +157,111 @@ fn display_ranges<'a>(
 
 pub fn deploy_context_menu(
     editor: &mut Editor,
-    position: Point<Pixels>,
+    position: Option<Point<Pixels>>,
     point: DisplayPoint,
-    cx: &mut ViewContext<Editor>,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
 ) {
-    if !editor.is_focused(cx) {
-        editor.focus(cx);
+    if !editor.is_focused(window) {
+        window.focus(&editor.focus_handle(cx), cx);
     }
 
-    // Don't show context menu for inline editors
-    if editor.mode() != EditorMode::Full {
-        return;
-    }
-
-    let display_map = editor.selections.display_map(cx);
+    let display_map = editor.display_snapshot(cx);
     let source_anchor = display_map.display_point_to_anchor(point, text::Bias::Right);
     let context_menu = if let Some(custom) = editor.custom_context_menu.take() {
-        let menu = custom(editor, point, cx);
+        let menu = custom(editor, point, window, cx);
         editor.custom_context_menu = Some(custom);
         let Some(menu) = menu else {
             return;
         };
         menu
     } else {
-        // Don't show the context menu if there isn't a project associated with this editor
-        if editor.project.is_none() {
+        // Don't show context menu for inline editors (only applies to default menu)
+        if !editor.mode().is_full() {
             return;
         }
 
-        let display_map = editor.selections.display_map(cx);
-        let buffer = &editor.snapshot(cx).buffer_snapshot;
+        // Don't show the context menu if there isn't a project associated with this editor
+        let Some(project) = editor.project.clone() else {
+            return;
+        };
+
+        let snapshot = editor.snapshot(window, cx);
+        let display_map = editor.display_snapshot(cx);
+        let buffer = snapshot.buffer_snapshot();
         let anchor = buffer.anchor_before(point.to_point(&display_map));
         if !display_ranges(&display_map, &editor.selections).any(|r| r.contains(&point)) {
             // Move the cursor to the clicked location so that dispatched actions make sense
-            editor.change_selections(None, cx, |s| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
                 s.clear_disjoint();
                 s.set_pending_anchor_range(anchor..anchor, SelectMode::Character);
             });
         }
 
-        let focus = cx.focused();
+        let focus = window.focused(cx);
         let has_reveal_target = editor.target_file(cx).is_some();
-        let reveal_in_finder_label = if cfg!(target_os = "macos") {
-            "Reveal in Finder"
-        } else {
-            "Reveal in File Manager"
-        };
         let has_selections = editor
             .selections
-            .all::<PointUtf16>(cx)
+            .all::<PointUtf16>(&display_map)
             .into_iter()
             .any(|s| !s.is_empty());
+        let has_git_repo = buffer
+            .buffer_id_for_anchor(anchor)
+            .is_some_and(|buffer_id| {
+                project
+                    .read(cx)
+                    .git_store()
+                    .read(cx)
+                    .repository_and_path_for_buffer_id(buffer_id, cx)
+                    .is_some()
+            });
 
-        ui::ContextMenu::build(cx, |menu, _cx| {
+        let evaluate_selection = window.is_action_available(&EvaluateSelectedText, cx);
+        let run_to_cursor = window.is_action_available(&RunToCursor, cx);
+        let disable_ai = DisableAiSettings::is_ai_disabled_for_buffer(
+            editor.buffer.read(cx).as_singleton().as_ref(),
+            cx,
+        );
+
+        let is_markdown = editor
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .and_then(|buffer| buffer.read(cx).language())
+            .is_some_and(|language| language.name().as_ref() == "Markdown");
+
+        let is_svg = editor
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .and_then(|buffer| buffer.read(cx).file())
+            .is_some_and(|file| {
+                std::path::Path::new(file.file_name(cx))
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
+            });
+
+        ui::ContextMenu::build(window, cx, |menu, _window, _cx| {
             let builder = menu
                 .on_blur_subscription(Subscription::new(|| {}))
+                .when(run_to_cursor, |builder| {
+                    builder.action("Run to Cursor", Box::new(RunToCursor))
+                })
+                .when(evaluate_selection && has_selections, |builder| {
+                    builder.action("Evaluate Selection", Box::new(EvaluateSelectedText))
+                })
+                .when(
+                    run_to_cursor || (evaluate_selection && has_selections),
+                    |builder| builder.separator(),
+                )
                 .action("Go to Definition", Box::new(GoToDefinition))
                 .action("Go to Declaration", Box::new(GoToDeclaration))
                 .action("Go to Type Definition", Box::new(GoToTypeDefinition))
                 .action("Go to Implementation", Box::new(GoToImplementation))
-                .action("Find All References", Box::new(FindAllReferences))
+                .action(
+                    "Find All References",
+                    Box::new(FindAllReferences::default()),
+                )
                 .separator()
                 .action("Rename Symbol", Box::new(Rename))
                 .action("Format Buffer", Box::new(Format))
@@ -186,26 +269,53 @@ pub fn deploy_context_menu(
                     cx.action("Format Selections", Box::new(FormatSelections))
                 })
                 .action(
-                    "Code Actions",
+                    "Show Code Actions",
                     Box::new(ToggleCodeActions {
-                        deployed_from_indicator: None,
+                        deployed_from: None,
+                        quick_launch: false,
                     }),
                 )
+                .when(!disable_ai && has_selections, |this| {
+                    this.action("Add to Agent Thread", Box::new(AddSelectionToThread))
+                })
                 .separator()
                 .action("Cut", Box::new(Cut))
                 .action("Copy", Box::new(Copy))
+                .action("Copy and Trim", Box::new(CopyAndTrim))
                 .action("Paste", Box::new(Paste))
                 .separator()
-                .map(|builder| {
-                    if has_reveal_target {
-                        builder.action(reveal_in_finder_label, Box::new(RevealInFileManager))
+                .action_disabled_when(
+                    !has_reveal_target,
+                    if cfg!(target_os = "macos") {
+                        "Reveal in Finder"
+                    } else if cfg!(target_os = "windows") {
+                        "Reveal in File Explorer"
                     } else {
-                        builder
-                            .disabled_action(reveal_in_finder_label, Box::new(RevealInFileManager))
-                    }
+                        "Reveal in File Manager"
+                    },
+                    Box::new(RevealInFileManager),
+                )
+                .when(is_markdown, |builder| {
+                    builder.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
                 })
-                .action("Open in Terminal", Box::new(OpenInTerminal))
-                .action("Copy Permalink", Box::new(CopyPermalinkToLine));
+                .when(is_svg, |builder| {
+                    builder.action("Open SVG Preview", Box::new(OpenSvgPreview))
+                })
+                .action_disabled_when(
+                    !has_reveal_target,
+                    "Open in Terminal",
+                    Box::new(OpenInTerminal),
+                )
+                .action_disabled_when(
+                    !has_git_repo,
+                    "Copy Permalink",
+                    Box::new(CopyPermalinkToLine),
+                )
+                .action_disabled_when(
+                    !has_git_repo,
+                    "View File History",
+                    Box::new(git::FileHistory),
+                );
             match focus {
                 Some(focus) => builder.context(focus),
                 None => builder,
@@ -213,8 +323,30 @@ pub fn deploy_context_menu(
         })
     };
 
-    editor.mouse_context_menu =
-        MouseContextMenu::pinned_to_editor(editor, source_anchor, position, context_menu, cx);
+    editor.mouse_context_menu = match position {
+        Some(position) => MouseContextMenu::pinned_to_editor(
+            editor,
+            source_anchor,
+            position,
+            context_menu,
+            window,
+            cx,
+        ),
+        None => {
+            let character_size = editor.character_dimensions(window, cx);
+            let menu_position = MenuPosition::PinnedToEditor {
+                source: source_anchor,
+                offset: gpui::point(character_size.em_width, character_size.line_height),
+            };
+            Some(MouseContextMenu::new(
+                editor,
+                menu_position,
+                context_menu,
+                window,
+                cx,
+            ))
+        }
+    };
     cx.notify();
 }
 
@@ -247,14 +379,26 @@ mod tests {
                 do_wˇork();
             }
         "});
-        cx.editor(|editor, _app| assert!(editor.mouse_context_menu.is_none()));
-        cx.update_editor(|editor, cx| deploy_context_menu(editor, Default::default(), point, cx));
+        cx.editor(|editor, _window, _app| assert!(editor.mouse_context_menu.is_none()));
+
+        cx.update_editor(|editor, window, cx| {
+            deploy_context_menu(editor, Some(Default::default()), point, window, cx);
+
+            // Assert that, even after deploying the editor's mouse context
+            // menu, the editor's focus handle still contains the focused
+            // element. The pane's tab bar relies on this to determine whether
+            // to show the tab bar buttons and there was a small flicker when
+            // deploying the mouse context menu that would cause this to not be
+            // true, making it so that the buttons would disappear for a couple
+            // of frames.
+            assert!(editor.focus_handle.contains_focused(window, cx));
+        });
 
         cx.assert_editor_state(indoc! {"
             fn test() {
                 do_wˇork();
             }
         "});
-        cx.editor(|editor, _app| assert!(editor.mouse_context_menu.is_some()));
+        cx.editor(|editor, _window, _app| assert!(editor.mouse_context_menu.is_some()));
     }
 }

@@ -1,55 +1,62 @@
-use editor::{CursorLayout, HighlightedRange, HighlightedRangeLine};
+use editor::{CursorLayout, EditorSettings, HighlightedRange, HighlightedRangeLine};
 use gpui::{
-    div, fill, point, px, relative, size, AnyElement, AvailableSpace, Bounds, ContentMask,
-    DispatchPhase, Element, ElementId, FocusHandle, Font, FontStyle, FontWeight, GlobalElementId,
-    HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity, IntoElement,
-    LayoutId, Model, ModelContext, ModifiersChangedEvent, MouseButton, MouseMoveEvent, Pixels,
-    Point, ShapedLine, StatefulInteractiveElement, StrikethroughStyle, Styled, TextRun, TextStyle,
-    UTF16Selection, UnderlineStyle, View, WeakView, WhiteSpace, WindowContext, WindowTextSystem,
+    AbsoluteLength, AnyElement, App, AvailableSpace, Bounds, ContentMask, Context, DispatchPhase,
+    Element, ElementId, Entity, FocusHandle, Font, FontFeatures, FontStyle, FontWeight,
+    GlobalElementId, HighlightStyle, Hitbox, Hsla, InputHandler, InteractiveElement, Interactivity,
+    IntoElement, LayoutId, Length, ModifiersChangedEvent, MouseButton, MouseMoveEvent, Pixels,
+    Point, StatefulInteractiveElement, StrikethroughStyle, Styled, TextRun, TextStyle,
+    UTF16Selection, UnderlineStyle, WeakEntity, WhiteSpace, Window, div, fill, point, px, relative,
+    size,
 };
 use itertools::Itertools;
 use language::CursorShape;
 use settings::Settings;
+use std::time::Instant;
 use terminal::{
+    IndexedCell, Terminal, TerminalBounds, TerminalContent,
     alacritty_terminal::{
         grid::Dimensions,
         index::Point as AlacPoint,
-        term::{cell::Flags, TermMode},
+        term::{TermMode, cell::Flags},
         vte::ansi::{
             Color::{self as AnsiColor, Named},
             CursorShape as AlacCursorShape, NamedColor,
         },
     },
     terminal_settings::TerminalSettings,
-    HoveredWord, IndexedCell, Terminal, TerminalContent, TerminalSize,
 };
 use theme::{ActiveTheme, Theme, ThemeSettings};
+use ui::utils::ensure_minimum_contrast;
 use ui::{ParentElement, Tooltip};
+use util::ResultExt;
 use workspace::Workspace;
 
 use std::mem;
 use std::{fmt::Debug, ops::RangeInclusive, rc::Rc};
 
-use crate::{BlockContext, BlockProperties, TerminalView};
+use crate::{BlockContext, BlockProperties, ContentMode, TerminalMode, TerminalView};
 
 /// The information generated during layout that is necessary for painting.
 pub struct LayoutState {
     hitbox: Hitbox,
-    cells: Vec<LayoutCell>,
+    batched_text_runs: Vec<BatchedTextRun>,
     rects: Vec<LayoutRect>,
     relative_highlighted_ranges: Vec<(RangeInclusive<AlacPoint>, Hsla)>,
     cursor: Option<CursorLayout>,
+    ime_cursor_bounds: Option<Bounds<Pixels>>,
     background_color: Hsla,
-    dimensions: TerminalSize,
+    dimensions: TerminalBounds,
     mode: TermMode,
     display_offset: usize,
     hyperlink_tooltip: Option<AnyElement>,
     gutter: Pixels,
-    last_hovered_word: Option<HoveredWord>,
     block_below_cursor_element: Option<AnyElement>,
+    base_text_style: TextStyle,
+    content_mode: ContentMode,
 }
 
 /// Helper struct for converting data between Alacritty's cursor points, and displayed cursor points.
+#[derive(Copy, Clone)]
 struct DisplayCursor {
     line: i32,
     col: usize,
@@ -72,34 +79,88 @@ impl DisplayCursor {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct LayoutCell {
-    pub point: AlacPoint<i32, i32>,
-    text: gpui::ShapedLine,
+/// A batched text run that combines multiple adjacent cells with the same style
+#[derive(Debug)]
+pub struct BatchedTextRun {
+    pub start_point: AlacPoint<i32, i32>,
+    pub text: String,
+    pub cell_count: usize,
+    pub style: TextRun,
+    pub font_size: AbsoluteLength,
 }
 
-impl LayoutCell {
-    fn new(point: AlacPoint<i32, i32>, text: gpui::ShapedLine) -> LayoutCell {
-        LayoutCell { point, text }
+impl BatchedTextRun {
+    fn new_from_char(
+        start_point: AlacPoint<i32, i32>,
+        c: char,
+        style: TextRun,
+        font_size: AbsoluteLength,
+    ) -> Self {
+        let mut text = String::with_capacity(100); // Pre-allocate for typical line length
+        text.push(c);
+        BatchedTextRun {
+            start_point,
+            text,
+            cell_count: 1,
+            style,
+            font_size,
+        }
+    }
+
+    fn can_append(&self, other_style: &TextRun) -> bool {
+        self.style.font == other_style.font
+            && self.style.color == other_style.color
+            && self.style.background_color == other_style.background_color
+            && self.style.underline == other_style.underline
+            && self.style.strikethrough == other_style.strikethrough
+    }
+
+    fn append_char(&mut self, c: char) {
+        self.append_char_internal(c, true);
+    }
+
+    fn append_zero_width_chars(&mut self, chars: &[char]) {
+        for &c in chars {
+            self.append_char_internal(c, false);
+        }
+    }
+
+    fn append_char_internal(&mut self, c: char, counts_cell: bool) {
+        self.text.push(c);
+        if counts_cell {
+            self.cell_count += 1;
+        }
+        self.style.len += c.len_utf8();
     }
 
     pub fn paint(
         &self,
         origin: Point<Pixels>,
-        dimensions: &TerminalSize,
-        _visible_bounds: Bounds<Pixels>,
-        cx: &mut WindowContext,
+        dimensions: &TerminalBounds,
+        window: &mut Window,
+        cx: &mut App,
     ) {
-        let pos = {
-            let point = self.point;
+        let pos = Point::new(
+            origin.x + self.start_point.column as f32 * dimensions.cell_width,
+            origin.y + self.start_point.line as f32 * dimensions.line_height,
+        );
 
-            Point::new(
-                (origin.x + point.column as f32 * dimensions.cell_width).floor(),
-                origin.y + point.line as f32 * dimensions.line_height,
+        let _ = window
+            .text_system()
+            .shape_line(
+                self.text.clone().into(),
+                self.font_size.to_pixels(window.rem_size()),
+                std::slice::from_ref(&self.style),
+                Some(dimensions.cell_width),
             )
-        };
-
-        self.text.paint(pos, dimensions.line_height, cx).ok();
+            .paint(
+                pos,
+                dimensions.line_height,
+                gpui::TextAlign::Left,
+                None,
+                window,
+                cx,
+            );
     }
 }
 
@@ -119,15 +180,7 @@ impl LayoutRect {
         }
     }
 
-    fn extend(&self) -> Self {
-        LayoutRect {
-            point: self.point,
-            num_of_cells: self.num_of_cells + 1,
-            color: self.color,
-        }
-    }
-
-    pub fn paint(&self, origin: Point<Pixels>, dimensions: &TerminalSize, cx: &mut WindowContext) {
+    pub fn paint(&self, origin: Point<Pixels>, dimensions: &TerminalBounds, window: &mut Window) {
         let position = {
             let alac_point = self.point;
             point(
@@ -141,21 +194,102 @@ impl LayoutRect {
         )
         .into();
 
-        cx.paint_quad(fill(Bounds::new(position, size), self.color));
+        window.paint_quad(fill(Bounds::new(position, size), self.color));
     }
 }
 
+/// Represents a rectangular region with a specific background color
+#[derive(Debug, Clone)]
+struct BackgroundRegion {
+    start_line: i32,
+    start_col: i32,
+    end_line: i32,
+    end_col: i32,
+    color: Hsla,
+}
+
+impl BackgroundRegion {
+    fn new(line: i32, col: i32, color: Hsla) -> Self {
+        BackgroundRegion {
+            start_line: line,
+            start_col: col,
+            end_line: line,
+            end_col: col,
+            color,
+        }
+    }
+
+    /// Check if this region can be merged with another region
+    fn can_merge_with(&self, other: &BackgroundRegion) -> bool {
+        if self.color != other.color {
+            return false;
+        }
+
+        // Check if regions are adjacent horizontally
+        if self.start_line == other.start_line && self.end_line == other.end_line {
+            return self.end_col + 1 == other.start_col || other.end_col + 1 == self.start_col;
+        }
+
+        // Check if regions are adjacent vertically with same column span
+        if self.start_col == other.start_col && self.end_col == other.end_col {
+            return self.end_line + 1 == other.start_line || other.end_line + 1 == self.start_line;
+        }
+
+        false
+    }
+
+    /// Merge this region with another region
+    fn merge_with(&mut self, other: &BackgroundRegion) {
+        self.start_line = self.start_line.min(other.start_line);
+        self.start_col = self.start_col.min(other.start_col);
+        self.end_line = self.end_line.max(other.end_line);
+        self.end_col = self.end_col.max(other.end_col);
+    }
+}
+
+/// Merge background regions to minimize the number of rectangles
+fn merge_background_regions(regions: Vec<BackgroundRegion>) -> Vec<BackgroundRegion> {
+    if regions.is_empty() {
+        return regions;
+    }
+
+    let mut merged = regions;
+    let mut changed = true;
+
+    // Keep merging until no more merges are possible
+    while changed {
+        changed = false;
+        let mut i = 0;
+
+        while i < merged.len() {
+            let mut j = i + 1;
+            while j < merged.len() {
+                if merged[i].can_merge_with(&merged[j]) {
+                    let other = merged.remove(j);
+                    merged[i].merge_with(&other);
+                    changed = true;
+                } else {
+                    j += 1;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    merged
+}
+
 /// The GPUI element that paints the terminal.
-/// We need to keep a reference to the view for mouse events, do we need it for any other terminal stuff, or can we move that to connection?
+/// We need to keep a reference to the model for mouse events, do we need it for any other terminal stuff, or can we move that to connection?
 pub struct TerminalElement {
-    terminal: Model<Terminal>,
-    terminal_view: View<TerminalView>,
-    workspace: WeakView<Workspace>,
+    terminal: Entity<Terminal>,
+    terminal_view: Entity<TerminalView>,
+    workspace: WeakEntity<Workspace>,
     focus: FocusHandle,
     focused: bool,
     cursor_visible: bool,
-    can_navigate_to_selected_word: bool,
     interactivity: Interactivity,
+    mode: TerminalMode,
     block_below_cursor: Option<Rc<BlockProperties>>,
 }
 
@@ -168,16 +302,15 @@ impl InteractiveElement for TerminalElement {
 impl StatefulInteractiveElement for TerminalElement {}
 
 impl TerminalElement {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        terminal: Model<Terminal>,
-        terminal_view: View<TerminalView>,
-        workspace: WeakView<Workspace>,
+        terminal: Entity<Terminal>,
+        terminal_view: Entity<TerminalView>,
+        workspace: WeakEntity<Workspace>,
         focus: FocusHandle,
         focused: bool,
         cursor_visible: bool,
-        can_navigate_to_selected_word: bool,
         block_below_cursor: Option<Rc<BlockProperties>>,
+        mode: TerminalMode,
     ) -> TerminalElement {
         TerminalElement {
             terminal,
@@ -186,33 +319,50 @@ impl TerminalElement {
             focused,
             focus: focus.clone(),
             cursor_visible,
-            can_navigate_to_selected_word,
             block_below_cursor,
+            mode,
             interactivity: Default::default(),
         }
         .track_focus(&focus)
-        .element
     }
 
     //Vec<Range<AlacPoint>> -> Clip out the parts of the ranges
 
     pub fn layout_grid(
         grid: impl Iterator<Item = IndexedCell>,
+        start_line_offset: i32,
         text_style: &TextStyle,
-        // terminal_theme: &TerminalStyle,
-        text_system: &WindowTextSystem,
         hyperlink: Option<(HighlightStyle, &RangeInclusive<AlacPoint>)>,
-        cx: &WindowContext,
-    ) -> (Vec<LayoutCell>, Vec<LayoutRect>) {
+        minimum_contrast: f32,
+        cx: &App,
+    ) -> (Vec<LayoutRect>, Vec<BatchedTextRun>) {
+        let start_time = Instant::now();
         let theme = cx.theme();
-        let mut cells = vec![];
-        let mut rects = vec![];
 
-        let mut cur_rect: Option<LayoutRect> = None;
-        let mut cur_alac_color = None;
+        // Pre-allocate with estimated capacity to reduce reallocations
+        let estimated_cells = grid.size_hint().0;
+        let estimated_runs = estimated_cells / 10; // Estimate ~10 cells per run
+        let estimated_regions = estimated_cells / 20; // Estimate ~20 cells per background region
 
+        let mut batched_runs = Vec::with_capacity(estimated_runs);
+        let mut cell_count = 0;
+
+        // Collect background regions for efficient merging
+        let mut background_regions: Vec<BackgroundRegion> = Vec::with_capacity(estimated_regions);
+        let mut current_batch: Option<BatchedTextRun> = None;
+
+        // First pass: collect all cells and their backgrounds
         let linegroups = grid.into_iter().chunk_by(|i| i.point.line);
         for (line_index, (_, line)) in linegroups.into_iter().enumerate() {
+            let alac_line = start_line_offset + line_index as i32;
+
+            // Flush any existing batch at line boundaries
+            if let Some(batch) = current_batch.take() {
+                batched_runs.push(batch);
+            }
+
+            let mut previous_cell_had_extras = false;
+
             for cell in line {
                 let mut fg = cell.fg;
                 let mut bg = cell.bg;
@@ -220,131 +370,192 @@ impl TerminalElement {
                     mem::swap(&mut fg, &mut bg);
                 }
 
-                //Expand background rect range
-                {
-                    if matches!(bg, Named(NamedColor::Background)) {
-                        //Continue to next cell, resetting variables if necessary
-                        cur_alac_color = None;
-                        if let Some(rect) = cur_rect {
-                            rects.push(rect);
-                            cur_rect = None
-                        }
+                // Collect background regions (skip default background)
+                if !matches!(bg, Named(NamedColor::Background)) {
+                    let color = convert_color(&bg, theme);
+                    let col = cell.point.column.0 as i32;
+
+                    // Try to extend the last region if it's on the same line with the same color
+                    if let Some(last_region) = background_regions.last_mut()
+                        && last_region.color == color
+                        && last_region.start_line == alac_line
+                        && last_region.end_line == alac_line
+                        && last_region.end_col + 1 == col
+                    {
+                        last_region.end_col = col;
                     } else {
-                        match cur_alac_color {
-                            Some(cur_color) => {
-                                if bg == cur_color {
-                                    // `cur_rect` can be None if it was moved to the `rects` vec after wrapping around
-                                    // from one line to the next. The variables are all set correctly but there is no current
-                                    // rect, so we create one if necessary.
-                                    cur_rect = cur_rect.map_or_else(
-                                        || {
-                                            Some(LayoutRect::new(
-                                                AlacPoint::new(
-                                                    line_index as i32,
-                                                    cell.point.column.0 as i32,
-                                                ),
-                                                1,
-                                                convert_color(&bg, theme),
-                                            ))
-                                        },
-                                        |rect| Some(rect.extend()),
-                                    );
-                                } else {
-                                    cur_alac_color = Some(bg);
-                                    if cur_rect.is_some() {
-                                        rects.push(cur_rect.take().unwrap());
-                                    }
-                                    cur_rect = Some(LayoutRect::new(
-                                        AlacPoint::new(
-                                            line_index as i32,
-                                            cell.point.column.0 as i32,
-                                        ),
-                                        1,
-                                        convert_color(&bg, theme),
-                                    ));
-                                }
-                            }
-                            None => {
-                                cur_alac_color = Some(bg);
-                                cur_rect = Some(LayoutRect::new(
-                                    AlacPoint::new(line_index as i32, cell.point.column.0 as i32),
-                                    1,
-                                    convert_color(&bg, theme),
-                                ));
-                            }
-                        }
+                        background_regions.push(BackgroundRegion::new(alac_line, col, color));
                     }
                 }
+                // Skip wide character spacers - they're just placeholders for the second cell of wide characters
+                if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+
+                // Skip spaces that follow cells with extras (emoji variation sequences)
+                if cell.c == ' ' && previous_cell_had_extras {
+                    previous_cell_had_extras = false;
+                    continue;
+                }
+                // Update tracking for next iteration
+                previous_cell_had_extras =
+                    matches!(cell.zerowidth(), Some(chars) if !chars.is_empty());
 
                 //Layout current cell text
                 {
                     if !is_blank(&cell) {
-                        let cell_text = cell.c.to_string();
-                        let cell_style =
-                            TerminalElement::cell_style(&cell, fg, theme, text_style, hyperlink);
+                        cell_count += 1;
+                        let cell_style = TerminalElement::cell_style(
+                            &cell,
+                            fg,
+                            bg,
+                            theme,
+                            text_style,
+                            hyperlink,
+                            minimum_contrast,
+                        );
 
-                        let layout_cell = text_system
-                            .shape_line(
-                                cell_text.into(),
-                                text_style.font_size.to_pixels(cx.rem_size()),
-                                &[cell_style],
-                            )
-                            .unwrap();
+                        let cell_point = AlacPoint::new(alac_line, cell.point.column.0 as i32);
+                        let zero_width_chars = cell.zerowidth();
 
-                        cells.push(LayoutCell::new(
-                            AlacPoint::new(line_index as i32, cell.point.column.0 as i32),
-                            layout_cell,
-                        ))
+                        // Try to batch with existing run
+                        if let Some(ref mut batch) = current_batch {
+                            if batch.can_append(&cell_style)
+                                && batch.start_point.line == cell_point.line
+                                && batch.start_point.column + batch.cell_count as i32
+                                    == cell_point.column
+                            {
+                                batch.append_char(cell.c);
+                                if let Some(chars) = zero_width_chars {
+                                    batch.append_zero_width_chars(chars);
+                                }
+                            } else {
+                                // Flush current batch and start new one
+                                let old_batch = current_batch.take().unwrap();
+                                batched_runs.push(old_batch);
+                                let mut new_batch = BatchedTextRun::new_from_char(
+                                    cell_point,
+                                    cell.c,
+                                    cell_style,
+                                    text_style.font_size,
+                                );
+                                if let Some(chars) = zero_width_chars {
+                                    new_batch.append_zero_width_chars(chars);
+                                }
+                                current_batch = Some(new_batch);
+                            }
+                        } else {
+                            // Start new batch
+                            let mut new_batch = BatchedTextRun::new_from_char(
+                                cell_point,
+                                cell.c,
+                                cell_style,
+                                text_style.font_size,
+                            );
+                            if let Some(chars) = zero_width_chars {
+                                new_batch.append_zero_width_chars(chars);
+                            }
+                            current_batch = Some(new_batch);
+                        }
                     };
                 }
             }
+        }
 
-            if cur_rect.is_some() {
-                rects.push(cur_rect.take().unwrap());
+        // Flush any remaining batch
+        if let Some(batch) = current_batch {
+            batched_runs.push(batch);
+        }
+
+        // Second pass: merge background regions and convert to layout rects
+        let region_count = background_regions.len();
+        let merged_regions = merge_background_regions(background_regions);
+        let mut rects = Vec::with_capacity(merged_regions.len() * 2); // Estimate 2 rects per merged region
+
+        // Convert merged regions to layout rects
+        // Since LayoutRect only supports single-line rectangles, we need to split multi-line regions
+        for region in merged_regions {
+            for line in region.start_line..=region.end_line {
+                rects.push(LayoutRect::new(
+                    AlacPoint::new(line, region.start_col),
+                    (region.end_col - region.start_col + 1) as usize,
+                    region.color,
+                ));
             }
         }
-        (cells, rects)
+
+        let layout_time = start_time.elapsed();
+
+        log::debug!(
+            "Terminal layout_grid: {} cells processed, \
+            {} batched runs created, {} rects (from {} merged regions), \
+            layout took {:?}",
+            cell_count,
+            batched_runs.len(),
+            rects.len(),
+            region_count,
+            layout_time
+        );
+
+        (rects, batched_runs)
     }
 
-    /// Computes the cursor position and expected block width, may return a zero width if x_for_index returns
-    /// the same position for sequential indexes. Use em_width instead
-    fn shape_cursor(
-        cursor_point: DisplayCursor,
-        size: TerminalSize,
-        text_fragment: &ShapedLine,
-    ) -> Option<(Point<Pixels>, Pixels)> {
+    /// Computes the cursor position based on the cursor point and terminal dimensions.
+    fn cursor_position(cursor_point: DisplayCursor, size: TerminalBounds) -> Option<Point<Pixels>> {
         if cursor_point.line() < size.total_lines() as i32 {
-            let cursor_width = if text_fragment.width == Pixels::ZERO {
-                size.cell_width()
-            } else {
-                text_fragment.width
-            };
-
-            // Cursor should always surround as much of the text as possible,
-            // hence when on pixel boundaries round the origin down and the width up
-            Some((
-                point(
-                    (cursor_point.col() as f32 * size.cell_width()).floor(),
-                    (cursor_point.line() as f32 * size.line_height()).floor(),
-                ),
-                cursor_width.ceil(),
+            // When on pixel boundaries round the origin down
+            Some(point(
+                (cursor_point.col() as f32 * size.cell_width()).floor(),
+                (cursor_point.line() as f32 * size.line_height()).floor(),
             ))
         } else {
             None
         }
     }
 
+    /// Checks if a character is a decorative block/box-like character that should
+    /// preserve its exact colors without contrast adjustment.
+    ///
+    /// This specifically targets characters used as visual connectors, separators,
+    /// and borders where color matching with adjacent backgrounds is critical.
+    /// Regular icons (git, folders, etc.) are excluded as they need to remain readable.
+    ///
+    /// Fixes https://github.com/zed-industries/zed/issues/34234
+    fn is_decorative_character(ch: char) -> bool {
+        matches!(
+            ch as u32,
+            // Unicode Box Drawing and Block Elements
+            0x2500..=0x257F // Box Drawing (└ ┐ ─ │ etc.)
+            | 0x2580..=0x259F // Block Elements (▀ ▄ █ ░ ▒ ▓ etc.)
+            | 0x25A0..=0x25FF // Geometric Shapes (■ ▶ ● etc. - includes triangular/circular separators)
+
+            // Private Use Area - Powerline separator symbols only
+            | 0xE0B0..=0xE0B7 // Powerline separators: triangles (E0B0-E0B3) and half circles (E0B4-E0B7)
+            | 0xE0B8..=0xE0BF // Powerline separators: corner triangles
+            | 0xE0C0..=0xE0CA // Powerline separators: flames (E0C0-E0C3), pixelated (E0C4-E0C7), and ice (E0C8 & E0CA)
+            | 0xE0CC..=0xE0D1 // Powerline separators: honeycombs (E0CC-E0CD) and lego (E0CE-E0D1)
+            | 0xE0D2..=0xE0D7 // Powerline separators: trapezoid (E0D2 & E0D4) and inverted triangles (E0D6-E0D7)
+        )
+    }
+
     /// Converts the Alacritty cell styles to GPUI text styles and background color.
     fn cell_style(
         indexed: &IndexedCell,
         fg: terminal::alacritty_terminal::vte::ansi::Color,
-        // bg: terminal::alacritty_terminal::ansi::Color,
+        bg: terminal::alacritty_terminal::vte::ansi::Color,
         colors: &Theme,
         text_style: &TextStyle,
         hyperlink: Option<(HighlightStyle, &RangeInclusive<AlacPoint>)>,
+        minimum_contrast: f32,
     ) -> TextRun {
         let flags = indexed.cell.flags;
         let mut fg = convert_color(&fg, colors);
+        let bg = convert_color(&bg, colors);
+
+        // Only apply contrast adjustment to non-decorative characters
+        if !Self::is_decorative_character(indexed.c) {
+            fg = ensure_minimum_contrast(fg, bg, minimum_contrast);
+        }
 
         // Ghostty uses (175/255) as the multiplier (~0.69), Alacritty uses 0.66, Kitty
         // uses 0.75. We're using 0.7 because it's pretty well in the middle of that.
@@ -392,15 +603,15 @@ impl TerminalElement {
             strikethrough,
         };
 
-        if let Some((style, range)) = hyperlink {
-            if range.contains(&indexed.point) {
-                if let Some(underline) = style.underline {
-                    result.underline = Some(underline);
-                }
+        if let Some((style, range)) = hyperlink
+            && range.contains(&indexed.point)
+        {
+            if let Some(underline) = style.underline {
+                result.underline = Some(underline);
+            }
 
-                if let Some(color) = style.color {
-                    result.color = color;
-                }
+            if let Some(color) = style.color {
+                result.color = color;
             }
         }
 
@@ -408,15 +619,19 @@ impl TerminalElement {
     }
 
     fn generic_button_handler<E>(
-        connection: Model<Terminal>,
-        origin: Point<Pixels>,
+        connection: Entity<Terminal>,
         focus_handle: FocusHandle,
-        f: impl Fn(&mut Terminal, Point<Pixels>, &E, &mut ModelContext<Terminal>),
-    ) -> impl Fn(&E, &mut WindowContext) {
-        move |event, cx| {
-            cx.focus(&focus_handle);
+        steal_focus: bool,
+        f: impl Fn(&mut Terminal, &E, &mut Context<Terminal>),
+    ) -> impl Fn(&E, &mut Window, &mut App) {
+        move |event, window, cx| {
+            if steal_focus {
+                window.focus(&focus_handle, cx);
+            } else if !focus_handle.is_focused(window) {
+                return;
+            }
             connection.update(cx, |terminal, cx| {
-                f(terminal, origin, event, cx);
+                f(terminal, event, cx);
 
                 cx.notify();
             })
@@ -425,52 +640,64 @@ impl TerminalElement {
 
     fn register_mouse_listeners(
         &mut self,
-        origin: Point<Pixels>,
         mode: TermMode,
         hitbox: &Hitbox,
-        cx: &mut WindowContext,
+        content_mode: &ContentMode,
+        window: &mut Window,
     ) {
         let focus = self.focus.clone();
         let terminal = self.terminal.clone();
+        let terminal_view = self.terminal_view.clone();
 
         self.interactivity.on_mouse_down(MouseButton::Left, {
             let terminal = terminal.clone();
             let focus = focus.clone();
-            move |e, cx| {
-                cx.focus(&focus);
+            let terminal_view = terminal_view.clone();
+
+            move |e, window, cx| {
+                window.focus(&focus, cx);
+
+                let scroll_top = terminal_view.read(cx).scroll_top;
                 terminal.update(cx, |terminal, cx| {
-                    terminal.mouse_down(e, origin, cx);
+                    let mut adjusted_event = e.clone();
+                    if scroll_top > Pixels::ZERO {
+                        adjusted_event.position.y += scroll_top;
+                    }
+                    terminal.mouse_down(&adjusted_event, cx);
                     cx.notify();
                 })
             }
         });
 
-        cx.on_mouse_event({
-            let focus = self.focus.clone();
+        window.on_mouse_event({
             let terminal = self.terminal.clone();
             let hitbox = hitbox.clone();
-            move |e: &MouseMoveEvent, phase, cx| {
-                if phase != DispatchPhase::Bubble || !focus.is_focused(cx) {
+            let focus = focus.clone();
+            let terminal_view = terminal_view;
+            move |e: &MouseMoveEvent, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
                     return;
                 }
 
-                if e.pressed_button.is_some() && !cx.has_active_drag() {
-                    let hovered = hitbox.is_hovered(cx);
+                if e.pressed_button.is_some() && !cx.has_active_drag() && focus.is_focused(window) {
+                    let hovered = hitbox.is_hovered(window);
+
+                    let scroll_top = terminal_view.read(cx).scroll_top;
                     terminal.update(cx, |terminal, cx| {
-                        if terminal.selection_started() {
-                            terminal.mouse_drag(e, origin, hitbox.bounds);
-                            cx.notify();
-                        } else if hovered {
-                            terminal.mouse_drag(e, origin, hitbox.bounds);
+                        if terminal.selection_started() || hovered {
+                            let mut adjusted_event = e.clone();
+                            if scroll_top > Pixels::ZERO {
+                                adjusted_event.position.y += scroll_top;
+                            }
+                            terminal.mouse_drag(&adjusted_event, hitbox.bounds, cx);
                             cx.notify();
                         }
                     })
                 }
 
-                if hitbox.is_hovered(cx) {
+                if hitbox.is_hovered(window) {
                     terminal.update(cx, |terminal, cx| {
-                        terminal.mouse_move(e, origin);
-                        cx.notify();
+                        terminal.mouse_move(e, cx);
                     })
                 }
             }
@@ -480,10 +707,10 @@ impl TerminalElement {
             MouseButton::Left,
             TerminalElement::generic_button_handler(
                 terminal.clone(),
-                origin,
                 focus.clone(),
-                move |terminal, origin, e, cx| {
-                    terminal.mouse_up(e, origin, cx);
+                false,
+                move |terminal, e, cx| {
+                    terminal.mouse_up(e, cx);
                 },
             ),
         );
@@ -491,24 +718,31 @@ impl TerminalElement {
             MouseButton::Middle,
             TerminalElement::generic_button_handler(
                 terminal.clone(),
-                origin,
                 focus.clone(),
-                move |terminal, origin, e, cx| {
-                    terminal.mouse_down(e, origin, cx);
+                true,
+                move |terminal, e, cx| {
+                    terminal.mouse_down(e, cx);
                 },
             ),
         );
-        self.interactivity.on_scroll_wheel({
-            let terminal_view = self.terminal_view.downgrade();
-            move |e, cx| {
-                terminal_view
-                    .update(cx, |terminal_view, cx| {
-                        terminal_view.scroll_wheel(e, origin, cx);
-                        cx.notify();
-                    })
-                    .ok();
-            }
-        });
+
+        if content_mode.is_scrollable() {
+            self.interactivity.on_scroll_wheel({
+                let terminal_view = self.terminal_view.downgrade();
+                move |e, window, cx| {
+                    terminal_view
+                        .update(cx, |terminal_view, cx| {
+                            if matches!(terminal_view.mode, TerminalMode::Standalone)
+                                || terminal_view.focus_handle.is_focused(window)
+                            {
+                                terminal_view.scroll_wheel(e, cx);
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                }
+            });
+        }
 
         // Mouse mode handlers:
         // All mouse modes need the extra click handlers
@@ -517,10 +751,10 @@ impl TerminalElement {
                 MouseButton::Right,
                 TerminalElement::generic_button_handler(
                     terminal.clone(),
-                    origin,
                     focus.clone(),
-                    move |terminal, origin, e, cx| {
-                        terminal.mouse_down(e, origin, cx);
+                    true,
+                    move |terminal, e, cx| {
+                        terminal.mouse_down(e, cx);
                     },
                 ),
             );
@@ -528,10 +762,10 @@ impl TerminalElement {
                 MouseButton::Right,
                 TerminalElement::generic_button_handler(
                     terminal.clone(),
-                    origin,
                     focus.clone(),
-                    move |terminal, origin, e, cx| {
-                        terminal.mouse_up(e, origin, cx);
+                    false,
+                    move |terminal, e, cx| {
+                        terminal.mouse_up(e, cx);
                     },
                 ),
             );
@@ -539,17 +773,17 @@ impl TerminalElement {
                 MouseButton::Middle,
                 TerminalElement::generic_button_handler(
                     terminal,
-                    origin,
                     focus,
-                    move |terminal, origin, e, cx| {
-                        terminal.mouse_up(e, origin, cx);
+                    false,
+                    move |terminal, e, cx| {
+                        terminal.mouse_up(e, cx);
                     },
                 ),
             );
         }
     }
 
-    fn rem_size(&self, cx: &WindowContext) -> Option<Pixels> {
+    fn rem_size(&self, cx: &mut App) -> Option<Pixels> {
         let settings = ThemeSettings::get_global(cx).clone();
         let buffer_font_size = settings.buffer_font_size(cx);
         let rem_size_scale = {
@@ -578,45 +812,84 @@ impl Element for TerminalElement {
         self.interactivity.element_id.clone()
     }
 
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
     fn request_layout(
         &mut self,
         global_id: Option<&GlobalElementId>,
-        cx: &mut WindowContext,
+        inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        let layout_id = self
-            .interactivity
-            .request_layout(global_id, cx, |mut style, cx| {
-                style.size.width = relative(1.).into();
-                style.size.height = relative(1.).into();
-                // style.overflow = point(Overflow::Hidden, Overflow::Hidden);
+        let height: Length = match self.terminal_view.read(cx).content_mode(window, cx) {
+            ContentMode::Inline {
+                displayed_lines,
+                total_lines: _,
+            } => {
+                let rem_size = window.rem_size();
+                let line_height = f32::from(window.text_style().font_size.to_pixels(rem_size))
+                    * TerminalSettings::get_global(cx).line_height.value();
+                px(displayed_lines as f32 * line_height).into()
+            }
+            ContentMode::Scrollable => {
+                if let TerminalMode::Embedded { .. } = &self.mode {
+                    let term = self.terminal.read(cx);
+                    if !term.scrolled_to_top() && !term.scrolled_to_bottom() && self.focused {
+                        self.interactivity.occlude_mouse();
+                    }
+                }
 
-                cx.request_layout(style, None)
-            });
+                relative(1.).into()
+            }
+        };
+
+        let layout_id = self.interactivity.request_layout(
+            global_id,
+            inspector_id,
+            window,
+            cx,
+            |mut style, window, cx| {
+                style.size.width = relative(1.).into();
+                style.size.height = height;
+
+                window.request_layout(style, None, cx)
+            },
+        );
         (layout_id, ())
     }
 
     fn prepaint(
         &mut self,
         global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
-        cx: &mut WindowContext,
+        window: &mut Window,
+        cx: &mut App,
     ) -> Self::PrepaintState {
         let rem_size = self.rem_size(cx);
-        self.interactivity
-            .prepaint(global_id, bounds, bounds.size, cx, |_, _, hitbox, cx| {
+        self.interactivity.prepaint(
+            global_id,
+            inspector_id,
+            bounds,
+            bounds.size,
+            window,
+            cx,
+            |_, _, hitbox, window, cx| {
                 let hitbox = hitbox.unwrap();
                 let settings = ThemeSettings::get_global(cx).clone();
 
                 let buffer_font_size = settings.buffer_font_size(cx);
 
                 let terminal_settings = TerminalSettings::get_global(cx);
+                let minimum_contrast = terminal_settings.minimum_contrast;
 
-                let font_family = terminal_settings
-                    .font_family
-                    .as_ref()
-                    .unwrap_or(&settings.buffer_font.family)
-                    .clone();
+                let font_family = terminal_settings.font_family.as_ref().map_or_else(
+                    || settings.buffer_font.family.clone(),
+                    |font_family| font_family.0.clone().into(),
+                );
 
                 let font_fallbacks = terminal_settings
                     .font_fallbacks
@@ -627,16 +900,21 @@ impl Element for TerminalElement {
                 let font_features = terminal_settings
                     .font_features
                     .as_ref()
-                    .unwrap_or(&settings.buffer_font.features)
+                    .unwrap_or(&FontFeatures::disable_ligatures())
                     .clone();
 
                 let font_weight = terminal_settings.font_weight.unwrap_or_default();
 
                 let line_height = terminal_settings.line_height.value();
-                let font_size = terminal_settings.font_size;
 
-                let font_size =
-                    font_size.map_or(buffer_font_size, |size| theme::adjusted_font_size(size, cx));
+                let font_size = match &self.mode {
+                    TerminalMode::Embedded { .. } => {
+                        window.text_style().font_size.to_pixels(window.rem_size())
+                    }
+                    TerminalMode::Standalone => terminal_settings
+                        .font_size
+                        .map_or(buffer_font_size, |size| theme::adjusted_font_size(size, cx)),
+                };
 
                 let theme = cx.theme().clone();
 
@@ -661,24 +939,22 @@ impl Element for TerminalElement {
                     font_fallbacks,
                     font_size: font_size.into(),
                     font_style: FontStyle::Normal,
-                    line_height: line_height.into(),
+                    line_height: px(line_height).into(),
                     background_color: Some(theme.colors().terminal_ansi_background),
                     white_space: WhiteSpace::Normal,
-                    truncate: None,
                     // These are going to be overridden per-cell
-                    underline: None,
-                    strikethrough: None,
                     color: theme.colors().terminal_foreground,
+                    ..Default::default()
                 };
 
                 let text_system = cx.text_system();
                 let player_color = theme.players().local();
                 let match_color = theme.colors().search_match_background;
                 let gutter;
-                let dimensions = {
-                    let rem_size = cx.rem_size();
+                let (dimensions, line_height_px) = {
+                    let rem_size = window.rem_size();
                     let font_pixels = text_style.font_size.to_pixels(rem_size);
-                    let line_height = font_pixels * line_height.to_pixels(rem_size);
+                    let line_height = f32::from(font_pixels) * line_height;
                     let font_id = cx.text_system().resolve_font(&text_style.font());
 
                     let cell_width = text_system
@@ -697,34 +973,53 @@ impl Element for TerminalElement {
                         size.width = cell_width * 2.0;
                     }
 
-                    TerminalSize::new(line_height, cell_width, size)
+                    let mut origin = bounds.origin;
+                    origin.x += gutter;
+
+                    (
+                        TerminalBounds::new(px(line_height), cell_width, Bounds { origin, size }),
+                        line_height,
+                    )
                 };
 
                 let search_matches = self.terminal.read(cx).matches.clone();
 
                 let background_color = theme.colors().terminal_background;
 
-                let last_hovered_word = self.terminal.update(cx, |terminal, cx| {
-                    terminal.set_size(dimensions);
-                    terminal.sync(cx);
-                    if self.can_navigate_to_selected_word
-                        && terminal.can_navigate_to_selected_word()
-                    {
-                        terminal.last_content.last_hovered_word.clone()
-                    } else {
-                        None
-                    }
-                });
+                let (last_hovered_word, hover_tooltip) =
+                    self.terminal.update(cx, |terminal, cx| {
+                        terminal.set_size(dimensions);
+                        terminal.sync(window, cx);
+
+                        if window.modifiers().secondary()
+                            && bounds.contains(&window.mouse_position())
+                            && self.terminal_view.read(cx).hover.is_some()
+                        {
+                            let registered_hover = self.terminal_view.read(cx).hover.as_ref();
+                            if terminal.last_content.last_hovered_word.as_ref()
+                                == registered_hover.map(|hover| &hover.hovered_word)
+                            {
+                                (
+                                    terminal.last_content.last_hovered_word.clone(),
+                                    registered_hover.map(|hover| hover.tooltip.clone()),
+                                )
+                            } else {
+                                (None, None)
+                            }
+                        } else {
+                            (None, None)
+                        }
+                    });
 
                 let scroll_top = self.terminal_view.read(cx).scroll_top;
-                let hyperlink_tooltip = last_hovered_word.clone().map(|hovered_word| {
+                let hyperlink_tooltip = hover_tooltip.map(|hover_tooltip| {
                     let offset = bounds.origin + point(gutter, px(0.)) - point(px(0.), scroll_top);
                     let mut element = div()
                         .size_full()
                         .id("terminal-element")
-                        .tooltip(move |cx| Tooltip::text(hovered_word.word.clone(), cx))
+                        .tooltip(Tooltip::text(hover_tooltip))
                         .into_any_element();
-                    element.prepaint_as_root(offset, bounds.size.into(), cx);
+                    element.prepaint_as_root(offset, bounds.size.into(), window, cx);
                     element
                 });
 
@@ -752,64 +1047,131 @@ impl Element for TerminalElement {
 
                 // then have that representation be converted to the appropriate highlight data structure
 
-                let (cells, rects) = TerminalElement::layout_grid(
-                    cells.iter().cloned(),
-                    &text_style,
-                    cx.text_system(),
-                    last_hovered_word
-                        .as_ref()
-                        .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
-                    cx,
-                );
+                let content_mode = self.terminal_view.read(cx).content_mode(window, cx);
+
+                // Calculate the intersection of the terminal's bounds with the current
+                // content mask (the visible viewport after all parent clipping).
+                // This allows us to only render cells that are actually visible, which is
+                // critical for performance when terminals are inside scrollable containers
+                // like the Agent Panel thread view.
+                //
+                // This optimization is analogous to the editor optimization in PR #45077
+                // which fixed performance issues with large AutoHeight editors inside Lists.
+                let visible_bounds = window.content_mask().bounds;
+                let intersection = visible_bounds.intersect(&bounds);
+
+                // If the terminal is entirely outside the viewport, skip all cell processing.
+                // This handles the case where the terminal has been scrolled past (above or
+                // below the viewport), similar to the editor fix in PR #45077 where start_row
+                // could exceed max_row when the editor was positioned above the viewport.
+                let (rects, batched_text_runs) = if intersection.size.height <= px(0.)
+                    || intersection.size.width <= px(0.)
+                {
+                    (Vec::new(), Vec::new())
+                } else if intersection == bounds {
+                    // Fast path: terminal fully visible, no clipping needed.
+                    // Avoid grouping/allocation overhead by streaming cells directly.
+                    TerminalElement::layout_grid(
+                        cells.iter().cloned(),
+                        0,
+                        &text_style,
+                        last_hovered_word
+                            .as_ref()
+                            .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
+                        minimum_contrast,
+                        cx,
+                    )
+                } else {
+                    // Calculate which screen rows are visible based on pixel positions.
+                    // This works for both Scrollable and Inline modes because we filter
+                    // by screen position (enumerated line group index), not by the cell's
+                    // internal line number (which can be negative in Scrollable mode for
+                    // scrollback history).
+                    let rows_above_viewport =
+                        f32::from((intersection.top() - bounds.top()).max(px(0.)) / line_height_px)
+                            as usize;
+                    let visible_row_count =
+                        f32::from((intersection.size.height / line_height_px).ceil()) as usize + 1;
+
+                    TerminalElement::layout_grid(
+                        // Group cells by line and filter to only the visible screen rows.
+                        // skip() and take() work on enumerated line groups (screen position),
+                        // making this work regardless of the actual cell.point.line values.
+                        cells
+                            .iter()
+                            .chunk_by(|c| c.point.line)
+                            .into_iter()
+                            .skip(rows_above_viewport)
+                            .take(visible_row_count)
+                            .flat_map(|(_, line_cells)| line_cells)
+                            .cloned(),
+                        rows_above_viewport as i32,
+                        &text_style,
+                        last_hovered_word
+                            .as_ref()
+                            .map(|last_hovered_word| (link_style, &last_hovered_word.word_match)),
+                        minimum_contrast,
+                        cx,
+                    )
+                };
 
                 // Layout cursor. Rectangle is used for IME, so we should lay it out even
                 // if we don't end up showing it.
+                let cursor_point = DisplayCursor::from(cursor.point, display_offset);
+                let cursor_text = {
+                    let str_trxt = cursor_char.to_string();
+                    let len = str_trxt.len();
+                    window.text_system().shape_line(
+                        str_trxt.into(),
+                        text_style.font_size.to_pixels(window.rem_size()),
+                        &[TextRun {
+                            len,
+                            font: text_style.font(),
+                            color: theme.colors().terminal_ansi_background,
+                            ..Default::default()
+                        }],
+                        None,
+                    )
+                };
+
+                // For whitespace, use cell width to avoid cursor stretching.
+                // For other characters, use the larger of shaped width and cell width
+                // to properly cover wide characters like emojis.
+                let cursor_width = if cursor_char.is_whitespace() {
+                    dimensions.cell_width()
+                } else {
+                    cursor_text.width.max(dimensions.cell_width())
+                };
+
+                let ime_cursor_bounds = TerminalElement::cursor_position(cursor_point, dimensions)
+                    .map(|cursor_position| Bounds {
+                        origin: cursor_position,
+                        size: size(cursor_width.ceil(), dimensions.line_height),
+                    });
+
                 let cursor = if let AlacCursorShape::Hidden = cursor.shape {
                     None
                 } else {
-                    let cursor_point = DisplayCursor::from(cursor.point, display_offset);
-                    let cursor_text = {
-                        let str_trxt = cursor_char.to_string();
-                        let len = str_trxt.len();
-                        cx.text_system()
-                            .shape_line(
-                                str_trxt.into(),
-                                text_style.font_size.to_pixels(cx.rem_size()),
-                                &[TextRun {
-                                    len,
-                                    font: text_style.font(),
-                                    color: theme.colors().terminal_ansi_background,
-                                    background_color: None,
-                                    underline: Default::default(),
-                                    strikethrough: None,
-                                }],
-                            )
-                            .unwrap()
-                    };
-
                     let focused = self.focused;
-                    TerminalElement::shape_cursor(cursor_point, dimensions, &cursor_text).map(
-                        move |(cursor_position, block_width)| {
-                            let (shape, text) = match cursor.shape {
-                                AlacCursorShape::Block if !focused => (CursorShape::Hollow, None),
-                                AlacCursorShape::Block => (CursorShape::Block, Some(cursor_text)),
-                                AlacCursorShape::Underline => (CursorShape::Underline, None),
-                                AlacCursorShape::Beam => (CursorShape::Bar, None),
-                                AlacCursorShape::HollowBlock => (CursorShape::Hollow, None),
-                                //This case is handled in the if wrapping the whole cursor layout
-                                AlacCursorShape::Hidden => unreachable!(),
-                            };
+                    ime_cursor_bounds.map(move |bounds| {
+                        let (shape, text) = match cursor.shape {
+                            AlacCursorShape::Block if !focused => (CursorShape::Hollow, None),
+                            AlacCursorShape::Block => (CursorShape::Block, Some(cursor_text)),
+                            AlacCursorShape::Underline => (CursorShape::Underline, None),
+                            AlacCursorShape::Beam => (CursorShape::Bar, None),
+                            AlacCursorShape::HollowBlock => (CursorShape::Hollow, None),
+                            AlacCursorShape::Hidden => unreachable!(),
+                        };
 
-                            CursorLayout::new(
-                                cursor_position,
-                                block_width,
-                                dimensions.line_height,
-                                theme.players().local().cursor,
-                                shape,
-                                text,
-                            )
-                        },
-                    )
+                        CursorLayout::new(
+                            bounds.origin,
+                            bounds.size.width,
+                            bounds.size.height,
+                            theme.players().local().cursor,
+                            shape,
+                            text,
+                        )
+                    })
                 };
 
                 let block_below_cursor_element = if let Some(block) = &self.block_below_cursor {
@@ -818,6 +1180,7 @@ impl Element for TerminalElement {
                         let target_line = terminal.last_content.cursor.point.line.0 + 1;
                         let render = &block.render;
                         let mut block_cx = BlockContext {
+                            window,
                             context: cx,
                             dimensions,
                         };
@@ -832,8 +1195,8 @@ impl Element for TerminalElement {
                         let origin = bounds.origin
                             + point(px(0.), target_line as f32 * dimensions.line_height())
                             - point(px(0.), scroll_top);
-                        cx.with_rem_size(rem_size, |cx| {
-                            element.prepaint_as_root(origin, available_space, cx);
+                        window.with_rem_size(rem_size, |window| {
+                            element.prepaint_as_root(origin, available_space, window, cx);
                         });
                         Some(element)
                     } else {
@@ -845,8 +1208,9 @@ impl Element for TerminalElement {
 
                 LayoutState {
                     hitbox,
-                    cells,
+                    batched_text_runs,
                     cursor,
+                    ime_cursor_bounds,
                     background_color,
                     dimensions,
                     rects,
@@ -855,105 +1219,186 @@ impl Element for TerminalElement {
                     display_offset,
                     hyperlink_tooltip,
                     gutter,
-                    last_hovered_word,
                     block_below_cursor_element,
+                    base_text_style: text_style,
+                    content_mode,
                 }
-            })
+            },
+        )
     }
 
     fn paint(
         &mut self,
         global_id: Option<&GlobalElementId>,
+        inspector_id: Option<&gpui::InspectorElementId>,
         bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         layout: &mut Self::PrepaintState,
-        cx: &mut WindowContext<'_>,
+        window: &mut Window,
+        cx: &mut App,
     ) {
-        cx.with_content_mask(Some(ContentMask { bounds }), |cx| {
+        let paint_start = Instant::now();
+        window.with_content_mask(Some(ContentMask { bounds }), |window| {
             let scroll_top = self.terminal_view.read(cx).scroll_top;
 
-            cx.paint_quad(fill(bounds, layout.background_color));
+            window.paint_quad(fill(bounds, layout.background_color));
             let origin =
                 bounds.origin + Point::new(layout.gutter, px(0.)) - Point::new(px(0.), scroll_top);
 
+            let marked_text_cloned: Option<String> = {
+                let ime_state = &self.terminal_view.read(cx).ime_state;
+                ime_state.as_ref().map(|state| state.marked_text.clone())
+            };
+
             let terminal_input_handler = TerminalInputHandler {
                 terminal: self.terminal.clone(),
-                cursor_bounds: layout
-                    .cursor
-                    .as_ref()
-                    .map(|cursor| cursor.bounding_rect(origin)),
+                terminal_view: self.terminal_view.clone(),
+                cursor_bounds: layout.ime_cursor_bounds.map(|bounds| bounds + origin),
                 workspace: self.workspace.clone(),
             };
 
-            self.register_mouse_listeners(origin, layout.mode, &layout.hitbox, cx);
-            if self.can_navigate_to_selected_word && layout.last_hovered_word.is_some() {
-                cx.set_cursor_style(gpui::CursorStyle::PointingHand, &layout.hitbox);
+            self.register_mouse_listeners(
+                layout.mode,
+                &layout.hitbox,
+                &layout.content_mode,
+                window,
+            );
+            if window.modifiers().secondary()
+                && bounds.contains(&window.mouse_position())
+                && self.terminal_view.read(cx).hover.is_some()
+            {
+                window.set_cursor_style(gpui::CursorStyle::PointingHand, &layout.hitbox);
             } else {
-                cx.set_cursor_style(gpui::CursorStyle::IBeam, &layout.hitbox);
+                window.set_cursor_style(gpui::CursorStyle::IBeam, &layout.hitbox);
             }
 
-            let cursor = layout.cursor.take();
+            let original_cursor = layout.cursor.take();
             let hyperlink_tooltip = layout.hyperlink_tooltip.take();
             let block_below_cursor_element = layout.block_below_cursor_element.take();
-            self.interactivity
-                .paint(global_id, bounds, Some(&layout.hitbox), cx, |_, cx| {
-                    cx.handle_input(&self.focus, terminal_input_handler);
+            self.interactivity.paint(
+                global_id,
+                inspector_id,
+                bounds,
+                Some(&layout.hitbox),
+                window,
+                cx,
+                |_, window, cx| {
+                    window.handle_input(&self.focus, terminal_input_handler, cx);
 
-                    cx.on_key_event({
+                    window.on_key_event({
                         let this = self.terminal.clone();
-                        move |event: &ModifiersChangedEvent, phase, cx| {
+                        move |event: &ModifiersChangedEvent, phase, window, cx| {
                             if phase != DispatchPhase::Bubble {
                                 return;
                             }
 
-                            let handled = this
-                                .update(cx, |term, _| term.try_modifiers_change(&event.modifiers));
-
-                            if handled {
-                                cx.refresh();
-                            }
+                            this.update(cx, |term, cx| {
+                                term.try_modifiers_change(&event.modifiers, window, cx)
+                            });
                         }
                     });
 
                     for rect in &layout.rects {
-                        rect.paint(origin, &layout.dimensions, cx);
+                        rect.paint(origin, &layout.dimensions, window);
                     }
 
-                    for (relative_highlighted_range, color) in
-                        layout.relative_highlighted_ranges.iter()
-                    {
+                    for (relative_highlighted_range, color) in &layout.relative_highlighted_ranges {
                         if let Some((start_y, highlighted_range_lines)) =
                             to_highlighted_range_lines(relative_highlighted_range, layout, origin)
                         {
+                            let corner_radius = if EditorSettings::get_global(cx).rounded_selection
+                            {
+                                0.15 * layout.dimensions.line_height
+                            } else {
+                                Pixels::ZERO
+                            };
                             let hr = HighlightedRange {
                                 start_y,
                                 line_height: layout.dimensions.line_height,
                                 lines: highlighted_range_lines,
                                 color: *color,
-                                corner_radius: 0.15 * layout.dimensions.line_height,
+                                corner_radius: corner_radius,
                             };
-                            hr.paint(bounds, cx);
+                            hr.paint(true, bounds, window);
                         }
                     }
 
-                    for cell in &layout.cells {
-                        cell.paint(origin, &layout.dimensions, bounds, cx);
+                    // Paint batched text runs instead of individual cells
+                    let text_paint_start = Instant::now();
+                    for batch in &layout.batched_text_runs {
+                        batch.paint(origin, &layout.dimensions, window, cx);
+                    }
+                    let text_paint_time = text_paint_start.elapsed();
+
+                    if let Some(text_to_mark) = &marked_text_cloned
+                        && !text_to_mark.is_empty()
+                        && let Some(ime_bounds) = layout.ime_cursor_bounds
+                    {
+                        let ime_position = (ime_bounds + origin).origin;
+                        let mut ime_style = layout.base_text_style.clone();
+                        ime_style.underline = Some(UnderlineStyle {
+                            color: Some(ime_style.color),
+                            thickness: px(1.0),
+                            wavy: false,
+                        });
+
+                        let shaped_line = window.text_system().shape_line(
+                            text_to_mark.clone().into(),
+                            ime_style.font_size.to_pixels(window.rem_size()),
+                            &[TextRun {
+                                len: text_to_mark.len(),
+                                font: ime_style.font(),
+                                color: ime_style.color,
+                                underline: ime_style.underline,
+                                ..Default::default()
+                            }],
+                            None,
+                        );
+
+                        // Paint background to cover terminal text behind marked text
+                        let ime_background_bounds = Bounds::new(
+                            ime_position,
+                            size(shaped_line.width, layout.dimensions.line_height),
+                        );
+                        window.paint_quad(fill(ime_background_bounds, layout.background_color));
+
+                        shaped_line
+                            .paint(
+                                ime_position,
+                                layout.dimensions.line_height,
+                                gpui::TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            )
+                            .log_err();
                     }
 
-                    if self.cursor_visible {
-                        if let Some(mut cursor) = cursor {
-                            cursor.paint(origin, cx);
-                        }
+                    if self.cursor_visible
+                        && marked_text_cloned.is_none()
+                        && let Some(mut cursor) = original_cursor
+                    {
+                        cursor.paint(origin, window, cx);
                     }
 
                     if let Some(mut element) = block_below_cursor_element {
-                        element.paint(cx);
+                        element.paint(window, cx);
                     }
 
                     if let Some(mut element) = hyperlink_tooltip {
-                        element.paint(cx);
+                        element.paint(window, cx);
                     }
-                });
+
+                    log::debug!(
+                        "Terminal paint: {} text runs, {} rects, \
+                        text paint took {:?}, total paint took {total_paint_time:?}",
+                        layout.batched_text_runs.len(),
+                        layout.rects.len(),
+                        text_paint_time,
+                        total_paint_time = paint_start.elapsed()
+                    );
+                },
+            );
         });
     }
 }
@@ -967,8 +1412,9 @@ impl IntoElement for TerminalElement {
 }
 
 struct TerminalInputHandler {
-    terminal: Model<Terminal>,
-    workspace: WeakView<Workspace>,
+    terminal: Entity<Terminal>,
+    terminal_view: Entity<TerminalView>,
+    workspace: WeakEntity<Workspace>,
     cursor_bounds: Option<Bounds<Pixels>>,
 }
 
@@ -976,7 +1422,8 @@ impl InputHandler for TerminalInputHandler {
     fn selected_text_range(
         &mut self,
         _ignore_disabled_input: bool,
-        cx: &mut WindowContext,
+        _: &mut Window,
+        cx: &mut App,
     ) -> Option<UTF16Selection> {
         if self
             .terminal
@@ -994,14 +1441,20 @@ impl InputHandler for TerminalInputHandler {
         }
     }
 
-    fn marked_text_range(&mut self, _: &mut WindowContext) -> Option<std::ops::Range<usize>> {
-        None
+    fn marked_text_range(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Option<std::ops::Range<usize>> {
+        self.terminal_view.read(cx).marked_text_range()
     }
 
     fn text_for_range(
         &mut self,
         _: std::ops::Range<usize>,
-        _: &mut WindowContext,
+        _: &mut Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut App,
     ) -> Option<String> {
         None
     }
@@ -1010,18 +1463,20 @@ impl InputHandler for TerminalInputHandler {
         &mut self,
         _replacement_range: Option<std::ops::Range<usize>>,
         text: &str,
-        cx: &mut WindowContext,
+        window: &mut Window,
+        cx: &mut App,
     ) {
-        self.terminal.update(cx, |terminal, _| {
-            terminal.input(text.into());
+        self.terminal_view.update(cx, |view, view_cx| {
+            view.clear_marked_text(view_cx);
+            view.commit_text(text, view_cx);
         });
 
         self.workspace
             .update(cx, |this, cx| {
-                cx.invalidate_character_coordinates();
+                window.invalidate_character_coordinates();
                 let project = this.project().read(cx);
                 let telemetry = project.client().telemetry().clone();
-                telemetry.log_edit_event("terminal", project.is_via_ssh());
+                telemetry.log_edit_event("terminal", project.is_via_remote_server());
             })
             .ok();
     }
@@ -1029,20 +1484,48 @@ impl InputHandler for TerminalInputHandler {
     fn replace_and_mark_text_in_range(
         &mut self,
         _range_utf16: Option<std::ops::Range<usize>>,
-        _new_text: &str,
-        _new_selected_range: Option<std::ops::Range<usize>>,
-        _: &mut WindowContext,
+        new_text: &str,
+        _new_marked_range: Option<std::ops::Range<usize>>,
+        _window: &mut Window,
+        cx: &mut App,
     ) {
+        self.terminal_view.update(cx, |view, view_cx| {
+            view.set_marked_text(new_text.to_string(), view_cx);
+        });
     }
 
-    fn unmark_text(&mut self, _: &mut WindowContext) {}
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut App) {
+        self.terminal_view.update(cx, |view, view_cx| {
+            view.clear_marked_text(view_cx);
+        });
+    }
 
     fn bounds_for_range(
         &mut self,
-        _range_utf16: std::ops::Range<usize>,
-        _: &mut WindowContext,
+        range_utf16: std::ops::Range<usize>,
+        _window: &mut Window,
+        cx: &mut App,
     ) -> Option<Bounds<Pixels>> {
-        self.cursor_bounds
+        let term_bounds = self.terminal_view.read(cx).terminal_bounds(cx);
+
+        let mut bounds = self.cursor_bounds?;
+        let offset_x = term_bounds.cell_width * range_utf16.start as f32;
+        bounds.origin.x += offset_x;
+
+        Some(bounds)
+    }
+
+    fn apple_press_and_hold_enabled(&mut self) -> bool {
+        false
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut App,
+    ) -> Option<usize> {
+        None
     }
 }
 
@@ -1105,11 +1588,13 @@ fn to_highlighted_range_lines(
     }
 
     let clamped_start_line = unclamped_start.line.0.max(0) as usize;
+
     let clamped_end_line = unclamped_end
         .line
         .0
         .min(layout.dimensions.num_lines() as i32) as usize;
-    //Convert the start of the range to pixels
+
+    // Convert the start of the range to pixels
     let start_y = origin.y + clamped_start_line as f32 * layout.dimensions.line_height;
 
     // Step 3. Expand ranges that cross lines into a collection of single-line ranges.
@@ -1119,10 +1604,11 @@ fn to_highlighted_range_lines(
         let mut line_start = 0;
         let mut line_end = layout.dimensions.columns();
 
-        if line == clamped_start_line {
+        if line == clamped_start_line && unclamped_start.line.0 >= 0 {
             line_start = unclamped_start.column.0;
         }
-        if line == clamped_end_line {
+        if line == clamped_end_line && unclamped_end.line.0 <= layout.dimensions.num_lines() as i32
+        {
             line_end = unclamped_end.column.0 + 1; // +1 for inclusive
         }
 
@@ -1179,5 +1665,675 @@ pub fn convert_color(fg: &terminal::alacritty_terminal::vte::ansi::Color, theme:
         terminal::alacritty_terminal::vte::ansi::Color::Indexed(i) => {
             terminal::get_color_at_index(*i as usize, theme)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{AbsoluteLength, Hsla, font};
+    use ui::utils::apca_contrast;
+
+    #[test]
+    fn test_is_decorative_character() {
+        // Box Drawing characters (U+2500 to U+257F)
+        assert!(TerminalElement::is_decorative_character('─')); // U+2500
+        assert!(TerminalElement::is_decorative_character('│')); // U+2502
+        assert!(TerminalElement::is_decorative_character('┌')); // U+250C
+        assert!(TerminalElement::is_decorative_character('┐')); // U+2510
+        assert!(TerminalElement::is_decorative_character('└')); // U+2514
+        assert!(TerminalElement::is_decorative_character('┘')); // U+2518
+        assert!(TerminalElement::is_decorative_character('┼')); // U+253C
+
+        // Block Elements (U+2580 to U+259F)
+        assert!(TerminalElement::is_decorative_character('▀')); // U+2580
+        assert!(TerminalElement::is_decorative_character('▄')); // U+2584
+        assert!(TerminalElement::is_decorative_character('█')); // U+2588
+        assert!(TerminalElement::is_decorative_character('░')); // U+2591
+        assert!(TerminalElement::is_decorative_character('▒')); // U+2592
+        assert!(TerminalElement::is_decorative_character('▓')); // U+2593
+
+        // Geometric Shapes - block/box-like subset (U+25A0 to U+25D7)
+        assert!(TerminalElement::is_decorative_character('■')); // U+25A0
+        assert!(TerminalElement::is_decorative_character('□')); // U+25A1
+        assert!(TerminalElement::is_decorative_character('▲')); // U+25B2
+        assert!(TerminalElement::is_decorative_character('▼')); // U+25BC
+        assert!(TerminalElement::is_decorative_character('◆')); // U+25C6
+        assert!(TerminalElement::is_decorative_character('●')); // U+25CF
+
+        // The specific character from the issue
+        assert!(TerminalElement::is_decorative_character('◗')); // U+25D7
+        assert!(TerminalElement::is_decorative_character('◘')); // U+25D8 (now included in Geometric Shapes)
+        assert!(TerminalElement::is_decorative_character('◙')); // U+25D9 (now included in Geometric Shapes)
+
+        // Powerline symbols (Private Use Area)
+        assert!(TerminalElement::is_decorative_character('\u{E0B0}')); // Powerline right triangle
+        assert!(TerminalElement::is_decorative_character('\u{E0B2}')); // Powerline left triangle
+        assert!(TerminalElement::is_decorative_character('\u{E0B4}')); // Powerline right half circle (the actual issue!)
+        assert!(TerminalElement::is_decorative_character('\u{E0B6}')); // Powerline left half circle
+        assert!(TerminalElement::is_decorative_character('\u{E0CA}')); // Powerline mirrored ice waveform
+        assert!(TerminalElement::is_decorative_character('\u{E0D7}')); // Powerline left triangle inverted
+
+        // Characters that should NOT be considered decorative
+        assert!(!TerminalElement::is_decorative_character('A')); // Regular letter
+        assert!(!TerminalElement::is_decorative_character('$')); // Symbol
+        assert!(!TerminalElement::is_decorative_character(' ')); // Space
+        assert!(!TerminalElement::is_decorative_character('←')); // U+2190 (Arrow, not in our ranges)
+        assert!(!TerminalElement::is_decorative_character('→')); // U+2192 (Arrow, not in our ranges)
+        assert!(!TerminalElement::is_decorative_character('\u{F00C}')); // Font Awesome check (icon, needs contrast)
+        assert!(!TerminalElement::is_decorative_character('\u{E711}')); // Devicons (icon, needs contrast)
+        assert!(!TerminalElement::is_decorative_character('\u{EA71}')); // Codicons folder (icon, needs contrast)
+        assert!(!TerminalElement::is_decorative_character('\u{F401}')); // Octicons (icon, needs contrast)
+        assert!(!TerminalElement::is_decorative_character('\u{1F600}')); // Emoji (not in our ranges)
+    }
+
+    #[test]
+    fn test_decorative_character_boundary_cases() {
+        // Test exact boundaries of our ranges
+        // Box Drawing range boundaries
+        assert!(TerminalElement::is_decorative_character('\u{2500}')); // First char
+        assert!(TerminalElement::is_decorative_character('\u{257F}')); // Last char
+        assert!(!TerminalElement::is_decorative_character('\u{24FF}')); // Just before
+
+        // Block Elements range boundaries
+        assert!(TerminalElement::is_decorative_character('\u{2580}')); // First char
+        assert!(TerminalElement::is_decorative_character('\u{259F}')); // Last char
+
+        // Geometric Shapes subset boundaries
+        assert!(TerminalElement::is_decorative_character('\u{25A0}')); // First char
+        assert!(TerminalElement::is_decorative_character('\u{25FF}')); // Last char
+        assert!(!TerminalElement::is_decorative_character('\u{2600}')); // Just after
+    }
+
+    #[test]
+    fn test_decorative_characters_bypass_contrast_adjustment() {
+        // Decorative characters should not be affected by contrast adjustment
+
+        // The specific character from issue #34234
+        let problematic_char = '◗'; // U+25D7
+        assert!(
+            TerminalElement::is_decorative_character(problematic_char),
+            "Character ◗ (U+25D7) should be recognized as decorative"
+        );
+
+        // Verify some other commonly used decorative characters
+        assert!(TerminalElement::is_decorative_character('│')); // Vertical line
+        assert!(TerminalElement::is_decorative_character('─')); // Horizontal line
+        assert!(TerminalElement::is_decorative_character('█')); // Full block
+        assert!(TerminalElement::is_decorative_character('▓')); // Dark shade
+        assert!(TerminalElement::is_decorative_character('■')); // Black square
+        assert!(TerminalElement::is_decorative_character('●')); // Black circle
+
+        // Verify normal text characters are NOT decorative
+        assert!(!TerminalElement::is_decorative_character('A'));
+        assert!(!TerminalElement::is_decorative_character('1'));
+        assert!(!TerminalElement::is_decorative_character('$'));
+        assert!(!TerminalElement::is_decorative_character(' '));
+    }
+
+    #[test]
+    fn test_contrast_adjustment_logic() {
+        // Test the core contrast adjustment logic without needing full app context
+
+        // Test case 1: Light colors (poor contrast)
+        let white_fg = gpui::Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 1.0,
+            a: 1.0,
+        };
+        let light_gray_bg = gpui::Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.95,
+            a: 1.0,
+        };
+
+        // Should have poor contrast
+        let actual_contrast = apca_contrast(white_fg, light_gray_bg).abs();
+        assert!(
+            actual_contrast < 30.0,
+            "White on light gray should have poor APCA contrast: {}",
+            actual_contrast
+        );
+
+        // After adjustment with minimum APCA contrast of 45, should be darker
+        let adjusted = ensure_minimum_contrast(white_fg, light_gray_bg, 45.0);
+        assert!(
+            adjusted.l < white_fg.l,
+            "Adjusted color should be darker than original"
+        );
+        let adjusted_contrast = apca_contrast(adjusted, light_gray_bg).abs();
+        assert!(adjusted_contrast >= 45.0, "Should meet minimum contrast");
+
+        // Test case 2: Dark colors (poor contrast)
+        let black_fg = gpui::Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.0,
+            a: 1.0,
+        };
+        let dark_gray_bg = gpui::Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.05,
+            a: 1.0,
+        };
+
+        // Should have poor contrast
+        let actual_contrast = apca_contrast(black_fg, dark_gray_bg).abs();
+        assert!(
+            actual_contrast < 30.0,
+            "Black on dark gray should have poor APCA contrast: {}",
+            actual_contrast
+        );
+
+        // After adjustment with minimum APCA contrast of 45, should be lighter
+        let adjusted = ensure_minimum_contrast(black_fg, dark_gray_bg, 45.0);
+        assert!(
+            adjusted.l > black_fg.l,
+            "Adjusted color should be lighter than original"
+        );
+        let adjusted_contrast = apca_contrast(adjusted, dark_gray_bg).abs();
+        assert!(adjusted_contrast >= 45.0, "Should meet minimum contrast");
+
+        // Test case 3: Already good contrast
+        let good_contrast = ensure_minimum_contrast(black_fg, white_fg, 45.0);
+        assert_eq!(
+            good_contrast, black_fg,
+            "Good contrast should not be adjusted"
+        );
+    }
+
+    #[test]
+    fn test_white_on_white_contrast_issue() {
+        // This test reproduces the exact issue from the bug report
+        // where white ANSI text on white background should be adjusted
+
+        // Simulate One Light theme colors
+        let white_fg = gpui::Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.98, // #fafafaff is approximately 98% lightness
+            a: 1.0,
+        };
+        let white_bg = gpui::Hsla {
+            h: 0.0,
+            s: 0.0,
+            l: 0.98, // Same as foreground - this is the problem!
+            a: 1.0,
+        };
+
+        // With minimum contrast of 0.0, no adjustment should happen
+        let no_adjust = ensure_minimum_contrast(white_fg, white_bg, 0.0);
+        assert_eq!(no_adjust, white_fg, "No adjustment with min_contrast 0.0");
+
+        // With minimum APCA contrast of 15, it should adjust to a darker color
+        let adjusted = ensure_minimum_contrast(white_fg, white_bg, 15.0);
+        assert!(
+            adjusted.l < white_fg.l,
+            "White on white should become darker, got l={}",
+            adjusted.l
+        );
+
+        // Verify the contrast is now acceptable
+        let new_contrast = apca_contrast(adjusted, white_bg).abs();
+        assert!(
+            new_contrast >= 15.0,
+            "Adjusted APCA contrast {} should be >= 15.0",
+            new_contrast
+        );
+    }
+
+    #[test]
+    fn test_batched_text_run_can_append() {
+        let style1 = TextRun {
+            len: 1,
+            font: font("Helvetica"),
+            color: Hsla::red(),
+            ..Default::default()
+        };
+
+        let style2 = TextRun {
+            len: 1,
+            font: font("Helvetica"),
+            color: Hsla::red(),
+            ..Default::default()
+        };
+
+        let style3 = TextRun {
+            len: 1,
+            font: font("Helvetica"),
+            color: Hsla::blue(), // Different color
+            ..Default::default()
+        };
+
+        let font_size = AbsoluteLength::Pixels(px(12.0));
+        let batch = BatchedTextRun::new_from_char(AlacPoint::new(0, 0), 'a', style1, font_size);
+
+        // Should be able to append same style
+        assert!(batch.can_append(&style2));
+
+        // Should not be able to append different style
+        assert!(!batch.can_append(&style3));
+    }
+
+    #[test]
+    fn test_batched_text_run_append() {
+        let style = TextRun {
+            len: 1,
+            font: font("Helvetica"),
+            color: Hsla::red(),
+            ..Default::default()
+        };
+
+        let font_size = AbsoluteLength::Pixels(px(12.0));
+        let mut batch = BatchedTextRun::new_from_char(AlacPoint::new(0, 0), 'a', style, font_size);
+
+        assert_eq!(batch.text, "a");
+        assert_eq!(batch.cell_count, 1);
+        assert_eq!(batch.style.len, 1);
+
+        batch.append_char('b');
+
+        assert_eq!(batch.text, "ab");
+        assert_eq!(batch.cell_count, 2);
+        assert_eq!(batch.style.len, 2);
+
+        batch.append_char('c');
+
+        assert_eq!(batch.text, "abc");
+        assert_eq!(batch.cell_count, 3);
+        assert_eq!(batch.style.len, 3);
+    }
+
+    #[test]
+    fn test_batched_text_run_append_char() {
+        let style = TextRun {
+            len: 1,
+            font: font("Helvetica"),
+            color: Hsla::red(),
+            ..Default::default()
+        };
+
+        let font_size = AbsoluteLength::Pixels(px(12.0));
+        let mut batch = BatchedTextRun::new_from_char(AlacPoint::new(0, 0), 'x', style, font_size);
+
+        assert_eq!(batch.text, "x");
+        assert_eq!(batch.cell_count, 1);
+        assert_eq!(batch.style.len, 1);
+
+        batch.append_char('y');
+
+        assert_eq!(batch.text, "xy");
+        assert_eq!(batch.cell_count, 2);
+        assert_eq!(batch.style.len, 2);
+
+        // Test with multi-byte character
+        batch.append_char('😀');
+
+        assert_eq!(batch.text, "xy😀");
+        assert_eq!(batch.cell_count, 3);
+        assert_eq!(batch.style.len, 6); // 1 + 1 + 4 bytes for emoji
+    }
+
+    #[test]
+    fn test_batched_text_run_append_zero_width_char() {
+        let style = TextRun {
+            len: 1,
+            font: font("Helvetica"),
+            color: Hsla::red(),
+            ..Default::default()
+        };
+
+        let font_size = AbsoluteLength::Pixels(px(12.0));
+        let mut batch = BatchedTextRun::new_from_char(AlacPoint::new(0, 0), 'x', style, font_size);
+
+        let combining = '\u{0301}';
+        batch.append_zero_width_chars(&[combining]);
+
+        assert_eq!(batch.text, format!("x{}", combining));
+        assert_eq!(batch.cell_count, 1);
+        assert_eq!(batch.style.len, 1 + combining.len_utf8());
+    }
+
+    #[test]
+    fn test_background_region_can_merge() {
+        let color1 = Hsla::red();
+        let color2 = Hsla::blue();
+
+        // Test horizontal merging
+        let mut region1 = BackgroundRegion::new(0, 0, color1);
+        region1.end_col = 5;
+        let region2 = BackgroundRegion::new(0, 6, color1);
+        assert!(region1.can_merge_with(&region2));
+
+        // Test vertical merging with same column span
+        let mut region3 = BackgroundRegion::new(0, 0, color1);
+        region3.end_col = 5;
+        let mut region4 = BackgroundRegion::new(1, 0, color1);
+        region4.end_col = 5;
+        assert!(region3.can_merge_with(&region4));
+
+        // Test cannot merge different colors
+        let region5 = BackgroundRegion::new(0, 0, color1);
+        let region6 = BackgroundRegion::new(0, 1, color2);
+        assert!(!region5.can_merge_with(&region6));
+
+        // Test cannot merge non-adjacent regions
+        let region7 = BackgroundRegion::new(0, 0, color1);
+        let region8 = BackgroundRegion::new(0, 2, color1);
+        assert!(!region7.can_merge_with(&region8));
+
+        // Test cannot merge vertical regions with different column spans
+        let mut region9 = BackgroundRegion::new(0, 0, color1);
+        region9.end_col = 5;
+        let mut region10 = BackgroundRegion::new(1, 0, color1);
+        region10.end_col = 6;
+        assert!(!region9.can_merge_with(&region10));
+    }
+
+    #[test]
+    fn test_background_region_merge() {
+        let color = Hsla::red();
+
+        // Test horizontal merge
+        let mut region1 = BackgroundRegion::new(0, 0, color);
+        region1.end_col = 5;
+        let mut region2 = BackgroundRegion::new(0, 6, color);
+        region2.end_col = 10;
+        region1.merge_with(&region2);
+        assert_eq!(region1.start_col, 0);
+        assert_eq!(region1.end_col, 10);
+        assert_eq!(region1.start_line, 0);
+        assert_eq!(region1.end_line, 0);
+
+        // Test vertical merge
+        let mut region3 = BackgroundRegion::new(0, 0, color);
+        region3.end_col = 5;
+        let mut region4 = BackgroundRegion::new(1, 0, color);
+        region4.end_col = 5;
+        region3.merge_with(&region4);
+        assert_eq!(region3.start_col, 0);
+        assert_eq!(region3.end_col, 5);
+        assert_eq!(region3.start_line, 0);
+        assert_eq!(region3.end_line, 1);
+    }
+
+    #[test]
+    fn test_merge_background_regions() {
+        let color = Hsla::red();
+
+        // Test merging multiple adjacent regions
+        let regions = vec![
+            BackgroundRegion::new(0, 0, color),
+            BackgroundRegion::new(0, 1, color),
+            BackgroundRegion::new(0, 2, color),
+            BackgroundRegion::new(1, 0, color),
+            BackgroundRegion::new(1, 1, color),
+            BackgroundRegion::new(1, 2, color),
+        ];
+
+        let merged = merge_background_regions(regions);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].start_line, 0);
+        assert_eq!(merged[0].end_line, 1);
+        assert_eq!(merged[0].start_col, 0);
+        assert_eq!(merged[0].end_col, 2);
+
+        // Test with non-mergeable regions
+        let color2 = Hsla::blue();
+        let regions2 = vec![
+            BackgroundRegion::new(0, 0, color),
+            BackgroundRegion::new(0, 2, color),  // Gap at column 1
+            BackgroundRegion::new(1, 0, color2), // Different color
+        ];
+
+        let merged2 = merge_background_regions(regions2);
+        assert_eq!(merged2.len(), 3);
+    }
+
+    #[test]
+    fn test_screen_position_filtering_with_positive_lines() {
+        // Test the unified screen-position-based filtering approach.
+        // This works for both Scrollable and Inline modes because we filter
+        // by enumerated line group index, not by cell.point.line values.
+        use itertools::Itertools;
+        use terminal::IndexedCell;
+        use terminal::alacritty_terminal::index::{Column, Line, Point as AlacPoint};
+        use terminal::alacritty_terminal::term::cell::Cell;
+
+        // Create mock cells for lines 0-23 (typical terminal with 24 visible lines)
+        let mut cells = Vec::new();
+        for line in 0..24i32 {
+            for col in 0..3i32 {
+                cells.push(IndexedCell {
+                    point: AlacPoint::new(Line(line), Column(col as usize)),
+                    cell: Cell::default(),
+                });
+            }
+        }
+
+        // Scenario: Terminal partially scrolled above viewport
+        // First 5 lines (0-4) are clipped, lines 5-15 should be visible
+        let rows_above_viewport = 5usize;
+        let visible_row_count = 11usize;
+
+        // Apply the same filtering logic as in the render code
+        let filtered: Vec<_> = cells
+            .iter()
+            .chunk_by(|c| c.point.line)
+            .into_iter()
+            .skip(rows_above_viewport)
+            .take(visible_row_count)
+            .flat_map(|(_, line_cells)| line_cells)
+            .collect();
+
+        // Should have lines 5-15 (11 lines * 3 cells each = 33 cells)
+        assert_eq!(filtered.len(), 11 * 3, "Should have 33 cells for 11 lines");
+
+        // First filtered cell should be line 5
+        assert_eq!(
+            filtered.first().unwrap().point.line,
+            Line(5),
+            "First cell should be on line 5"
+        );
+
+        // Last filtered cell should be line 15
+        assert_eq!(
+            filtered.last().unwrap().point.line,
+            Line(15),
+            "Last cell should be on line 15"
+        );
+    }
+
+    #[test]
+    fn test_screen_position_filtering_with_negative_lines() {
+        // This is the key test! In Scrollable mode, cells have NEGATIVE line numbers
+        // for scrollback history. The screen-position filtering approach works because
+        // we filter by enumerated line group index, not by cell.point.line values.
+        use itertools::Itertools;
+        use terminal::IndexedCell;
+        use terminal::alacritty_terminal::index::{Column, Line, Point as AlacPoint};
+        use terminal::alacritty_terminal::term::cell::Cell;
+
+        // Simulate cells from a scrolled terminal with scrollback
+        // These have negative line numbers representing scrollback history
+        let mut scrollback_cells = Vec::new();
+        for line in -588i32..=-578i32 {
+            for col in 0..80i32 {
+                scrollback_cells.push(IndexedCell {
+                    point: AlacPoint::new(Line(line), Column(col as usize)),
+                    cell: Cell::default(),
+                });
+            }
+        }
+
+        // Scenario: First 3 screen rows clipped, show next 5 rows
+        let rows_above_viewport = 3usize;
+        let visible_row_count = 5usize;
+
+        // Apply the same filtering logic as in the render code
+        let filtered: Vec<_> = scrollback_cells
+            .iter()
+            .chunk_by(|c| c.point.line)
+            .into_iter()
+            .skip(rows_above_viewport)
+            .take(visible_row_count)
+            .flat_map(|(_, line_cells)| line_cells)
+            .collect();
+
+        // Should have 5 lines * 80 cells = 400 cells
+        assert_eq!(filtered.len(), 5 * 80, "Should have 400 cells for 5 lines");
+
+        // First filtered cell should be line -585 (skipped 3 lines from -588)
+        assert_eq!(
+            filtered.first().unwrap().point.line,
+            Line(-585),
+            "First cell should be on line -585"
+        );
+
+        // Last filtered cell should be line -581 (5 lines: -585, -584, -583, -582, -581)
+        assert_eq!(
+            filtered.last().unwrap().point.line,
+            Line(-581),
+            "Last cell should be on line -581"
+        );
+    }
+
+    #[test]
+    fn test_screen_position_filtering_skip_all() {
+        // Test what happens when we skip more rows than exist
+        use itertools::Itertools;
+        use terminal::IndexedCell;
+        use terminal::alacritty_terminal::index::{Column, Line, Point as AlacPoint};
+        use terminal::alacritty_terminal::term::cell::Cell;
+
+        let mut cells = Vec::new();
+        for line in 0..10i32 {
+            cells.push(IndexedCell {
+                point: AlacPoint::new(Line(line), Column(0)),
+                cell: Cell::default(),
+            });
+        }
+
+        // Skip more rows than exist
+        let rows_above_viewport = 100usize;
+        let visible_row_count = 5usize;
+
+        let filtered: Vec<_> = cells
+            .iter()
+            .chunk_by(|c| c.point.line)
+            .into_iter()
+            .skip(rows_above_viewport)
+            .take(visible_row_count)
+            .flat_map(|(_, line_cells)| line_cells)
+            .collect();
+
+        assert_eq!(
+            filtered.len(),
+            0,
+            "Should have no cells when all are skipped"
+        );
+    }
+
+    #[test]
+    fn test_layout_grid_positioning_math() {
+        // Test the math that layout_grid uses for positioning.
+        // When we skip N rows, we pass N as start_line_offset to layout_grid,
+        // which positions the first visible line at screen row N.
+
+        // Scenario: Terminal at y=-100px, line_height=20px
+        // First 5 screen rows are above viewport (clipped)
+        // So we skip 5 rows and pass offset=5 to layout_grid
+
+        let terminal_origin_y = -100.0f32;
+        let line_height = 20.0f32;
+        let rows_skipped = 5;
+
+        // The first visible line (at offset 5) renders at:
+        // y = terminal_origin + offset * line_height = -100 + 5*20 = 0
+        let first_visible_y = terminal_origin_y + rows_skipped as f32 * line_height;
+        assert_eq!(
+            first_visible_y, 0.0,
+            "First visible line should be at viewport top (y=0)"
+        );
+
+        // The 6th visible line (at offset 10) renders at:
+        let sixth_visible_y = terminal_origin_y + (rows_skipped + 5) as f32 * line_height;
+        assert_eq!(
+            sixth_visible_y, 100.0,
+            "6th visible line should be at y=100"
+        );
+    }
+
+    #[test]
+    fn test_unified_filtering_works_for_both_modes() {
+        // This test proves that the unified screen-position filtering approach
+        // works for BOTH positive line numbers (Inline mode) and negative line
+        // numbers (Scrollable mode with scrollback).
+        //
+        // The key insight: we filter by enumerated line group index (screen position),
+        // not by cell.point.line values. This makes the filtering agnostic to the
+        // actual line numbers in the cells.
+        use itertools::Itertools;
+        use terminal::IndexedCell;
+        use terminal::alacritty_terminal::index::{Column, Line, Point as AlacPoint};
+        use terminal::alacritty_terminal::term::cell::Cell;
+
+        // Test with positive line numbers (Inline mode style)
+        let positive_cells: Vec<_> = (0..10i32)
+            .flat_map(|line| {
+                (0..3i32).map(move |col| IndexedCell {
+                    point: AlacPoint::new(Line(line), Column(col as usize)),
+                    cell: Cell::default(),
+                })
+            })
+            .collect();
+
+        // Test with negative line numbers (Scrollable mode with scrollback)
+        let negative_cells: Vec<_> = (-10i32..0i32)
+            .flat_map(|line| {
+                (0..3i32).map(move |col| IndexedCell {
+                    point: AlacPoint::new(Line(line), Column(col as usize)),
+                    cell: Cell::default(),
+                })
+            })
+            .collect();
+
+        let rows_to_skip = 3usize;
+        let rows_to_take = 4usize;
+
+        // Filter positive cells
+        let positive_filtered: Vec<_> = positive_cells
+            .iter()
+            .chunk_by(|c| c.point.line)
+            .into_iter()
+            .skip(rows_to_skip)
+            .take(rows_to_take)
+            .flat_map(|(_, cells)| cells)
+            .collect();
+
+        // Filter negative cells
+        let negative_filtered: Vec<_> = negative_cells
+            .iter()
+            .chunk_by(|c| c.point.line)
+            .into_iter()
+            .skip(rows_to_skip)
+            .take(rows_to_take)
+            .flat_map(|(_, cells)| cells)
+            .collect();
+
+        // Both should have same count: 4 lines * 3 cells = 12
+        assert_eq!(positive_filtered.len(), 12);
+        assert_eq!(negative_filtered.len(), 12);
+
+        // Positive: lines 3, 4, 5, 6
+        assert_eq!(positive_filtered.first().unwrap().point.line, Line(3));
+        assert_eq!(positive_filtered.last().unwrap().point.line, Line(6));
+
+        // Negative: lines -7, -6, -5, -4
+        assert_eq!(negative_filtered.first().unwrap().point.line, Line(-7));
+        assert_eq!(negative_filtered.last().unwrap().point.line, Line(-4));
     }
 }

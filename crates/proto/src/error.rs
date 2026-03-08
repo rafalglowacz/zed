@@ -22,12 +22,14 @@
 /// When handling an error you can use .error_code() to match which error it was
 /// and .error_tag() to read any tags.
 ///
-/// ```
+/// ```ignore
+/// use proto::{ErrorCode, ErrorExt};
+///
 /// match err.error_code() {
-///   ErrorCode::Forbidden => alert("I'm sorry I can't do that.")
+///   ErrorCode::Forbidden => alert("I'm sorry I can't do that."),
 ///   ErrorCode::WrongReleaseChannel =>
-///     alert(format!("You need to be on the {} release channel.", err.error_tag("required").unwrap()))
-///   ErrorCode::Internal => alert("Sorry, something went wrong")
+///     alert(format!("You need to be on the {} release channel.", err.error_tag("required").unwrap())),
+///   ErrorCode::Internal => alert("Sorry, something went wrong"),
 /// }
 /// ```
 ///
@@ -124,7 +126,7 @@ impl ErrorExt for anyhow::Error {
         if let Some(rpc_error) = self.downcast_ref::<RpcError>() {
             rpc_error.cloned()
         } else {
-            anyhow::anyhow!("{}", self)
+            anyhow::anyhow!("{self:#}")
         }
     }
 }
@@ -134,7 +136,7 @@ impl From<ErrorCode> for anyhow::Error {
         RpcError {
             request: None,
             code: value,
-            msg: format!("{:?}", value).to_string(),
+            msg: format!("{:?}", value),
             tags: Default::default(),
         }
         .into()
@@ -157,6 +159,12 @@ pub struct RpcError {
 /// in the app; however it is useful for chaining .message() and .with_tag() on
 /// ErrorCode.
 impl RpcError {
+    /// Returns the raw server-provided error message without any RPC framing
+    /// (e.g. without the "RPC request X failed: " prefix that `Display` adds).
+    pub fn raw_message(&self) -> &str {
+        &self.msg
+    }
+
     /// from_proto converts a crate::Error into an anyhow::Error containing
     /// an RpcError.
     pub fn from_proto(error: &crate::Error, request: &str) -> anyhow::Error {
@@ -190,10 +198,10 @@ impl ErrorExt for RpcError {
     fn error_tag(&self, k: &str) -> Option<&str> {
         for tag in &self.tags {
             let mut parts = tag.split('=');
-            if let Some(key) = parts.next() {
-                if key == k {
-                    return parts.next();
-                }
+            if let Some(key) = parts.next()
+                && key == k
+            {
+                return parts.next();
             }
         }
         None
@@ -241,7 +249,7 @@ impl From<ErrorCode> for RpcError {
         RpcError {
             request: None,
             code,
-            msg: format!("{:?}", code).to_string(),
+            msg: format!("{:?}", code),
             tags: Default::default(),
         }
     }

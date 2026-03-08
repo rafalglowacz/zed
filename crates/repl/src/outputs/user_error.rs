@@ -1,20 +1,21 @@
-use gpui::{AnyElement, FontWeight, View, WindowContext};
-use ui::{h_flex, prelude::*, v_flex, Label};
+use gpui::{AnyElement, App, Entity, FontWeight, Window};
+use ui::{Label, h_flex, prelude::*, v_flex};
 
 use crate::outputs::plain::TerminalOutput;
 
 /// Userspace error from the kernel
+#[derive(Clone)]
 pub struct ErrorView {
     pub ename: String,
     pub evalue: String,
-    pub traceback: View<TerminalOutput>,
+    pub traceback: Entity<TerminalOutput>,
 }
 
 impl ErrorView {
-    pub fn render(&self, cx: &mut WindowContext) -> Option<AnyElement> {
+    pub fn render(&self, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
         let theme = cx.theme();
 
-        let padding = cx.line_height() / 2.;
+        let padding = window.line_height() / 2.;
 
         Some(
             v_flex()
@@ -24,15 +25,10 @@ impl ErrorView {
                         .font_buffer(cx)
                         .child(
                             Label::new(format!("{}: ", self.ename.clone()))
-                                // .size(LabelSize::Large)
                                 .color(Color::Error)
                                 .weight(FontWeight::BOLD),
                         )
-                        .child(
-                            Label::new(self.evalue.clone())
-                                // .size(LabelSize::Large)
-                                .weight(FontWeight::BOLD),
-                        ),
+                        .child(Label::new(self.evalue.clone()).weight(FontWeight::BOLD)),
                 )
                 .child(
                     div()

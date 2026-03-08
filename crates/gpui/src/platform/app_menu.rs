@@ -1,5 +1,4 @@
-use crate::{Action, AppContext, Platform, SharedString};
-use util::ResultExt;
+use crate::{Action, App, Platform, SharedString};
 
 /// A menu of the application, either a main menu or a submenu
 pub struct Menu {
@@ -20,6 +19,34 @@ impl Menu {
     }
 }
 
+/// OS menus are menus that are recognized by the operating system
+/// This allows the operating system to provide specialized items for
+/// these menus
+pub struct OsMenu {
+    /// The name of the menu
+    pub name: SharedString,
+
+    /// The type of menu
+    pub menu_type: SystemMenuType,
+}
+
+impl OsMenu {
+    /// Create an OwnedOsMenu from this OsMenu
+    pub fn owned(self) -> OwnedOsMenu {
+        OwnedOsMenu {
+            name: self.name.to_string().into(),
+            menu_type: self.menu_type,
+        }
+    }
+}
+
+/// The type of system menu
+#[derive(Copy, Clone, Eq, PartialEq)]
+pub enum SystemMenuType {
+    /// The 'Services' menu in the Application menu on macOS
+    Services,
+}
+
 /// The different kinds of items that can be in a menu
 pub enum MenuItem {
     /// A separator between items
@@ -28,17 +55,23 @@ pub enum MenuItem {
     /// A submenu
     Submenu(Menu),
 
+    /// A menu, managed by the system (for example, the Services menu on macOS)
+    SystemMenu(OsMenu),
+
     /// An action that can be performed
     Action {
         /// The name of this menu item
         name: SharedString,
 
-        /// the action to perform when this menu item is selected
+        /// The action to perform when this menu item is selected
         action: Box<dyn Action>,
 
         /// The OS Action that corresponds to this action, if any
         /// See [`OsAction`] for more information
         os_action: Option<OsAction>,
+
+        /// Whether this action is checked
+        checked: bool,
     },
 }
 
@@ -53,12 +86,21 @@ impl MenuItem {
         Self::Submenu(menu)
     }
 
+    /// Creates a new submenu that is populated by the OS
+    pub fn os_submenu(name: impl Into<SharedString>, menu_type: SystemMenuType) -> Self {
+        Self::SystemMenu(OsMenu {
+            name: name.into(),
+            menu_type,
+        })
+    }
+
     /// Creates a new menu item that invokes an action
     pub fn action(name: impl Into<SharedString>, action: impl Action) -> Self {
         Self::Action {
             name: name.into(),
             action: Box::new(action),
             os_action: None,
+            checked: false,
         }
     }
 
@@ -72,6 +114,7 @@ impl MenuItem {
             name: name.into(),
             action: Box::new(action),
             os_action: Some(os_action),
+            checked: false,
         }
     }
 
@@ -84,13 +127,48 @@ impl MenuItem {
                 name,
                 action,
                 os_action,
+                checked,
             } => OwnedMenuItem::Action {
                 name: name.into(),
                 action,
                 os_action,
+                checked,
             },
+            MenuItem::SystemMenu(os_menu) => OwnedMenuItem::SystemMenu(os_menu.owned()),
         }
     }
+
+    /// Set whether this menu item is checked
+    ///
+    /// Only for [`MenuItem::Action`], otherwise, will be ignored
+    pub fn checked(mut self, checked: bool) -> Self {
+        match self {
+            MenuItem::Action {
+                action,
+                os_action,
+                name,
+                ..
+            } => MenuItem::Action {
+                name,
+                action,
+                os_action,
+                checked,
+            },
+            _ => self,
+        }
+    }
+}
+
+/// OS menus are menus that are recognized by the operating system
+/// This allows the operating system to provide specialized items for
+/// these menus
+#[derive(Clone)]
+pub struct OwnedOsMenu {
+    /// The name of the menu
+    pub name: SharedString,
+
+    /// The type of menu
+    pub menu_type: SystemMenuType,
 }
 
 /// A menu of the application, either a main menu or a submenu
@@ -111,17 +189,23 @@ pub enum OwnedMenuItem {
     /// A submenu
     Submenu(OwnedMenu),
 
+    /// A menu, managed by the system (for example, the Services menu on macOS)
+    SystemMenu(OwnedOsMenu),
+
     /// An action that can be performed
     Action {
         /// The name of this menu item
         name: String,
 
-        /// the action to perform when this menu item is selected
+        /// The action to perform when this menu item is selected
         action: Box<dyn Action>,
 
         /// The OS Action that corresponds to this action, if any
         /// See [`OsAction`] for more information
         os_action: Option<OsAction>,
+
+        /// Whether this action is checked
+        checked: bool,
     },
 }
 
@@ -134,11 +218,14 @@ impl Clone for OwnedMenuItem {
                 name,
                 action,
                 os_action,
+                checked,
             } => OwnedMenuItem::Action {
                 name: name.clone(),
                 action: action.boxed_clone(),
                 os_action: *os_action,
+                checked: *checked,
             },
+            OwnedMenuItem::SystemMenu(os_menu) => OwnedMenuItem::SystemMenu(os_menu.clone()),
         }
     }
 }
@@ -171,18 +258,22 @@ pub enum OsAction {
     Redo,
 }
 
-pub(crate) fn init_app_menus(platform: &dyn Platform, cx: &AppContext) {
+pub(crate) fn init_app_menus(platform: &dyn Platform, cx: &App) {
     platform.on_will_open_app_menu(Box::new({
         let cx = cx.to_async();
         move || {
-            cx.update(|cx| cx.clear_pending_keystrokes()).ok();
+            if let Some(app) = cx.app.upgrade() {
+                app.borrow_mut().update(|cx| cx.clear_pending_keystrokes());
+            }
         }
     }));
 
     platform.on_validate_app_menu_command(Box::new({
         let cx = cx.to_async();
         move |action| {
-            cx.update(|cx| cx.is_action_available(action))
+            cx.app
+                .upgrade()
+                .map(|app| app.borrow_mut().update(|cx| cx.is_action_available(action)))
                 .unwrap_or(false)
         }
     }));
@@ -190,7 +281,9 @@ pub(crate) fn init_app_menus(platform: &dyn Platform, cx: &AppContext) {
     platform.on_app_menu_action(Box::new({
         let cx = cx.to_async();
         move |action| {
-            cx.update(|cx| cx.dispatch_action(action)).log_err();
+            if let Some(app) = cx.app.upgrade() {
+                app.borrow_mut().update(|cx| cx.dispatch_action(action));
+            }
         }
     }));
 }

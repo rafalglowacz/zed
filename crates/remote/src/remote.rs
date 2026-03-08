@@ -1,9 +1,23 @@
 pub mod json_log;
 pub mod protocol;
 pub mod proxy;
-pub mod ssh_session;
+pub mod remote_client;
+mod transport;
 
-pub use ssh_session::{
-    ConnectionState, SshClientDelegate, SshConnectionOptions, SshPlatform, SshRemoteClient,
-    SshRemoteEvent,
+#[cfg(target_os = "windows")]
+pub use remote_client::OpenWslPath;
+pub use remote_client::{
+    CommandTemplate, ConnectionIdentifier, ConnectionState, Interactive, RemoteArch, RemoteClient,
+    RemoteClientDelegate, RemoteClientEvent, RemoteConnection, RemoteConnectionOptions, RemoteOs,
+    RemotePlatform, connect,
+};
+pub use transport::docker::DockerConnectionOptions;
+pub use transport::ssh::{SshConnectionOptions, SshPortForwardOption};
+pub use transport::wsl::WslConnectionOptions;
+#[cfg(target_os = "windows")]
+pub use transport::wsl::wsl_path_to_windows_path;
+
+#[cfg(any(test, feature = "test-support"))]
+pub use transport::mock::{
+    MockConnection, MockConnectionOptions, MockConnectionRegistry, MockDelegate,
 };

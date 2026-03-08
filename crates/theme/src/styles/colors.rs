@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 
-use gpui::{Hsla, SharedString, WindowBackgroundAppearance, WindowContext};
+use gpui::{App, Hsla, SharedString, WindowBackgroundAppearance};
 use refineable::Refineable;
 use std::sync::Arc;
 use strum::{AsRefStr, EnumIter, IntoEnumIterator};
@@ -43,7 +43,7 @@ pub struct ThemeColors {
     pub element_hover: Hsla,
     /// Background Color. Used for the active state of an element that should have a different background than the surface it's on.
     ///
-    /// Active states are triggered by the mouse button being pressed down on an element, or the Return button or other activator being pressd.
+    /// Active states are triggered by the mouse button being pressed down on an element, or the Return button or other activator being pressed.
     pub element_active: Hsla,
     /// Background Color. Used for the selected state of an element that should have a different background than the surface it's on.
     ///
@@ -51,14 +51,16 @@ pub struct ThemeColors {
     ///
     /// This could include a selected checkbox, a toggleable button that is toggled on, etc.
     pub element_selected: Hsla,
+    /// Background Color. Used for the background of selections in a UI element.
+    pub element_selection_background: Hsla,
     /// Background Color. Used for the disabled state of an element that should have a different background than the surface it's on.
     ///
     /// Disabled states are shown when a user cannot interact with an element, like a disabled button or input.
     pub element_disabled: Hsla,
     /// Background Color. Used for the area that shows where a dragged element will be dropped.
     pub drop_target_background: Hsla,
-    /// Border Color. Used to show the area that shows where a dragged element will be dropped.
-    // pub drop_target_border: Hsla,
+    /// Border Color. Used for the border that shows where a dragged element will be dropped.
+    pub drop_target_border: Hsla,
     /// Used for the background of a ghost element that should have the same background as the surface it's on.
     ///
     /// Elements might include: Buttons, Inputs, Checkboxes, Radio Buttons...
@@ -71,7 +73,7 @@ pub struct ThemeColors {
     pub ghost_element_hover: Hsla,
     /// Background Color. Used for the active state of a ghost element that should have the same background as the surface it's on.
     ///
-    /// Active states are triggered by the mouse button being pressed down on an element, or the Return button or other activator being pressd.
+    /// Active states are triggered by the mouse button being pressed down on an element, or the Return button or other activator being pressed.
     pub ghost_element_active: Hsla,
     /// Background Color. Used for the selected state of a ghost element that should have the same background as the surface it's on.
     ///
@@ -97,7 +99,7 @@ pub struct ThemeColors {
     pub icon: Hsla,
     /// Fill Color. Used for the muted or deemphasized fill color of an icon.
     ///
-    /// This might be used to show an icon in an inactive pane, or to demphasize a series of icons to give them less visual weight.
+    /// This might be used to show an icon in an inactive pane, or to deemphasize a series of icons to give them less visual weight.
     pub icon_muted: Hsla,
     /// Fill Color. Used for the disabled fill color of an icon.
     ///
@@ -111,6 +113,9 @@ pub struct ThemeColors {
     ///
     /// This might be used to show when a toggleable icon button is selected.
     pub icon_accent: Hsla,
+    /// Color used to accent some debugger elements
+    /// Is used by breakpoints
+    pub debugger_accent: Hsla,
 
     // ===
     // UI Elements
@@ -123,41 +128,93 @@ pub struct ThemeColors {
     pub tab_inactive_background: Hsla,
     pub tab_active_background: Hsla,
     pub search_match_background: Hsla,
+    pub search_active_match_background: Hsla,
     pub panel_background: Hsla,
     pub panel_focused_border: Hsla,
     pub panel_indent_guide: Hsla,
     pub panel_indent_guide_hover: Hsla,
     pub panel_indent_guide_active: Hsla,
+
+    /// The color of the overlay surface on top of panel.
+    pub panel_overlay_background: Hsla,
+    /// The color of the overlay surface on top of panel when hovered over.
+    pub panel_overlay_hover: Hsla,
+
     pub pane_focused_border: Hsla,
     pub pane_group_border: Hsla,
     /// The color of the scrollbar thumb.
     pub scrollbar_thumb_background: Hsla,
     /// The color of the scrollbar thumb when hovered over.
     pub scrollbar_thumb_hover_background: Hsla,
+    /// The color of the scrollbar thumb whilst being actively dragged.
+    pub scrollbar_thumb_active_background: Hsla,
     /// The border color of the scrollbar thumb.
     pub scrollbar_thumb_border: Hsla,
     /// The background color of the scrollbar track.
     pub scrollbar_track_background: Hsla,
     /// The border color of the scrollbar track.
     pub scrollbar_track_border: Hsla,
-    // /// The opacity of the scrollbar status marks, like diagnostic states and git status.
-    // todo()
-    // pub scrollbar_status_opacity: Hsla,
+    /// The color of the minimap thumb.
+    pub minimap_thumb_background: Hsla,
+    /// The color of the minimap thumb when hovered over.
+    pub minimap_thumb_hover_background: Hsla,
+    /// The color of the minimap thumb whilst being actively dragged.
+    pub minimap_thumb_active_background: Hsla,
+    /// The border color of the minimap thumb.
+    pub minimap_thumb_border: Hsla,
+
+    /// Background color for Vim Normal mode indicator.
+    pub vim_normal_background: Hsla,
+    /// Background color for Vim Insert mode indicator.
+    pub vim_insert_background: Hsla,
+    /// Background color for Vim Replace mode indicator.
+    pub vim_replace_background: Hsla,
+    /// Background color for Vim Visual mode indicator.
+    pub vim_visual_background: Hsla,
+    /// Background color for Vim Visual Line mode indicator.
+    pub vim_visual_line_background: Hsla,
+    /// Background color for Vim Visual Block mode indicator.
+    pub vim_visual_block_background: Hsla,
+    /// Background color for Vim yank highlight.
+    pub vim_yank_background: Hsla,
+    /// Background color for Vim Helix Normal mode indicator.
+    pub vim_helix_normal_background: Hsla,
+    /// Background color for Vim Helix Select mode indicator.
+    pub vim_helix_select_background: Hsla,
+    /// Foreground color for Vim Normal mode indicator.
+    pub vim_normal_foreground: Hsla,
+    /// Foreground color for Vim Insert mode indicator.
+    pub vim_insert_foreground: Hsla,
+    /// Foreground color for Vim Replace mode indicator.
+    pub vim_replace_foreground: Hsla,
+    /// Foreground color for Vim Visual mode indicator.
+    pub vim_visual_foreground: Hsla,
+    /// Foreground color for Vim Visual Line mode indicator.
+    pub vim_visual_line_foreground: Hsla,
+    /// Foreground color for Vim Visual Block mode indicator.
+    pub vim_visual_block_foreground: Hsla,
+    /// Foreground color for Vim Helix Normal mode indicator.
+    pub vim_helix_normal_foreground: Hsla,
+    /// Foreground color for Vim Helix Select mode indicator.
+    pub vim_helix_select_foreground: Hsla,
 
     // ===
     // Editor
     // ===
     pub editor_foreground: Hsla,
     pub editor_background: Hsla,
-    // pub editor_inactive_background: Hsla,
     pub editor_gutter_background: Hsla,
     pub editor_subheader_background: Hsla,
     pub editor_active_line_background: Hsla,
     pub editor_highlighted_line_background: Hsla,
+    /// Line color of the line a debugger is currently stopped at
+    pub editor_debugger_active_line_background: Hsla,
     /// Text Color. Used for the text of the line number in the editor gutter.
     pub editor_line_number: Hsla,
     /// Text Color. Used for the text of the line number in the editor gutter when the line is highlighted.
     pub editor_active_line_number: Hsla,
+    /// Text Color. Used for the text of the line number in the editor gutter when the line is hovered over.
+    pub editor_hover_line_number: Hsla,
     /// Text Color. Used to mark invisible characters in the editor.
     ///
     /// Example: spaces, tabs, carriage returns, etc.
@@ -245,10 +302,29 @@ pub struct ThemeColors {
     /// Dim white ANSI terminal color.
     pub terminal_ansi_dim_white: Hsla,
 
-    // ===
-    // UI/Rich Text
-    // ===
+    /// Represents a link text hover color.
     pub link_text_hover: Hsla,
+
+    /// Represents an added entry or hunk in vcs, like git.
+    pub version_control_added: Hsla,
+    /// Represents a deleted entry in version control systems.
+    pub version_control_deleted: Hsla,
+    /// Represents a modified entry in version control systems.
+    pub version_control_modified: Hsla,
+    /// Represents a renamed entry in version control systems.
+    pub version_control_renamed: Hsla,
+    /// Represents a conflicting entry in version control systems.
+    pub version_control_conflict: Hsla,
+    /// Represents an ignored entry in version control systems.
+    pub version_control_ignored: Hsla,
+    /// Represents an added word in a word diff.
+    pub version_control_word_added: Hsla,
+    /// Represents a deleted word in a word diff.
+    pub version_control_word_deleted: Hsla,
+    /// Represents the "ours" region of a merge conflict.
+    pub version_control_conflict_marker_ours: Hsla,
+    /// Represents the "theirs" region of a merge conflict.
+    pub version_control_conflict_marker_theirs: Hsla,
 }
 
 #[derive(EnumIter, Debug, Clone, Copy, AsRefStr)]
@@ -269,6 +345,7 @@ pub enum ThemeColorField {
     ElementSelected,
     ElementDisabled,
     DropTargetBackground,
+    DropTargetBorder,
     GhostElementBackground,
     GhostElementHover,
     GhostElementActive,
@@ -292,18 +369,26 @@ pub enum ThemeColorField {
     TabInactiveBackground,
     TabActiveBackground,
     SearchMatchBackground,
+    SearchActiveMatchBackground,
     PanelBackground,
     PanelFocusedBorder,
     PanelIndentGuide,
     PanelIndentGuideHover,
     PanelIndentGuideActive,
+    PanelOverlayBackground,
+    PanelOverlayHover,
     PaneFocusedBorder,
     PaneGroupBorder,
     ScrollbarThumbBackground,
     ScrollbarThumbHoverBackground,
+    ScrollbarThumbActiveBackground,
     ScrollbarThumbBorder,
     ScrollbarTrackBackground,
     ScrollbarTrackBorder,
+    MinimapThumbBackground,
+    MinimapThumbHoverBackground,
+    MinimapThumbActiveBackground,
+    MinimapThumbBorder,
     EditorForeground,
     EditorBackground,
     EditorGutterBackground,
@@ -350,6 +435,12 @@ pub enum ThemeColorField {
     TerminalAnsiBrightWhite,
     TerminalAnsiDimWhite,
     LinkTextHover,
+    VersionControlAdded,
+    VersionControlDeleted,
+    VersionControlModified,
+    VersionControlRenamed,
+    VersionControlConflict,
+    VersionControlIgnored,
 }
 
 impl ThemeColors {
@@ -370,6 +461,7 @@ impl ThemeColors {
             ThemeColorField::ElementSelected => self.element_selected,
             ThemeColorField::ElementDisabled => self.element_disabled,
             ThemeColorField::DropTargetBackground => self.drop_target_background,
+            ThemeColorField::DropTargetBorder => self.drop_target_border,
             ThemeColorField::GhostElementBackground => self.ghost_element_background,
             ThemeColorField::GhostElementHover => self.ghost_element_hover,
             ThemeColorField::GhostElementActive => self.ghost_element_active,
@@ -393,18 +485,28 @@ impl ThemeColors {
             ThemeColorField::TabInactiveBackground => self.tab_inactive_background,
             ThemeColorField::TabActiveBackground => self.tab_active_background,
             ThemeColorField::SearchMatchBackground => self.search_match_background,
+            ThemeColorField::SearchActiveMatchBackground => self.search_active_match_background,
             ThemeColorField::PanelBackground => self.panel_background,
             ThemeColorField::PanelFocusedBorder => self.panel_focused_border,
             ThemeColorField::PanelIndentGuide => self.panel_indent_guide,
             ThemeColorField::PanelIndentGuideHover => self.panel_indent_guide_hover,
             ThemeColorField::PanelIndentGuideActive => self.panel_indent_guide_active,
+            ThemeColorField::PanelOverlayBackground => self.panel_overlay_background,
+            ThemeColorField::PanelOverlayHover => self.panel_overlay_hover,
             ThemeColorField::PaneFocusedBorder => self.pane_focused_border,
             ThemeColorField::PaneGroupBorder => self.pane_group_border,
             ThemeColorField::ScrollbarThumbBackground => self.scrollbar_thumb_background,
             ThemeColorField::ScrollbarThumbHoverBackground => self.scrollbar_thumb_hover_background,
+            ThemeColorField::ScrollbarThumbActiveBackground => {
+                self.scrollbar_thumb_active_background
+            }
             ThemeColorField::ScrollbarThumbBorder => self.scrollbar_thumb_border,
             ThemeColorField::ScrollbarTrackBackground => self.scrollbar_track_background,
             ThemeColorField::ScrollbarTrackBorder => self.scrollbar_track_border,
+            ThemeColorField::MinimapThumbBackground => self.minimap_thumb_background,
+            ThemeColorField::MinimapThumbHoverBackground => self.minimap_thumb_hover_background,
+            ThemeColorField::MinimapThumbActiveBackground => self.minimap_thumb_active_background,
+            ThemeColorField::MinimapThumbBorder => self.minimap_thumb_border,
             ThemeColorField::EditorForeground => self.editor_foreground,
             ThemeColorField::EditorBackground => self.editor_background,
             ThemeColorField::EditorGutterBackground => self.editor_gutter_background,
@@ -459,6 +561,12 @@ impl ThemeColors {
             ThemeColorField::TerminalAnsiBrightWhite => self.terminal_ansi_bright_white,
             ThemeColorField::TerminalAnsiDimWhite => self.terminal_ansi_dim_white,
             ThemeColorField::LinkTextHover => self.link_text_hover,
+            ThemeColorField::VersionControlAdded => self.version_control_added,
+            ThemeColorField::VersionControlDeleted => self.version_control_deleted,
+            ThemeColorField::VersionControlModified => self.version_control_modified,
+            ThemeColorField::VersionControlRenamed => self.version_control_renamed,
+            ThemeColorField::VersionControlConflict => self.version_control_conflict,
+            ThemeColorField::VersionControlIgnored => self.version_control_ignored,
         }
     }
 
@@ -471,7 +579,7 @@ impl ThemeColors {
     }
 }
 
-pub fn all_theme_colors(cx: &WindowContext) -> Vec<(Hsla, SharedString)> {
+pub fn all_theme_colors(cx: &mut App) -> Vec<(Hsla, SharedString)> {
     let theme = cx.theme();
     ThemeColorField::iter()
         .map(|field| {
@@ -482,7 +590,7 @@ pub fn all_theme_colors(cx: &WindowContext) -> Vec<(Hsla, SharedString)> {
         .collect()
 }
 
-#[derive(Refineable, Clone, PartialEq)]
+#[derive(Refineable, Clone, Debug, PartialEq)]
 pub struct ThemeStyles {
     /// The background appearance of the window.
     pub window_background_appearance: WindowBackgroundAppearance,

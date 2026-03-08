@@ -1,30 +1,30 @@
 use crate::{
-    display_map::ToDisplayPoint, AnchorRangeExt, Autoscroll, DiffRowHighlight, DisplayPoint,
-    Editor, MultiBuffer, RowExt,
+    AnchorRangeExt, DisplayPoint, Editor, ExcerptId, MultiBuffer, MultiBufferSnapshot, RowExt,
+    display_map::{HighlightKey, ToDisplayPoint},
 };
+use buffer_diff::DiffHunkStatusKind;
 use collections::BTreeMap;
 use futures::Future;
-use git::diff::DiffHunkStatus;
+
+use git::repository::RepoPath;
 use gpui::{
-    AnyWindowHandle, AppContext, Keystroke, ModelContext, Pixels, Point, View, ViewContext,
-    VisualTestContext, WindowHandle,
+    AnyWindowHandle, App, Context, Entity, Focusable as _, Keystroke, Pixels, Point,
+    VisualTestContext, Window, WindowHandle, prelude::*,
 };
 use itertools::Itertools;
 use language::{Buffer, BufferSnapshot, LanguageRegistry};
-use multi_buffer::{ExcerptRange, ToPoint};
+use multi_buffer::{Anchor, ExcerptRange, MultiBufferOffset, MultiBufferRow, PathKey};
 use parking_lot::RwLock;
 use project::{FakeFs, Project};
 use std::{
-    any::TypeId,
     ops::{Deref, DerefMut, Range},
     path::Path,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
-
-use ui::Context;
+use text::Selection;
 use util::{
     assert_set_eq,
     test::{generate_marked_text, marked_text_ranges},
@@ -35,36 +35,54 @@ use super::{build_editor, build_editor_with_project};
 pub struct EditorTestContext {
     pub cx: gpui::VisualTestContext,
     pub window: AnyWindowHandle,
-    pub editor: View<Editor>,
+    pub editor: Entity<Editor>,
     pub assertion_cx: AssertionContextManager,
 }
 
 impl EditorTestContext {
     pub async fn new(cx: &mut gpui::TestAppContext) -> EditorTestContext {
         let fs = FakeFs::new(cx.executor());
-        // fs.insert_file("/file", "".to_owned()).await;
         let root = Self::root_path();
         fs.insert_tree(
             root,
             serde_json::json!({
+                ".git": {},
                 "file": "",
             }),
         )
         .await;
-        let project = Project::test(fs, [root], cx).await;
+        let project = Project::test(fs.clone(), [root], cx).await;
         let buffer = project
             .update(cx, |project, cx| {
                 project.open_local_buffer(root.join("file"), cx)
             })
             .await
             .unwrap();
-        let editor = cx.add_window(|cx| {
-            let editor =
-                build_editor_with_project(project, MultiBuffer::build_from_buffer(buffer, cx), cx);
-            editor.focus(cx);
+
+        let language = project
+            .read_with(cx, |project, _cx| {
+                project.languages().language_for_name("Plain Text")
+            })
+            .await
+            .unwrap();
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_language(Some(language), cx);
+        });
+
+        let editor = cx.add_window(|window, cx| {
+            let editor = build_editor_with_project(
+                project,
+                MultiBuffer::build_from_buffer(buffer, cx),
+                window,
+                cx,
+            );
+
+            window.focus(&editor.focus_handle(cx), cx);
             editor
         });
-        let editor_view = editor.root_view(cx).unwrap();
+        let editor_view = editor.root(cx).unwrap();
+
+        cx.run_until_parked();
         Self {
             cx: VisualTestContext::from_window(*editor.deref(), cx),
             window: editor.into(),
@@ -83,8 +101,18 @@ impl EditorTestContext {
         Path::new("/root")
     }
 
+    pub async fn for_editor_in(editor: Entity<Editor>, cx: &mut gpui::VisualTestContext) -> Self {
+        cx.focus(&editor);
+        Self {
+            window: cx.windows()[0],
+            cx: cx.clone(),
+            editor,
+            assertion_cx: AssertionContextManager::new(),
+        }
+    }
+
     pub async fn for_editor(editor: WindowHandle<Editor>, cx: &mut gpui::TestAppContext) -> Self {
-        let editor_view = editor.root_view(cx).unwrap();
+        let editor_view = editor.root(cx).unwrap();
         Self {
             cx: VisualTestContext::from_window(*editor.deref(), cx),
             window: editor.into(),
@@ -93,34 +121,45 @@ impl EditorTestContext {
         }
     }
 
+    #[track_caller]
     pub fn new_multibuffer<const COUNT: usize>(
         cx: &mut gpui::TestAppContext,
         excerpts: [&str; COUNT],
     ) -> EditorTestContext {
         let mut multibuffer = MultiBuffer::new(language::Capability::ReadWrite);
-        let buffer = cx.new_model(|cx| {
-            for excerpt in excerpts.into_iter() {
+        let buffer = cx.new(|cx| {
+            for (index, excerpt) in excerpts.into_iter().enumerate() {
                 let (text, ranges) = marked_text_ranges(excerpt, false);
-                let buffer = cx.new_model(|cx| Buffer::local(text, cx));
-                multibuffer.push_excerpts(
+                let buffer = cx.new(|cx| Buffer::local(text, cx));
+                let point_ranges: Vec<_> = {
+                    let snapshot = buffer.read(cx);
+                    ranges
+                        .into_iter()
+                        .map(|range| {
+                            snapshot.offset_to_point(range.start)
+                                ..snapshot.offset_to_point(range.end)
+                        })
+                        .collect()
+                };
+                multibuffer.set_excerpts_for_path(
+                    PathKey::sorted(index as u64),
                     buffer,
-                    ranges.into_iter().map(|range| ExcerptRange {
-                        context: range,
-                        primary: None,
-                    }),
+                    point_ranges,
+                    0,
                     cx,
                 );
             }
             multibuffer
         });
 
-        let editor = cx.add_window(|cx| {
-            let editor = build_editor(buffer, cx);
-            editor.focus(cx);
+        let editor = cx.add_window(|window, cx| {
+            let editor = build_editor(buffer, window, cx);
+            window.focus(&editor.focus_handle(cx), cx);
+
             editor
         });
 
-        let editor_view = editor.root_view(cx).unwrap();
+        let editor_view = editor.root(cx).unwrap();
         Self {
             cx: VisualTestContext::from_window(*editor.deref(), cx),
             window: editor.into(),
@@ -131,7 +170,7 @@ impl EditorTestContext {
 
     pub fn condition(
         &self,
-        predicate: impl FnMut(&Editor, &AppContext) -> bool,
+        predicate: impl FnMut(&Editor, &App) -> bool,
     ) -> impl Future<Output = ()> {
         self.editor
             .condition::<crate::EditorEvent>(&self.cx, predicate)
@@ -140,31 +179,32 @@ impl EditorTestContext {
     #[track_caller]
     pub fn editor<F, T>(&mut self, read: F) -> T
     where
-        F: FnOnce(&Editor, &ViewContext<Editor>) -> T,
+        F: FnOnce(&Editor, &Window, &mut Context<Editor>) -> T,
     {
-        self.editor.update(&mut self.cx, |this, cx| read(this, cx))
+        self.editor
+            .update_in(&mut self.cx, |this, window, cx| read(this, window, cx))
     }
 
     #[track_caller]
     pub fn update_editor<F, T>(&mut self, update: F) -> T
     where
-        F: FnOnce(&mut Editor, &mut ViewContext<Editor>) -> T,
+        F: FnOnce(&mut Editor, &mut Window, &mut Context<Editor>) -> T,
     {
-        self.editor.update(&mut self.cx, update)
+        self.editor.update_in(&mut self.cx, update)
     }
 
     pub fn multibuffer<F, T>(&mut self, read: F) -> T
     where
-        F: FnOnce(&MultiBuffer, &AppContext) -> T,
+        F: FnOnce(&MultiBuffer, &App) -> T,
     {
-        self.editor(|editor, cx| read(editor.buffer().read(cx), cx))
+        self.editor(|editor, _, cx| read(editor.buffer().read(cx), cx))
     }
 
     pub fn update_multibuffer<F, T>(&mut self, update: F) -> T
     where
-        F: FnOnce(&mut MultiBuffer, &mut ModelContext<MultiBuffer>) -> T,
+        F: FnOnce(&mut MultiBuffer, &mut Context<MultiBuffer>) -> T,
     {
-        self.update_editor(|editor, cx| editor.buffer().update(cx, update))
+        self.update_editor(|editor, _, cx| editor.buffer().update(cx, update))
     }
 
     pub fn buffer_text(&mut self) -> String {
@@ -172,12 +212,12 @@ impl EditorTestContext {
     }
 
     pub fn display_text(&mut self) -> String {
-        self.update_editor(|editor, cx| editor.display_text(cx))
+        self.update_editor(|editor, _, cx| editor.display_text(cx))
     }
 
     pub fn buffer<F, T>(&mut self, read: F) -> T
     where
-        F: FnOnce(&Buffer, &AppContext) -> T,
+        F: FnOnce(&Buffer, &App) -> T,
     {
         self.multibuffer(|multibuffer, cx| {
             let buffer = multibuffer.as_singleton().unwrap().read(cx);
@@ -186,7 +226,7 @@ impl EditorTestContext {
     }
 
     pub fn language_registry(&mut self) -> Arc<LanguageRegistry> {
-        self.editor(|editor, cx| {
+        self.editor(|editor, _, cx| {
             editor
                 .project
                 .as_ref()
@@ -199,7 +239,7 @@ impl EditorTestContext {
 
     pub fn update_buffer<F, T>(&mut self, update: F) -> T
     where
-        F: FnOnce(&mut Buffer, &mut ModelContext<Buffer>) -> T,
+        F: FnOnce(&mut Buffer, &mut Context<Buffer>) -> T,
     {
         self.update_multibuffer(|multibuffer, cx| {
             let buffer = multibuffer.as_singleton().unwrap();
@@ -230,6 +270,7 @@ impl EditorTestContext {
         self.cx.background_executor.run_until_parked();
     }
 
+    #[track_caller]
     pub fn ranges(&mut self, marked_text: &str) -> Vec<Range<usize>> {
         let (unmarked_text, ranges) = marked_text_ranges(marked_text, false);
         assert_eq!(self.buffer_text(), unmarked_text);
@@ -238,10 +279,10 @@ impl EditorTestContext {
 
     pub fn display_point(&mut self, marked_text: &str) -> DisplayPoint {
         let ranges = self.ranges(marked_text);
-        let snapshot = self
-            .editor
-            .update(&mut self.cx, |editor, cx| editor.snapshot(cx));
-        ranges[0].start.to_display_point(&snapshot)
+        let snapshot = self.editor.update_in(&mut self.cx, |editor, window, cx| {
+            editor.snapshot(window, cx)
+        });
+        MultiBufferOffset(ranges[0].start).to_display_point(&snapshot)
     }
 
     pub fn pixel_position(&mut self, marked_text: &str) -> Point<Pixels> {
@@ -250,19 +291,22 @@ impl EditorTestContext {
     }
 
     pub fn pixel_position_for(&mut self, display_point: DisplayPoint) -> Point<Pixels> {
-        self.update_editor(|editor, cx| {
-            let newest_point = editor.selections.newest_display(cx).head();
+        self.update_editor(|editor, window, cx| {
+            let newest_point = editor
+                .selections
+                .newest_display(&editor.display_snapshot(cx))
+                .head();
             let pixel_position = editor.pixel_position_of_newest_cursor.unwrap();
             let line_height = editor
-                .style()
-                .unwrap()
+                .style(cx)
                 .text
-                .line_height_in_pixels(cx.rem_size());
-            let snapshot = editor.snapshot(cx);
-            let details = editor.text_layout_details(cx);
+                .line_height_in_pixels(window.rem_size());
+            let snapshot = editor.snapshot(window, cx);
+            let details = editor.text_layout_details(window, cx);
 
             let y = pixel_position.y
-                + line_height * (display_point.row().as_f32() - newest_point.row().as_f32());
+                + f32::from(line_height)
+                    * Pixels::from(display_point.row().as_f64() - newest_point.row().as_f64());
             let x = pixel_position.x + snapshot.x_for_display_point(display_point, &details)
                 - snapshot.x_for_display_point(newest_point, &details);
             Point::new(x, y)
@@ -276,8 +320,59 @@ impl EditorTestContext {
         snapshot.anchor_before(ranges[0].start)..snapshot.anchor_after(ranges[0].end)
     }
 
-    pub fn set_diff_base(&mut self, diff_base: Option<&str>) {
-        self.update_buffer(|buffer, cx| buffer.set_diff_base(diff_base.map(ToOwned::to_owned), cx));
+    pub async fn wait_for_autoindent_applied(&mut self) {
+        if let Some(fut) = self.update_buffer(|buffer, _| buffer.wait_for_autoindent_applied()) {
+            fut.await.ok();
+        }
+    }
+
+    pub fn set_head_text(&mut self, diff_base: &str) {
+        self.cx.run_until_parked();
+        let fs =
+            self.update_editor(|editor, _, cx| editor.project().unwrap().read(cx).fs().as_fake());
+        let path = self.update_buffer(|buffer, _| buffer.file().unwrap().path().clone());
+        fs.set_head_for_repo(
+            &Self::root_path().join(".git"),
+            &[(path.as_unix_str(), diff_base.to_string())],
+            "deadbeef",
+        );
+        self.cx.run_until_parked();
+    }
+
+    pub fn clear_index_text(&mut self) {
+        self.cx.run_until_parked();
+        let fs =
+            self.update_editor(|editor, _, cx| editor.project().unwrap().read(cx).fs().as_fake());
+        fs.set_index_for_repo(&Self::root_path().join(".git"), &[]);
+        self.cx.run_until_parked();
+    }
+
+    pub fn set_index_text(&mut self, diff_base: &str) {
+        self.cx.run_until_parked();
+        let fs =
+            self.update_editor(|editor, _, cx| editor.project().unwrap().read(cx).fs().as_fake());
+        let path = self.update_buffer(|buffer, _| buffer.file().unwrap().path().clone());
+        fs.set_index_for_repo(
+            &Self::root_path().join(".git"),
+            &[(path.as_unix_str(), diff_base.to_string())],
+        );
+        self.cx.run_until_parked();
+    }
+
+    #[track_caller]
+    pub fn assert_index_text(&mut self, expected: Option<&str>) {
+        let fs =
+            self.update_editor(|editor, _, cx| editor.project().unwrap().read(cx).fs().as_fake());
+        let path = self.update_buffer(|buffer, _| buffer.file().unwrap().path().clone());
+        let mut found = None;
+        fs.with_git_state(&Self::root_path().join(".git"), false, |git_state| {
+            found = git_state
+                .index_contents
+                .get(&RepoPath::from_rel_path(&path))
+                .cloned();
+        })
+        .unwrap();
+        assert_eq!(expected, found.as_deref());
     }
 
     /// Change the editor's text and selections using a string containing
@@ -288,106 +383,183 @@ impl EditorTestContext {
     /// editor state was needed to cause the failure.
     ///
     /// See the `util::test::marked_text_ranges` function for more information.
+    #[track_caller]
     pub fn set_state(&mut self, marked_text: &str) -> ContextHandle {
         let state_context = self.add_assertion_context(format!(
             "Initial Editor State: \"{}\"",
             marked_text.escape_debug()
         ));
         let (unmarked_text, selection_ranges) = marked_text_ranges(marked_text, true);
-        self.editor.update(&mut self.cx, |editor, cx| {
-            editor.set_text(unmarked_text, cx);
-            editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
-                s.select_ranges(selection_ranges)
+        self.editor.update_in(&mut self.cx, |editor, window, cx| {
+            editor.set_text(unmarked_text, window, cx);
+            editor.change_selections(Default::default(), window, cx, |s| {
+                s.select_ranges(
+                    selection_ranges
+                        .into_iter()
+                        .map(|range| MultiBufferOffset(range.start)..MultiBufferOffset(range.end)),
+                )
             })
         });
         state_context
     }
 
     /// Only change the editor's selections
+    #[track_caller]
     pub fn set_selections_state(&mut self, marked_text: &str) -> ContextHandle {
         let state_context = self.add_assertion_context(format!(
             "Initial Editor State: \"{}\"",
             marked_text.escape_debug()
         ));
         let (unmarked_text, selection_ranges) = marked_text_ranges(marked_text, true);
-        self.editor.update(&mut self.cx, |editor, cx| {
+        self.editor.update_in(&mut self.cx, |editor, window, cx| {
             assert_eq!(editor.text(cx), unmarked_text);
-            editor.change_selections(Some(Autoscroll::fit()), cx, |s| {
-                s.select_ranges(selection_ranges)
+            editor.change_selections(Default::default(), window, cx, |s| {
+                s.select_ranges(
+                    selection_ranges
+                        .into_iter()
+                        .map(|range| MultiBufferOffset(range.start)..MultiBufferOffset(range.end)),
+                )
             })
         });
         state_context
     }
 
+    /// Assert about the text of the editor, the selections, and the expanded
+    /// diff hunks.
+    ///
+    /// Diff hunks are indicated by lines starting with `+` and `-`.
     #[track_caller]
-    pub fn assert_diff_hunks(&mut self, expected_diff: String) {
-        // Normalize the expected diff. If it has no diff markers, then insert blank markers
-        // before each line. Strip any whitespace-only lines.
-        let has_diff_markers = expected_diff
-            .lines()
-            .any(|line| line.starts_with("+") || line.starts_with("-"));
-        let expected_diff_text = expected_diff
-            .split('\n')
-            .map(|line| {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    String::new()
-                } else if has_diff_markers {
-                    line.to_string()
-                } else {
-                    format!("  {line}")
-                }
-            })
-            .join("\n");
+    pub fn assert_state_with_diff(&mut self, expected_diff_text: String) {
+        assert_state_with_diff(&self.editor, &mut self.cx, &expected_diff_text);
+    }
 
-        // Read the actual diff from the editor's row highlights and block
-        // decorations.
-        let actual_diff = self.editor.update(&mut self.cx, |editor, cx| {
-            let snapshot = editor.snapshot(cx);
-            let text = editor.text(cx);
-            let insertions = editor
-                .highlighted_rows::<DiffRowHighlight>()
-                .map(|(range, _)| {
-                    let start = range.start.to_point(&snapshot.buffer_snapshot);
-                    let end = range.end.to_point(&snapshot.buffer_snapshot);
-                    start.row..end.row
-                })
+    #[track_caller]
+    pub fn assert_excerpts_with_selections(&mut self, marked_text: &str) {
+        let actual_text = self.to_format_multibuffer_as_marked_text();
+        let fmt_additional_notes = || {
+            struct Format<'a, T: std::fmt::Display>(&'a str, &'a T);
+
+            impl<T: std::fmt::Display> std::fmt::Display for Format<'_, T> {
+                fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    write!(
+                        f,
+                        "\n\n----- EXPECTED: -----\n\n{}\n\n----- ACTUAL: -----\n\n{}\n\n",
+                        self.0, self.1
+                    )
+                }
+            }
+
+            Format(marked_text, &actual_text)
+        };
+
+        let expected_excerpts = marked_text
+            .strip_prefix("[EXCERPT]\n")
+            .unwrap()
+            .split("[EXCERPT]\n")
+            .collect::<Vec<_>>();
+
+        let (multibuffer_snapshot, selections, excerpts) = self.update_editor(|editor, _, cx| {
+            let multibuffer_snapshot = editor.buffer.read(cx).snapshot(cx);
+
+            let selections = editor.selections.disjoint_anchors_arc();
+            let excerpts = multibuffer_snapshot
+                .excerpts()
+                .map(|(e_id, snapshot, range)| (e_id, snapshot.clone(), range))
                 .collect::<Vec<_>>();
-            let deletions = editor
-                .expanded_hunks
-                .hunks
-                .iter()
-                .filter_map(|hunk| {
-                    if hunk.blocks.is_empty() {
-                        return None;
-                    }
-                    let row = hunk
-                        .hunk_range
-                        .start
-                        .to_point(&snapshot.buffer_snapshot)
-                        .row;
-                    let (_, buffer, _) = editor
-                        .buffer()
-                        .read(cx)
-                        .excerpt_containing(hunk.hunk_range.start, cx)
-                        .expect("no excerpt for expanded buffer's hunk start");
-                    let deleted_text = buffer
-                        .read(cx)
-                        .diff_base()
-                        .expect("should have a diff base for expanded hunk")
-                        .slice(hunk.diff_base_byte_range.clone())
-                        .to_string();
-                    if let DiffHunkStatus::Modified | DiffHunkStatus::Removed = hunk.status {
-                        Some((row, deleted_text))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-            format_diff(text, deletions, insertions)
+
+            (multibuffer_snapshot, selections, excerpts)
         });
 
-        pretty_assertions::assert_eq!(actual_diff, expected_diff_text, "unexpected diff state");
+        assert!(
+            excerpts.len() == expected_excerpts.len(),
+            "should have {} excerpts, got {}{}",
+            expected_excerpts.len(),
+            excerpts.len(),
+            fmt_additional_notes(),
+        );
+
+        for (ix, (excerpt_id, snapshot, range)) in excerpts.into_iter().enumerate() {
+            let is_folded = self
+                .update_editor(|editor, _, cx| editor.is_buffer_folded(snapshot.remote_id(), cx));
+            let (expected_text, expected_selections) =
+                marked_text_ranges(expected_excerpts[ix], true);
+            if expected_text == "[FOLDED]\n" {
+                assert!(is_folded, "excerpt {} should be folded", ix);
+                let is_selected = selections.iter().any(|s| s.head().excerpt_id == excerpt_id);
+                if !expected_selections.is_empty() {
+                    assert!(
+                        is_selected,
+                        "excerpt {ix} should contain selections. got {:?}{}",
+                        self.editor_state(),
+                        fmt_additional_notes(),
+                    );
+                } else {
+                    assert!(
+                        !is_selected,
+                        "excerpt {ix} should not contain selections, got: {selections:?}{}",
+                        fmt_additional_notes(),
+                    );
+                }
+                continue;
+            }
+            assert!(
+                !is_folded,
+                "excerpt {} should not be folded{}",
+                ix,
+                fmt_additional_notes()
+            );
+            assert_eq!(
+                multibuffer_snapshot
+                    .text_for_range(Anchor::range_in_buffer(excerpt_id, range.context.clone()))
+                    .collect::<String>(),
+                expected_text,
+                "{}",
+                fmt_additional_notes(),
+            );
+
+            let selections = selections
+                .iter()
+                .filter(|s| s.head().excerpt_id == excerpt_id)
+                .map(|s| {
+                    let head = text::ToOffset::to_offset(&s.head().text_anchor, &snapshot)
+                        - text::ToOffset::to_offset(&range.context.start, &snapshot);
+                    let tail = text::ToOffset::to_offset(&s.head().text_anchor, &snapshot)
+                        - text::ToOffset::to_offset(&range.context.start, &snapshot);
+                    tail..head
+                })
+                .collect::<Vec<_>>();
+            // todo: selections that cross excerpt boundaries..
+            assert_eq!(
+                selections,
+                expected_selections,
+                "excerpt {} has incorrect selections{}",
+                ix,
+                fmt_additional_notes()
+            );
+        }
+    }
+
+    fn to_format_multibuffer_as_marked_text(&mut self) -> FormatMultiBufferAsMarkedText {
+        let (multibuffer_snapshot, selections, excerpts) = self.update_editor(|editor, _, cx| {
+            let multibuffer_snapshot = editor.buffer.read(cx).snapshot(cx);
+
+            let selections = editor.selections.disjoint_anchors_arc().to_vec();
+            let excerpts = multibuffer_snapshot
+                .excerpts()
+                .map(|(e_id, snapshot, range)| {
+                    let is_folded = editor.is_buffer_folded(snapshot.remote_id(), cx);
+                    (e_id, snapshot.clone(), range, is_folded)
+                })
+                .collect::<Vec<_>>();
+
+            (multibuffer_snapshot, selections, excerpts)
+        });
+
+        FormatMultiBufferAsMarkedText {
+            multibuffer_snapshot,
+            selections,
+            excerpts,
+        }
     }
 
     /// Make an assertion about the editor's text and the ranges and directions
@@ -401,37 +573,50 @@ impl EditorTestContext {
         self.assert_selections(expected_selections, marked_text.to_string())
     }
 
+    /// Make an assertion about the editor's text and the ranges and directions
+    /// of its selections using a string containing embedded range markers.
+    ///
+    /// See the `util::test::marked_text_ranges` function for more information.
+    #[track_caller]
+    pub fn assert_display_state(&mut self, marked_text: &str) {
+        let (expected_text, expected_selections) = marked_text_ranges(marked_text, true);
+        pretty_assertions::assert_eq!(self.display_text(), expected_text, "unexpected buffer text");
+        self.assert_selections(expected_selections, marked_text.to_string())
+    }
+
     pub fn editor_state(&mut self) -> String {
         generate_marked_text(self.buffer_text().as_str(), &self.editor_selections(), true)
     }
 
     #[track_caller]
-    pub fn assert_editor_background_highlights<Tag: 'static>(&mut self, marked_text: &str) {
+    pub fn assert_editor_background_highlights(&mut self, key: HighlightKey, marked_text: &str) {
         let expected_ranges = self.ranges(marked_text);
-        let actual_ranges: Vec<Range<usize>> = self.update_editor(|editor, cx| {
-            let snapshot = editor.snapshot(cx);
+        let actual_ranges: Vec<Range<usize>> = self.update_editor(|editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
             editor
                 .background_highlights
-                .get(&TypeId::of::<Tag>())
+                .get(&key)
                 .map(|h| h.1.clone())
                 .unwrap_or_default()
                 .iter()
-                .map(|range| range.to_offset(&snapshot.buffer_snapshot))
+                .map(|range| range.to_offset(&snapshot.buffer_snapshot()))
+                .map(|range| range.start.0..range.end.0)
                 .collect()
         });
         assert_set_eq!(actual_ranges, expected_ranges);
     }
 
     #[track_caller]
-    pub fn assert_editor_text_highlights<Tag: ?Sized + 'static>(&mut self, marked_text: &str) {
+    pub fn assert_editor_text_highlights(&mut self, key: HighlightKey, marked_text: &str) {
         let expected_ranges = self.ranges(marked_text);
-        let snapshot = self.update_editor(|editor, cx| editor.snapshot(cx));
+        let snapshot = self.update_editor(|editor, window, cx| editor.snapshot(window, cx));
         let actual_ranges: Vec<Range<usize>> = snapshot
-            .text_highlight_ranges::<Tag>()
+            .text_highlight_ranges(key)
             .map(|ranges| ranges.as_ref().clone().1)
             .unwrap_or_default()
             .into_iter()
-            .map(|range| range.to_offset(&snapshot.buffer_snapshot))
+            .map(|range| range.to_offset(&snapshot.buffer_snapshot()))
+            .map(|range| range.start.0..range.end.0)
             .collect();
         assert_set_eq!(actual_ranges, expected_ranges);
     }
@@ -439,7 +624,9 @@ impl EditorTestContext {
     #[track_caller]
     pub fn assert_editor_selections(&mut self, expected_selections: Vec<Range<usize>>) {
         let expected_marked_text =
-            generate_marked_text(&self.buffer_text(), &expected_selections, true);
+            generate_marked_text(&self.buffer_text(), &expected_selections, true)
+                .replace(" \n", "•\n");
+
         self.assert_selections(expected_selections, expected_marked_text)
     }
 
@@ -447,14 +634,16 @@ impl EditorTestContext {
     fn editor_selections(&mut self) -> Vec<Range<usize>> {
         self.editor
             .update(&mut self.cx, |editor, cx| {
-                editor.selections.all::<usize>(cx)
+                editor
+                    .selections
+                    .all::<MultiBufferOffset>(&editor.display_snapshot(cx))
             })
             .into_iter()
             .map(|s| {
                 if s.reversed {
-                    s.end..s.start
+                    s.end.0..s.start.0
                 } else {
-                    s.start..s.end
+                    s.start.0..s.end.0
                 }
             })
             .collect::<Vec<_>>()
@@ -468,7 +657,8 @@ impl EditorTestContext {
     ) {
         let actual_selections = self.editor_selections();
         let actual_marked_text =
-            generate_marked_text(&self.buffer_text(), &actual_selections, true);
+            generate_marked_text(&self.buffer_text(), &actual_selections, true)
+                .replace(" \n", "•\n");
         if expected_selections != actual_selections {
             pretty_assertions::assert_eq!(
                 actual_marked_text,
@@ -480,44 +670,108 @@ impl EditorTestContext {
     }
 }
 
-fn format_diff(
-    text: String,
-    actual_deletions: Vec<(u32, String)>,
-    actual_insertions: Vec<Range<u32>>,
-) -> String {
-    let mut diff = String::new();
-    for (row, line) in text.split('\n').enumerate() {
-        let row = row as u32;
-        if row > 0 {
-            diff.push('\n');
-        }
-        if let Some(text) = actual_deletions
-            .iter()
-            .find_map(|(deletion_row, deleted_text)| {
-                if *deletion_row == row {
-                    Some(deleted_text)
-                } else {
-                    None
-                }
-            })
-        {
-            for line in text.lines() {
-                diff.push('-');
-                if !line.is_empty() {
-                    diff.push(' ');
-                    diff.push_str(line);
-                }
-                diff.push('\n');
+struct FormatMultiBufferAsMarkedText {
+    multibuffer_snapshot: MultiBufferSnapshot,
+    selections: Vec<Selection<Anchor>>,
+    excerpts: Vec<(ExcerptId, BufferSnapshot, ExcerptRange<text::Anchor>, bool)>,
+}
+
+impl std::fmt::Display for FormatMultiBufferAsMarkedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            multibuffer_snapshot,
+            selections,
+            excerpts,
+        } = self;
+
+        for (excerpt_id, snapshot, range, is_folded) in excerpts.into_iter() {
+            write!(f, "[EXCERPT]\n")?;
+            if *is_folded {
+                write!(f, "[FOLDED]\n")?;
             }
+
+            let mut text = multibuffer_snapshot
+                .text_for_range(Anchor::range_in_buffer(*excerpt_id, range.context.clone()))
+                .collect::<String>();
+
+            let selections = selections
+                .iter()
+                .filter(|&s| s.head().excerpt_id == *excerpt_id)
+                .map(|s| {
+                    let head = text::ToOffset::to_offset(&s.head().text_anchor, &snapshot)
+                        - text::ToOffset::to_offset(&range.context.start, &snapshot);
+                    let tail = text::ToOffset::to_offset(&s.head().text_anchor, &snapshot)
+                        - text::ToOffset::to_offset(&range.context.start, &snapshot);
+                    tail..head
+                })
+                .rev()
+                .collect::<Vec<_>>();
+
+            for selection in selections {
+                if selection.is_empty() {
+                    text.insert(selection.start, 'ˇ');
+                    continue;
+                }
+                text.insert(selection.end, '»');
+                text.insert(selection.start, '«');
+            }
+
+            write!(f, "{text}")?;
         }
-        let marker = if actual_insertions.iter().any(|range| range.contains(&row)) {
-            "+ "
-        } else {
-            "  "
-        };
-        diff.push_str(format!("{marker}{line}").trim_end());
+
+        Ok(())
     }
-    diff
+}
+
+#[track_caller]
+pub fn assert_state_with_diff(
+    editor: &Entity<Editor>,
+    cx: &mut VisualTestContext,
+    expected_diff_text: &str,
+) {
+    let (snapshot, selections) = editor.update_in(cx, |editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        (
+            snapshot.buffer_snapshot().clone(),
+            editor
+                .selections
+                .ranges::<MultiBufferOffset>(&snapshot.display_snapshot)
+                .into_iter()
+                .map(|range| range.start.0..range.end.0)
+                .collect::<Vec<_>>(),
+        )
+    });
+
+    let actual_marked_text = generate_marked_text(&snapshot.text(), &selections, true);
+
+    // Read the actual diff.
+    let line_infos = snapshot.row_infos(MultiBufferRow(0)).collect::<Vec<_>>();
+    let has_diff = line_infos.iter().any(|info| info.diff_status.is_some());
+    let actual_diff = actual_marked_text
+        .split('\n')
+        .zip(line_infos)
+        .map(|(line, info)| {
+            let mut marker = match info.diff_status.map(|status| status.kind) {
+                Some(DiffHunkStatusKind::Added) => "+ ",
+                Some(DiffHunkStatusKind::Deleted) => "- ",
+                Some(DiffHunkStatusKind::Modified) => unreachable!(),
+                None => {
+                    if has_diff {
+                        "  "
+                    } else {
+                        ""
+                    }
+                }
+            };
+            if line.is_empty() {
+                marker = marker.trim();
+            }
+            format!("{marker}{line}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    pretty_assertions::assert_eq!(actual_diff, expected_diff_text, "unexpected diff state");
 }
 
 impl Deref for EditorTestContext {

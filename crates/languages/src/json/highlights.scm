@@ -1,6 +1,7 @@
 (comment) @comment
 
 (string) @string
+
 (escape_sequence) @string.escape
 
 (pair
@@ -11,8 +12,14 @@
 [
   (true)
   (false)
-  (null)
-] @constant
+] @boolean
+
+(null) @constant.builtin
+
+[
+  ","
+  ":"
+] @punctuation.delimiter
 
 [
   "{"

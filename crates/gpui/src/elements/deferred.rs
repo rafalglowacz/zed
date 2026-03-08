@@ -1,5 +1,6 @@
 use crate::{
-    AnyElement, Bounds, Element, GlobalElementId, IntoElement, LayoutId, Pixels, WindowContext,
+    AnyElement, App, Bounds, Element, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
+    Pixels, Window,
 };
 
 /// Builds a `Deferred` element, which delays the layout and paint of its child.
@@ -35,34 +36,44 @@ impl Element for Deferred {
         None
     }
 
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
     fn request_layout(
         &mut self,
         _id: Option<&GlobalElementId>,
-        cx: &mut WindowContext,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
     ) -> (LayoutId, ()) {
-        let layout_id = self.child.as_mut().unwrap().request_layout(cx);
+        let layout_id = self.child.as_mut().unwrap().request_layout(window, cx);
         (layout_id, ())
     }
 
     fn prepaint(
         &mut self,
         _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
         _bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
-        cx: &mut WindowContext,
+        window: &mut Window,
+        _cx: &mut App,
     ) {
         let child = self.child.take().unwrap();
-        let element_offset = cx.element_offset();
-        cx.defer_draw(child, element_offset, self.priority)
+        let element_offset = window.element_offset();
+        window.defer_draw(child, element_offset, self.priority, None)
     }
 
     fn paint(
         &mut self,
         _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
         _bounds: Bounds<Pixels>,
         _request_layout: &mut Self::RequestLayoutState,
         _prepaint: &mut Self::PrepaintState,
-        _cx: &mut WindowContext,
+        _window: &mut Window,
+        _cx: &mut App,
     ) {
     }
 }

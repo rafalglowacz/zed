@@ -1,33 +1,24 @@
 mod async_body;
+#[cfg(not(target_family = "wasm"))]
 pub mod github;
+#[cfg(not(target_family = "wasm"))]
+pub mod github_download;
 
-pub use anyhow::{anyhow, Result};
-pub use async_body::{AsyncBody, Inner};
+pub use anyhow::{Result, anyhow};
+pub use async_body::{AsyncBody, Inner, Json};
 use derive_more::Deref;
-pub use http::{self, Method, Request, Response, StatusCode, Uri};
+use http::HeaderValue;
+pub use http::{self, Method, Request, Response, StatusCode, Uri, request::Builder};
 
 use futures::future::BoxFuture;
-use http::request::Builder;
+use parking_lot::Mutex;
+use serde::Serialize;
+use std::sync::Arc;
 #[cfg(feature = "test-support")]
-use std::fmt;
-use std::{
-    any::type_name,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
-pub use url::Url;
-
-#[derive(Clone, Debug)]
-pub struct ReadTimeout(pub Duration);
-
-impl Default for ReadTimeout {
-    fn default() -> Self {
-        Self(Duration::from_secs(5))
-    }
-}
+use std::{any::type_name, fmt};
+pub use url::{Host, Url};
 
 #[derive(Default, Debug, Clone, PartialEq, Eq, Hash)]
-
 pub enum RedirectPolicy {
     #[default]
     NoFollow,
@@ -37,39 +28,51 @@ pub enum RedirectPolicy {
 pub struct FollowRedirects(pub bool);
 
 pub trait HttpRequestExt {
-    /// Set a read timeout on the request.
-    /// For isahc, this is the low_speed_timeout.
-    /// For other clients, this is the timeout used for read calls when reading the response.
-    /// In all cases this prevents servers stalling completely, but allows them to send data slowly.
-    fn read_timeout(self, timeout: Duration) -> Self;
+    /// Conditionally modify self with the given closure.
+    fn when(self, condition: bool, then: impl FnOnce(Self) -> Self) -> Self
+    where
+        Self: Sized,
+    {
+        if condition { then(self) } else { self }
+    }
+
+    /// Conditionally unwrap and modify self with the given closure, if the given option is Some.
+    fn when_some<T>(self, option: Option<T>, then: impl FnOnce(Self, T) -> Self) -> Self
+    where
+        Self: Sized,
+    {
+        match option {
+            Some(value) => then(self, value),
+            None => self,
+        }
+    }
+
     /// Whether or not to follow redirects
     fn follow_redirects(self, follow: RedirectPolicy) -> Self;
 }
 
 impl HttpRequestExt for http::request::Builder {
-    fn read_timeout(self, timeout: Duration) -> Self {
-        self.extension(ReadTimeout(timeout))
-    }
-
     fn follow_redirects(self, follow: RedirectPolicy) -> Self {
         self.extension(follow)
     }
 }
 
 pub trait HttpClient: 'static + Send + Sync {
-    fn type_name(&self) -> &'static str;
+    fn user_agent(&self) -> Option<&HeaderValue>;
+
+    fn proxy(&self) -> Option<&Url>;
 
     fn send(
         &self,
         req: http::Request<AsyncBody>,
-    ) -> BoxFuture<'static, Result<Response<AsyncBody>, anyhow::Error>>;
+    ) -> BoxFuture<'static, anyhow::Result<Response<AsyncBody>>>;
 
-    fn get<'a>(
-        &'a self,
+    fn get(
+        &self,
         uri: &str,
         body: AsyncBody,
         follow_redirects: bool,
-    ) -> BoxFuture<'a, Result<Response<AsyncBody>, anyhow::Error>> {
+    ) -> BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
         let request = Builder::new()
             .uri(uri)
             .follow_redirects(if follow_redirects {
@@ -80,16 +83,16 @@ pub trait HttpClient: 'static + Send + Sync {
             .body(body);
 
         match request {
-            Ok(request) => Box::pin(async move { self.send(request).await.map_err(Into::into) }),
+            Ok(request) => self.send(request),
             Err(e) => Box::pin(async move { Err(e.into()) }),
         }
     }
 
-    fn post_json<'a>(
-        &'a self,
+    fn post_json(
+        &self,
         uri: &str,
         body: AsyncBody,
-    ) -> BoxFuture<'a, Result<Response<AsyncBody>, anyhow::Error>> {
+    ) -> BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
         let request = Builder::new()
             .uri(uri)
             .method(Method::POST)
@@ -97,12 +100,15 @@ pub trait HttpClient: 'static + Send + Sync {
             .body(body);
 
         match request {
-            Ok(request) => Box::pin(async move { self.send(request).await.map_err(Into::into) }),
+            Ok(request) => self.send(request),
             Err(e) => Box::pin(async move { Err(e.into()) }),
         }
     }
 
-    fn proxy(&self) -> Option<&Uri>;
+    #[cfg(feature = "test-support")]
+    fn as_fake(&self) -> &FakeHttpClient {
+        panic!("called as_fake on {}", type_name::<Self>())
+    }
 }
 
 /// An [`HttpClient`] that may have a proxy.
@@ -110,22 +116,22 @@ pub trait HttpClient: 'static + Send + Sync {
 pub struct HttpClientWithProxy {
     #[deref]
     client: Arc<dyn HttpClient>,
-    proxy: Option<Uri>,
+    proxy: Option<Url>,
 }
 
 impl HttpClientWithProxy {
     /// Returns a new [`HttpClientWithProxy`] with the given proxy URL.
     pub fn new(client: Arc<dyn HttpClient>, proxy_url: Option<String>) -> Self {
-        let proxy_uri = proxy_url
+        let proxy_url = proxy_url
             .and_then(|proxy| proxy.parse().ok())
             .or_else(read_proxy_from_env);
 
-        Self::new_uri(client, proxy_uri)
+        Self::new_url(client, proxy_url)
     }
-    pub fn new_uri(client: Arc<dyn HttpClient>, proxy_uri: Option<Uri>) -> Self {
+    pub fn new_url(client: Arc<dyn HttpClient>, proxy_url: Option<Url>) -> Self {
         Self {
             client,
-            proxy: proxy_uri,
+            proxy: proxy_url,
         }
     }
 }
@@ -134,48 +140,30 @@ impl HttpClient for HttpClientWithProxy {
     fn send(
         &self,
         req: Request<AsyncBody>,
-    ) -> BoxFuture<'static, Result<Response<AsyncBody>, anyhow::Error>> {
+    ) -> BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
         self.client.send(req)
     }
 
-    fn proxy(&self) -> Option<&Uri> {
+    fn user_agent(&self) -> Option<&HeaderValue> {
+        self.client.user_agent()
+    }
+
+    fn proxy(&self) -> Option<&Url> {
         self.proxy.as_ref()
     }
 
-    fn type_name(&self) -> &'static str {
-        self.client.type_name()
-    }
-}
-
-impl HttpClient for Arc<HttpClientWithProxy> {
-    fn send(
-        &self,
-        req: Request<AsyncBody>,
-    ) -> BoxFuture<'static, Result<Response<AsyncBody>, anyhow::Error>> {
-        self.client.send(req)
-    }
-
-    fn proxy(&self) -> Option<&Uri> {
-        self.proxy.as_ref()
-    }
-
-    fn type_name(&self) -> &'static str {
-        self.client.type_name()
+    #[cfg(feature = "test-support")]
+    fn as_fake(&self) -> &FakeHttpClient {
+        self.client.as_fake()
     }
 }
 
 /// An [`HttpClient`] that has a base URL.
+#[derive(Deref)]
 pub struct HttpClientWithUrl {
     base_url: Mutex<String>,
+    #[deref]
     client: HttpClientWithProxy,
-}
-
-impl std::ops::Deref for HttpClientWithUrl {
-    type Target = HttpClientWithProxy;
-
-    fn deref(&self) -> &Self::Target {
-        &self.client
-    }
 }
 
 impl HttpClientWithUrl {
@@ -193,12 +181,12 @@ impl HttpClientWithUrl {
         }
     }
 
-    pub fn new_uri(
+    pub fn new_url(
         client: Arc<dyn HttpClient>,
         base_url: impl Into<String>,
-        proxy_uri: Option<Uri>,
+        proxy_url: Option<Url>,
     ) -> Self {
-        let client = HttpClientWithProxy::new_uri(client, proxy_uri);
+        let client = HttpClientWithProxy::new_url(client, proxy_url);
 
         Self {
             base_url: Mutex::new(base_url.into()),
@@ -208,20 +196,13 @@ impl HttpClientWithUrl {
 
     /// Returns the base URL.
     pub fn base_url(&self) -> String {
-        self.base_url
-            .lock()
-            .map_or_else(|_| Default::default(), |url| url.clone())
+        self.base_url.lock().clone()
     }
 
     /// Sets the base URL.
     pub fn set_base_url(&self, base_url: impl Into<String>) {
         let base_url = base_url.into();
-        self.base_url
-            .lock()
-            .map(|mut url| {
-                *url = base_url;
-            })
-            .ok();
+        *self.base_url.lock() = base_url;
     }
 
     /// Builds a URL using the given path.
@@ -245,13 +226,39 @@ impl HttpClientWithUrl {
         )?)
     }
 
+    /// Builds a Zed Cloud URL using the given path.
+    pub fn build_zed_cloud_url(&self, path: &str) -> Result<Url> {
+        let base_url = self.base_url();
+        let base_api_url = match base_url.as_ref() {
+            "https://zed.dev" => "https://cloud.zed.dev",
+            "https://staging.zed.dev" => "https://cloud.zed.dev",
+            "http://localhost:3000" => "http://localhost:8787",
+            other => other,
+        };
+
+        Ok(Url::parse(&format!("{}{}", base_api_url, path))?)
+    }
+
+    /// Builds a Zed Cloud URL using the given path and query params.
+    pub fn build_zed_cloud_url_with_query(&self, path: &str, query: impl Serialize) -> Result<Url> {
+        let base_url = self.base_url();
+        let base_api_url = match base_url.as_ref() {
+            "https://zed.dev" => "https://cloud.zed.dev",
+            "https://staging.zed.dev" => "https://cloud.zed.dev",
+            "http://localhost:3000" => "http://localhost:8787",
+            other => other,
+        };
+        let query = serde_urlencoded::to_string(&query)?;
+        Ok(Url::parse(&format!("{}{}?{}", base_api_url, path, query))?)
+    }
+
     /// Builds a Zed LLM URL using the given path.
     pub fn build_zed_llm_url(&self, path: &str, query: &[(&str, &str)]) -> Result<Url> {
         let base_url = self.base_url();
         let base_api_url = match base_url.as_ref() {
-            "https://zed.dev" => "https://llm.zed.dev",
+            "https://zed.dev" => "https://cloud.zed.dev",
             "https://staging.zed.dev" => "https://llm-staging.zed.dev",
-            "http://localhost:3000" => "http://localhost:8080",
+            "http://localhost:3000" => "http://localhost:8787",
             other => other,
         };
 
@@ -262,41 +269,29 @@ impl HttpClientWithUrl {
     }
 }
 
-impl HttpClient for Arc<HttpClientWithUrl> {
-    fn send(
-        &self,
-        req: Request<AsyncBody>,
-    ) -> BoxFuture<'static, Result<Response<AsyncBody>, anyhow::Error>> {
-        self.client.send(req)
-    }
-
-    fn proxy(&self) -> Option<&Uri> {
-        self.client.proxy.as_ref()
-    }
-
-    fn type_name(&self) -> &'static str {
-        self.client.type_name()
-    }
-}
-
 impl HttpClient for HttpClientWithUrl {
     fn send(
         &self,
         req: Request<AsyncBody>,
-    ) -> BoxFuture<'static, Result<Response<AsyncBody>, anyhow::Error>> {
+    ) -> BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
         self.client.send(req)
     }
 
-    fn proxy(&self) -> Option<&Uri> {
+    fn user_agent(&self) -> Option<&HeaderValue> {
+        self.client.user_agent()
+    }
+
+    fn proxy(&self) -> Option<&Url> {
         self.client.proxy.as_ref()
     }
 
-    fn type_name(&self) -> &'static str {
-        self.client.type_name()
+    #[cfg(feature = "test-support")]
+    fn as_fake(&self) -> &FakeHttpClient {
+        self.client.as_fake()
     }
 }
 
-pub fn read_proxy_from_env() -> Option<Uri> {
+pub fn read_proxy_from_env() -> Option<Url> {
     const ENV_VARS: &[&str] = &[
         "ALL_PROXY",
         "all_proxy",
@@ -306,13 +301,16 @@ pub fn read_proxy_from_env() -> Option<Uri> {
         "http_proxy",
     ];
 
-    for var in ENV_VARS {
-        if let Ok(env) = std::env::var(var) {
-            return env.parse::<Uri>().ok();
-        }
-    }
+    ENV_VARS
+        .iter()
+        .find_map(|var| std::env::var(var).ok())
+        .and_then(|env| env.parse().ok())
+}
 
-    None
+pub fn read_no_proxy_from_env() -> Option<String> {
+    const ENV_VARS: &[&str] = &["NO_PROXY", "no_proxy"];
+
+    ENV_VARS.iter().find_map(|var| std::env::var(var).ok())
 }
 
 pub struct BlockedHttpClient;
@@ -327,7 +325,7 @@ impl HttpClient for BlockedHttpClient {
     fn send(
         &self,
         _req: Request<AsyncBody>,
-    ) -> BoxFuture<'static, Result<Response<AsyncBody>, anyhow::Error>> {
+    ) -> BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
         Box::pin(async {
             Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -337,18 +335,23 @@ impl HttpClient for BlockedHttpClient {
         })
     }
 
-    fn proxy(&self) -> Option<&Uri> {
+    fn user_agent(&self) -> Option<&HeaderValue> {
         None
     }
 
-    fn type_name(&self) -> &'static str {
-        type_name::<Self>()
+    fn proxy(&self) -> Option<&Url> {
+        None
+    }
+
+    #[cfg(feature = "test-support")]
+    fn as_fake(&self) -> &FakeHttpClient {
+        panic!("called as_fake on {}", type_name::<Self>())
     }
 }
 
 #[cfg(feature = "test-support")]
-type FakeHttpHandler = Box<
-    dyn Fn(Request<AsyncBody>) -> BoxFuture<'static, Result<Response<AsyncBody>, anyhow::Error>>
+type FakeHttpHandler = Arc<
+    dyn Fn(Request<AsyncBody>) -> BoxFuture<'static, anyhow::Result<Response<AsyncBody>>>
         + Send
         + Sync
         + 'static,
@@ -356,21 +359,23 @@ type FakeHttpHandler = Box<
 
 #[cfg(feature = "test-support")]
 pub struct FakeHttpClient {
-    handler: FakeHttpHandler,
+    handler: Mutex<Option<FakeHttpHandler>>,
+    user_agent: HeaderValue,
 }
 
 #[cfg(feature = "test-support")]
 impl FakeHttpClient {
     pub fn create<Fut, F>(handler: F) -> Arc<HttpClientWithUrl>
     where
-        Fut: futures::Future<Output = Result<Response<AsyncBody>, anyhow::Error>> + Send + 'static,
+        Fut: futures::Future<Output = anyhow::Result<Response<AsyncBody>>> + Send + 'static,
         F: Fn(Request<AsyncBody>) -> Fut + Send + Sync + 'static,
     {
         Arc::new(HttpClientWithUrl {
             base_url: Mutex::new("http://test.example".into()),
             client: HttpClientWithProxy {
                 client: Arc::new(Self {
-                    handler: Box::new(move |req| Box::pin(handler(req))),
+                    handler: Mutex::new(Some(Arc::new(move |req| Box::pin(handler(req))))),
+                    user_agent: HeaderValue::from_static(type_name::<Self>()),
                 }),
                 proxy: None,
             },
@@ -378,6 +383,7 @@ impl FakeHttpClient {
     }
 
     pub fn with_404_response() -> Arc<HttpClientWithUrl> {
+        log::warn!("Using fake HTTP client with 404 response");
         Self::create(|_| async move {
             Ok(Response::builder()
                 .status(404)
@@ -387,12 +393,25 @@ impl FakeHttpClient {
     }
 
     pub fn with_200_response() -> Arc<HttpClientWithUrl> {
+        log::warn!("Using fake HTTP client with 200 response");
         Self::create(|_| async move {
             Ok(Response::builder()
                 .status(200)
                 .body(Default::default())
                 .unwrap())
         })
+    }
+
+    pub fn replace_handler<Fut, F>(&self, new_handler: F)
+    where
+        Fut: futures::Future<Output = anyhow::Result<Response<AsyncBody>>> + Send + 'static,
+        F: Fn(FakeHttpHandler, Request<AsyncBody>) -> Fut + Send + Sync + 'static,
+    {
+        let mut handler = self.handler.lock();
+        let old_handler = handler.take().unwrap();
+        *handler = Some(Arc::new(move |req| {
+            Box::pin(new_handler(old_handler.clone(), req))
+        }));
     }
 }
 
@@ -408,16 +427,19 @@ impl HttpClient for FakeHttpClient {
     fn send(
         &self,
         req: Request<AsyncBody>,
-    ) -> BoxFuture<'static, Result<Response<AsyncBody>, anyhow::Error>> {
-        let future = (self.handler)(req);
-        future
+    ) -> BoxFuture<'static, anyhow::Result<Response<AsyncBody>>> {
+        ((self.handler.lock().as_ref().unwrap())(req)) as _
     }
 
-    fn proxy(&self) -> Option<&Uri> {
+    fn user_agent(&self) -> Option<&HeaderValue> {
+        Some(&self.user_agent)
+    }
+
+    fn proxy(&self) -> Option<&Url> {
         None
     }
 
-    fn type_name(&self) -> &'static str {
-        type_name::<Self>()
+    fn as_fake(&self) -> &FakeHttpClient {
+        self
     }
 }

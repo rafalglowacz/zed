@@ -1,253 +1,120 @@
 use super::{SerializedAxis, SerializedWindowBounds};
 use crate::{
-    item::ItemHandle, Member, Pane, PaneAxis, SerializableItemRegistry, Workspace, WorkspaceId,
+    Member, Pane, PaneAxis, SerializableItemRegistry, Workspace, WorkspaceId, item::ItemHandle,
+    path_list::PathList,
 };
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
+use collections::IndexSet;
 use db::sqlez::{
     bindable::{Bind, Column, StaticColumnCount},
     statement::Statement,
 };
-use gpui::{AsyncWindowContext, Model, View, WeakView};
-use project::Project;
-use remote::ssh_session::SshProjectId;
+use gpui::{AsyncWindowContext, Entity, WeakEntity, WindowId};
+
+use language::{Toolchain, ToolchainScope};
+use project::{Project, debugger::breakpoint_store::SourceBreakpoint};
+use remote::RemoteConnectionOptions;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     sync::Arc,
 };
 use util::ResultExt;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-pub struct SerializedSshProject {
-    pub id: SshProjectId,
-    pub host: String,
-    pub port: Option<u16>,
-    pub paths: Vec<String>,
-    pub user: Option<String>,
-}
+#[derive(
+    Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy, serde::Serialize, serde::Deserialize,
+)]
+pub(crate) struct RemoteConnectionId(pub u64);
 
-impl SerializedSshProject {
-    pub fn ssh_urls(&self) -> Vec<PathBuf> {
-        self.paths
-            .iter()
-            .map(|path| {
-                let mut result = String::new();
-                if let Some(user) = &self.user {
-                    result.push_str(user);
-                    result.push('@');
-                }
-                result.push_str(&self.host);
-                if let Some(port) = &self.port {
-                    result.push(':');
-                    result.push_str(&port.to_string());
-                }
-                result.push_str(path);
-                PathBuf::from(result)
-            })
-            .collect()
-    }
-}
-
-impl StaticColumnCount for SerializedSshProject {
-    fn column_count() -> usize {
-        5
-    }
-}
-
-impl Bind for &SerializedSshProject {
-    fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
-        let next_index = statement.bind(&self.id.0, start_index)?;
-        let next_index = statement.bind(&self.host, next_index)?;
-        let next_index = statement.bind(&self.port, next_index)?;
-        let raw_paths = serde_json::to_string(&self.paths)?;
-        let next_index = statement.bind(&raw_paths, next_index)?;
-        statement.bind(&self.user, next_index)
-    }
-}
-
-impl Column for SerializedSshProject {
-    fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
-        let id = statement.column_int64(start_index)?;
-        let host = statement.column_text(start_index + 1)?.to_string();
-        let (port, _) = Option::<u16>::column(statement, start_index + 2)?;
-        let raw_paths = statement.column_text(start_index + 3)?.to_string();
-        let paths: Vec<String> = serde_json::from_str(&raw_paths)?;
-
-        let (user, _) = Option::<String>::column(statement, start_index + 4)?;
-
-        Ok((
-            Self {
-                id: SshProjectId(id as u64),
-                host,
-                port,
-                paths,
-                user,
-            },
-            start_index + 5,
-        ))
-    }
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct LocalPaths(Arc<Vec<PathBuf>>);
-
-impl LocalPaths {
-    pub fn new<P: AsRef<Path>>(paths: impl IntoIterator<Item = P>) -> Self {
-        let mut paths: Vec<PathBuf> = paths
-            .into_iter()
-            .map(|p| p.as_ref().to_path_buf())
-            .collect();
-        // Ensure all future `zed workspace1 workspace2` and `zed workspace2 workspace1` calls are using the same workspace.
-        // The actual workspace order is stored in the `LocalPathsOrder` struct.
-        paths.sort();
-        Self(Arc::new(paths))
-    }
-
-    pub fn paths(&self) -> &Arc<Vec<PathBuf>> {
-        &self.0
-    }
-}
-
-impl StaticColumnCount for LocalPaths {}
-impl Bind for &LocalPaths {
-    fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
-        statement.bind(&bincode::serialize(&self.0)?, start_index)
-    }
-}
-
-impl Column for LocalPaths {
-    fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
-        let path_blob = statement.column_blob(start_index)?;
-        let paths: Arc<Vec<PathBuf>> = if path_blob.is_empty() {
-            Default::default()
-        } else {
-            bincode::deserialize(path_blob).context("Bincode deserialization of paths failed")?
-        };
-
-        Ok((Self(paths), start_index + 1))
-    }
-}
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct LocalPathsOrder(Vec<usize>);
-
-impl LocalPathsOrder {
-    pub fn new(order: impl IntoIterator<Item = usize>) -> Self {
-        Self(order.into_iter().collect())
-    }
-
-    pub fn order(&self) -> &[usize] {
-        self.0.as_slice()
-    }
-
-    pub fn default_for_paths(paths: &LocalPaths) -> Self {
-        Self::new(0..paths.0.len())
-    }
-}
-
-impl StaticColumnCount for LocalPathsOrder {}
-impl Bind for &LocalPathsOrder {
-    fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
-        statement.bind(&bincode::serialize(&self.0)?, start_index)
-    }
-}
-
-impl Column for LocalPathsOrder {
-    fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
-        let order_blob = statement.column_blob(start_index)?;
-        let order = if order_blob.is_empty() {
-            Vec::new()
-        } else {
-            bincode::deserialize(order_blob).context("deserializing workspace root order")?
-        };
-
-        Ok((Self(order), start_index + 1))
-    }
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum RemoteConnectionKind {
+    Ssh,
+    Wsl,
+    Docker,
 }
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum SerializedWorkspaceLocation {
-    Local(LocalPaths, LocalPathsOrder),
-    Ssh(SerializedSshProject),
+    Local,
+    Remote(RemoteConnectionOptions),
 }
 
 impl SerializedWorkspaceLocation {
-    /// Create a new `SerializedWorkspaceLocation` from a list of local paths.
-    ///
-    /// The paths will be sorted and the order will be stored in the `LocalPathsOrder` struct.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use std::path::Path;
-    /// use zed_workspace::SerializedWorkspaceLocation;
-    ///
-    /// let location = SerializedWorkspaceLocation::from_local_paths(vec![
-    ///     Path::new("path/to/workspace1"),
-    ///     Path::new("path/to/workspace2"),
-    /// ]);
-    /// assert_eq!(location, SerializedWorkspaceLocation::Local(
-    ///    LocalPaths::new(vec![
-    ///         Path::new("path/to/workspace1"),
-    ///         Path::new("path/to/workspace2"),
-    ///    ]),
-    ///   LocalPathsOrder::new(vec![0, 1]),
-    /// ));
-    /// ```
-    ///
-    /// ```
-    /// use std::path::Path;
-    /// use zed_workspace::SerializedWorkspaceLocation;
-    ///
-    /// let location = SerializedWorkspaceLocation::from_local_paths(vec![
-    ///     Path::new("path/to/workspace2"),
-    ///     Path::new("path/to/workspace1"),
-    /// ]);
-    ///
-    /// assert_eq!(location, SerializedWorkspaceLocation::Local(
-    ///    LocalPaths::new(vec![
-    ///         Path::new("path/to/workspace1"),
-    ///         Path::new("path/to/workspace2"),
-    ///   ]),
-    ///  LocalPathsOrder::new(vec![1, 0]),
-    /// ));
-    /// ```
-    pub fn from_local_paths<P: AsRef<Path>>(paths: impl IntoIterator<Item = P>) -> Self {
-        let mut indexed_paths: Vec<_> = paths
-            .into_iter()
-            .map(|p| p.as_ref().to_path_buf())
-            .enumerate()
-            .collect();
-
-        indexed_paths.sort_by(|(_, a), (_, b)| a.cmp(b));
-
-        let sorted_paths: Vec<_> = indexed_paths.iter().map(|(_, path)| path.clone()).collect();
-        let order: Vec<_> = indexed_paths.iter().map(|(index, _)| *index).collect();
-
-        Self::Local(LocalPaths::new(sorted_paths), LocalPathsOrder::new(order))
+    /// Get sorted paths
+    pub fn sorted_paths(&self) -> Arc<Vec<PathBuf>> {
+        unimplemented!()
     }
+}
+
+/// A workspace entry from a previous session, containing all the info needed
+/// to restore it including which window it belonged to (for MultiWorkspace grouping).
+#[derive(Debug, PartialEq, Clone)]
+pub struct SessionWorkspace {
+    pub workspace_id: WorkspaceId,
+    pub location: SerializedWorkspaceLocation,
+    pub paths: PathList,
+    pub window_id: Option<WindowId>,
+}
+
+/// Per-window state for a MultiWorkspace, persisted to KVP.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct MultiWorkspaceState {
+    pub active_workspace_id: Option<WorkspaceId>,
+    pub sidebar_open: bool,
+}
+
+/// The serialized state of a single MultiWorkspace window from a previous session:
+/// all workspaces that shared the window, which one was active, and whether the
+/// sidebar was open.
+#[derive(Debug, Clone)]
+pub struct SerializedMultiWorkspace {
+    pub workspaces: Vec<SessionWorkspace>,
+    pub state: MultiWorkspaceState,
 }
 
 #[derive(Debug, PartialEq, Clone)]
 pub(crate) struct SerializedWorkspace {
     pub(crate) id: WorkspaceId,
     pub(crate) location: SerializedWorkspaceLocation,
+    pub(crate) paths: PathList,
     pub(crate) center_group: SerializedPaneGroup,
     pub(crate) window_bounds: Option<SerializedWindowBounds>,
     pub(crate) centered_layout: bool,
     pub(crate) display: Option<Uuid>,
     pub(crate) docks: DockStructure,
     pub(crate) session_id: Option<String>,
+    pub(crate) breakpoints: BTreeMap<Arc<Path>, Vec<SourceBreakpoint>>,
+    pub(crate) user_toolchains: BTreeMap<ToolchainScope, IndexSet<Toolchain>>,
     pub(crate) window_id: Option<u64>,
 }
 
-#[derive(Debug, PartialEq, Clone, Default)]
+#[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize)]
 pub struct DockStructure {
-    pub(crate) left: DockData,
-    pub(crate) right: DockData,
-    pub(crate) bottom: DockData,
+    pub left: DockData,
+    pub right: DockData,
+    pub bottom: DockData,
+}
+
+impl RemoteConnectionKind {
+    pub(crate) fn serialize(&self) -> &'static str {
+        match self {
+            RemoteConnectionKind::Ssh => "ssh",
+            RemoteConnectionKind::Wsl => "wsl",
+            RemoteConnectionKind::Docker => "docker",
+        }
+    }
+
+    pub(crate) fn deserialize(text: &str) -> Option<Self> {
+        match text {
+            "ssh" => Some(Self::Ssh),
+            "wsl" => Some(Self::Wsl),
+            "docker" => Some(Self::Docker),
+            _ => None,
+        }
+    }
 }
 
 impl Column for DockStructure {
@@ -274,11 +141,11 @@ impl Bind for DockStructure {
     }
 }
 
-#[derive(Debug, PartialEq, Clone, Default)]
+#[derive(Debug, PartialEq, Clone, Default, Serialize, Deserialize)]
 pub struct DockData {
-    pub(crate) visible: bool,
-    pub(crate) active_panel: Option<String>,
-    pub(crate) zoom: bool,
+    pub visible: bool,
+    pub active_panel: Option<String>,
+    pub zoom: bool,
 }
 
 impl Column for DockData {
@@ -330,11 +197,15 @@ impl SerializedPaneGroup {
     #[async_recursion(?Send)]
     pub(crate) async fn deserialize(
         self,
-        project: &Model<Project>,
+        project: &Entity<Project>,
         workspace_id: WorkspaceId,
-        workspace: WeakView<Workspace>,
+        workspace: WeakEntity<Workspace>,
         cx: &mut AsyncWindowContext,
-    ) -> Option<(Member, Option<View<Pane>>, Vec<Option<Box<dyn ItemHandle>>>)> {
+    ) -> Option<(
+        Member,
+        Option<Entity<Pane>>,
+        Vec<Option<Box<dyn ItemHandle>>>,
+    )> {
         match self {
             SerializedPaneGroup::Group {
                 axis,
@@ -371,15 +242,21 @@ impl SerializedPaneGroup {
             }
             SerializedPaneGroup::Pane(serialized_pane) => {
                 let pane = workspace
-                    .update(cx, |workspace, cx| workspace.add_pane(cx).downgrade())
+                    .update_in(cx, |workspace, window, cx| {
+                        workspace.add_pane(window, cx).downgrade()
+                    })
                     .log_err()?;
                 let active = serialized_pane.active;
                 let new_items = serialized_pane
                     .deserialize_to(project, &pane, workspace_id, workspace.clone(), cx)
                     .await
+                    .context("Could not deserialize pane)")
                     .log_err()?;
 
-                if pane.update(cx, |pane, _| pane.items_len() != 0).log_err()? {
+                if pane
+                    .read_with(cx, |pane, _| pane.items_len() != 0)
+                    .log_err()?
+                {
                     let pane = pane.upgrade()?;
                     Some((
                         Member::Pane(pane.clone()),
@@ -389,8 +266,8 @@ impl SerializedPaneGroup {
                 } else {
                     let pane = pane.upgrade()?;
                     workspace
-                        .update(cx, |workspace, cx| {
-                            workspace.force_remove_pane(&pane, &None, cx)
+                        .update_in(cx, |workspace, window, cx| {
+                            workspace.force_remove_pane(&pane, &None, window, cx)
                         })
                         .log_err()?;
                     None
@@ -418,10 +295,10 @@ impl SerializedPane {
 
     pub async fn deserialize_to(
         &self,
-        project: &Model<Project>,
-        pane: &WeakView<Pane>,
+        project: &Entity<Project>,
+        pane: &WeakEntity<Pane>,
         workspace_id: WorkspaceId,
-        workspace: WeakView<Workspace>,
+        workspace: WeakEntity<Workspace>,
         cx: &mut AsyncWindowContext,
     ) -> Result<Vec<Option<Box<dyn ItemHandle>>>> {
         let mut item_tasks = Vec::new();
@@ -429,13 +306,14 @@ impl SerializedPane {
         let mut preview_item_index = None;
         for (index, item) in self.children.iter().enumerate() {
             let project = project.clone();
-            item_tasks.push(pane.update(cx, |_, cx| {
+            item_tasks.push(pane.update_in(cx, |_, window, cx| {
                 SerializableItemRegistry::deserialize(
                     &item.kind,
                     project,
                     workspace.clone(),
                     workspace_id,
                     item.item_id,
+                    window,
                     cx,
                 )
             })?);
@@ -453,15 +331,15 @@ impl SerializedPane {
             items.push(item_handle.clone());
 
             if let Some(item_handle) = item_handle {
-                pane.update(cx, |pane, cx| {
-                    pane.add_item(item_handle.clone(), true, true, None, cx);
+                pane.update_in(cx, |pane, window, cx| {
+                    pane.add_item(item_handle.clone(), true, true, None, window, cx);
                 })?;
             }
         }
 
         if let Some(active_item_index) = active_item_index {
-            pane.update(cx, |pane, cx| {
-                pane.activate_item(active_item_index, false, false, cx);
+            pane.update_in(cx, |pane, window, cx| {
+                pane.activate_item(active_item_index, false, false, window, cx);
             })?;
         }
 
@@ -473,7 +351,7 @@ impl SerializedPane {
             })?;
         }
         pane.update(cx, |pane, _| {
-            pane.set_pinned_count(self.pinned_count);
+            pane.set_pinned_count(self.pinned_count.min(items.len()));
         })?;
 
         anyhow::Ok(items)
@@ -544,24 +422,5 @@ impl Column for SerializedItem {
             },
             next_index,
         ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_serialize_local_paths() {
-        let paths = vec!["b", "a", "c"];
-        let serialized = SerializedWorkspaceLocation::from_local_paths(paths);
-
-        assert_eq!(
-            serialized,
-            SerializedWorkspaceLocation::Local(
-                LocalPaths::new(vec!["a", "b", "c"]),
-                LocalPathsOrder::new(vec![1, 0, 2])
-            )
-        );
     }
 }

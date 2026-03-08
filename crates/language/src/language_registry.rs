@@ -1,27 +1,27 @@
 use crate::{
-    language_settings::{
-        all_language_settings, AllLanguageSettingsContent, LanguageSettingsContent,
-    },
-    task_context::ContextProvider,
-    with_parser, CachedLspAdapter, File, Language, LanguageConfig, LanguageId, LanguageMatcher,
-    LanguageServerName, LspAdapter, ToolchainLister, PLAIN_TEXT,
+    CachedLspAdapter, File, Language, LanguageConfig, LanguageId, LanguageMatcher,
+    LanguageServerName, LspAdapter, ManifestName, PLAIN_TEXT, ToolchainLister,
+    language_settings::all_language_settings, task_context::ContextProvider, with_parser,
 };
-use anyhow::{anyhow, Context, Result};
-use collections::{hash_map, HashMap, HashSet};
+use anyhow::{Context as _, Result, anyhow};
+use collections::{FxHashMap, HashMap, HashSet, hash_map};
+use settings::{AllLanguageSettingsContent, LanguageSettingsContent};
 
 use futures::{
-    channel::{mpsc, oneshot},
     Future,
+    channel::{mpsc, oneshot},
 };
 use globset::GlobSet;
-use gpui::{AppContext, BackgroundExecutor};
+use gpui::{App, BackgroundExecutor, SharedString};
 use lsp::LanguageServerId;
 use parking_lot::{Mutex, RwLock};
 use postage::watch;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::{
     borrow::{Borrow, Cow},
+    cell::LazyCell,
     ffi::OsStr,
     ops::Not,
     path::{Path, PathBuf},
@@ -31,29 +31,53 @@ use sum_tree::Bias;
 use text::{Point, Rope};
 use theme::Theme;
 use unicase::UniCase;
-use util::{maybe, paths::PathExt, post_inc, ResultExt};
+use util::{ResultExt, maybe, post_inc};
 
 #[derive(
     Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
 )]
-pub struct LanguageName(pub Arc<str>);
+pub struct LanguageName(pub SharedString);
 
 impl LanguageName {
     pub fn new(s: &str) -> Self {
-        Self(Arc::from(s))
+        Self(SharedString::new(s))
+    }
+
+    pub fn new_static(s: &'static str) -> Self {
+        Self(SharedString::new_static(s))
     }
 
     pub fn from_proto(s: String) -> Self {
-        Self(Arc::from(s))
+        Self(SharedString::from(s))
     }
-    pub fn to_proto(self) -> String {
+
+    pub fn to_proto(&self) -> String {
         self.0.to_string()
     }
+
     pub fn lsp_id(&self) -> String {
         match self.0.as_ref() {
             "Plain Text" => "plaintext".to_string(),
             language_name => language_name.to_lowercase(),
         }
+    }
+}
+
+impl From<LanguageName> for SharedString {
+    fn from(value: LanguageName) -> Self {
+        value.0
+    }
+}
+
+impl From<SharedString> for LanguageName {
+    fn from(value: SharedString) -> Self {
+        LanguageName(value)
+    }
+}
+
+impl AsRef<str> for LanguageName {
+    fn as_ref(&self) -> &str {
+        self.0.as_ref()
     }
 }
 
@@ -63,15 +87,27 @@ impl Borrow<str> for LanguageName {
     }
 }
 
+impl PartialEq<str> for LanguageName {
+    fn eq(&self, other: &str) -> bool {
+        self.0.as_ref() == other
+    }
+}
+
+impl PartialEq<&str> for LanguageName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0.as_ref() == *other
+    }
+}
+
 impl std::fmt::Display for LanguageName {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-impl<'a> From<&'a str> for LanguageName {
-    fn from(str: &'a str) -> LanguageName {
-        LanguageName(str.into())
+impl From<&'static str> for LanguageName {
+    fn from(str: &'static str) -> Self {
+        Self(SharedString::new_static(str))
     }
 }
 
@@ -86,7 +122,7 @@ pub struct LanguageRegistry {
     state: RwLock<LanguageRegistryState>,
     language_server_download_dir: Option<Arc<Path>>,
     executor: BackgroundExecutor,
-    lsp_binary_status_tx: LspBinaryStatusSender,
+    lsp_binary_status_tx: ServerStatusSender,
 }
 
 struct LanguageRegistryState {
@@ -96,6 +132,7 @@ struct LanguageRegistryState {
     available_languages: Vec<AvailableLanguage>,
     grammars: HashMap<Arc<str>, AvailableGrammar>,
     lsp_adapters: HashMap<LanguageName, Vec<Arc<CachedLspAdapter>>>,
+    all_lsp_adapters: HashMap<LanguageServerName, Arc<CachedLspAdapter>>,
     available_lsp_adapters:
         HashMap<LanguageServerName, Arc<dyn Fn() -> Arc<CachedLspAdapter> + 'static + Send + Sync>>,
     loading_languages: HashMap<LanguageId, Vec<oneshot::Sender<Result<Arc<Language>>>>>,
@@ -117,10 +154,27 @@ pub struct FakeLanguageServerEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum LanguageServerBinaryStatus {
+pub enum LanguageServerStatusUpdate {
+    Binary(BinaryStatus),
+    Health(ServerHealth, Option<SharedString>),
+}
+
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize, Clone, Copy)]
+#[serde(rename_all = "camelCase")]
+pub enum ServerHealth {
+    Ok,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BinaryStatus {
     None,
     CheckingForUpdate,
     Downloading,
+    Starting,
+    Stopping,
+    Stopped,
     Failed { error: String },
 }
 
@@ -130,8 +184,10 @@ pub struct AvailableLanguage {
     name: LanguageName,
     grammar: Option<Arc<str>>,
     matcher: LanguageMatcher,
+    hidden: bool,
     load: Arc<dyn Fn() -> Result<LoadedLanguage> + 'static + Send + Sync>,
     loaded: bool,
+    manifest_name: Option<ManifestName>,
 }
 
 impl AvailableLanguage {
@@ -142,6 +198,18 @@ impl AvailableLanguage {
     pub fn matcher(&self) -> &LanguageMatcher {
         &self.matcher
     }
+
+    pub fn hidden(&self) -> bool {
+        self.hidden
+    }
+}
+
+#[derive(Copy, Clone, Default)]
+enum LanguageMatchPrecedence {
+    #[default]
+    Undetermined,
+    PathOrContent(usize),
+    UserConfigured(usize),
 }
 
 enum AvailableGrammar {
@@ -172,11 +240,13 @@ pub const QUERY_FILENAME_PREFIXES: &[(
     ("brackets", |q| &mut q.brackets),
     ("outline", |q| &mut q.outline),
     ("indents", |q| &mut q.indents),
-    ("embedding", |q| &mut q.embedding),
     ("injections", |q| &mut q.injections),
     ("overrides", |q| &mut q.overrides),
     ("redactions", |q| &mut q.redactions),
     ("runnables", |q| &mut q.runnables),
+    ("debugger", |q| &mut q.debugger),
+    ("textobjects", |q| &mut q.text_objects),
+    ("imports", |q| &mut q.imports),
 ];
 
 /// Tree-sitter language queries for a given language.
@@ -186,16 +256,18 @@ pub struct LanguageQueries {
     pub brackets: Option<Cow<'static, str>>,
     pub indents: Option<Cow<'static, str>>,
     pub outline: Option<Cow<'static, str>>,
-    pub embedding: Option<Cow<'static, str>>,
     pub injections: Option<Cow<'static, str>>,
     pub overrides: Option<Cow<'static, str>>,
     pub redactions: Option<Cow<'static, str>>,
     pub runnables: Option<Cow<'static, str>>,
+    pub text_objects: Option<Cow<'static, str>>,
+    pub debugger: Option<Cow<'static, str>>,
+    pub imports: Option<Cow<'static, str>>,
 }
 
 #[derive(Clone, Default)]
-struct LspBinaryStatusSender {
-    txs: Arc<Mutex<Vec<mpsc::UnboundedSender<(LanguageServerName, LanguageServerBinaryStatus)>>>>,
+struct ServerStatusSender {
+    txs: Arc<Mutex<Vec<mpsc::UnboundedSender<(LanguageServerName, BinaryStatus)>>>>,
 }
 
 pub struct LoadedLanguage {
@@ -203,6 +275,7 @@ pub struct LoadedLanguage {
     pub queries: LanguageQueries,
     pub context_provider: Option<Arc<dyn ContextProvider>>,
     pub toolchain_provider: Option<Arc<dyn ToolchainLister>>,
+    pub manifest_name: Option<ManifestName>,
 }
 
 impl LanguageRegistry {
@@ -216,6 +289,7 @@ impl LanguageRegistry {
                 language_settings: Default::default(),
                 loading_languages: Default::default(),
                 lsp_adapters: Default::default(),
+                all_lsp_adapters: Default::default(),
                 available_lsp_adapters: HashMap::default(),
                 subscription: watch::channel(),
                 theme: Default::default(),
@@ -277,6 +351,9 @@ impl LanguageRegistry {
         if let Some(adapters) = state.lsp_adapters.get_mut(language_name) {
             adapters.retain(|adapter| &adapter.name != name)
         }
+        state.all_lsp_adapters.remove(name);
+        state.available_lsp_adapters.remove(name);
+
         state.version += 1;
         state.reload_count += 1;
         *state.subscription.0.borrow_mut() = ();
@@ -288,12 +365,15 @@ impl LanguageRegistry {
             config.name.clone(),
             config.grammar.clone(),
             config.matcher.clone(),
+            config.hidden,
+            None,
             Arc::new(move || {
                 Ok(LoadedLanguage {
                     config: config.clone(),
                     queries: Default::default(),
                     toolchain_provider: None,
                     context_provider: None,
+                    manifest_name: None,
                 })
             }),
         )
@@ -309,14 +389,23 @@ impl LanguageRegistry {
     pub fn register_available_lsp_adapter(
         &self,
         name: LanguageServerName,
-        load: impl Fn() -> Arc<dyn LspAdapter> + 'static + Send + Sync,
+        adapter: Arc<dyn LspAdapter>,
     ) {
-        self.state.write().available_lsp_adapters.insert(
+        let mut state = self.state.write();
+
+        if adapter.is_extension()
+            && let Some(existing_adapter) = state.all_lsp_adapters.get(&name)
+            && !existing_adapter.adapter.is_extension()
+        {
+            log::warn!(
+                "not registering extension-provided language server {name:?}, since a builtin language server exists with that name",
+            );
+            return;
+        }
+
+        state.available_lsp_adapters.insert(
             name,
-            Arc::new(move || {
-                let lsp_adapter = load();
-                CachedLspAdapter::new(lsp_adapter)
-            }),
+            Arc::new(move || CachedLspAdapter::new(adapter.clone())),
         );
     }
 
@@ -331,43 +420,46 @@ impl LanguageRegistry {
         Some(load_lsp_adapter())
     }
 
-    pub fn register_lsp_adapter(
-        &self,
-        language_name: LanguageName,
-        adapter: Arc<dyn LspAdapter>,
-    ) -> Arc<CachedLspAdapter> {
-        let cached = CachedLspAdapter::new(adapter);
+    /// Checks if a language server adapter with the given name is available to be loaded.
+    pub fn is_lsp_adapter_available(&self, name: &LanguageServerName) -> bool {
+        let state = self.state.read();
+        state.available_lsp_adapters.contains_key(name)
+    }
+
+    /// Returns the names of all available LSP adapters (registered via `register_available_lsp_adapter`).
+    /// These are adapters that are not bound to a specific language but can be enabled via settings.
+    pub fn available_lsp_adapter_names(&self) -> Vec<LanguageServerName> {
         self.state
-            .write()
+            .read()
+            .available_lsp_adapters
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    pub fn register_lsp_adapter(&self, language_name: LanguageName, adapter: Arc<dyn LspAdapter>) {
+        let mut state = self.state.write();
+
+        if adapter.is_extension()
+            && let Some(existing_adapter) = state.all_lsp_adapters.get(&adapter.name())
+            && !existing_adapter.adapter.is_extension()
+        {
+            log::warn!(
+                "not registering extension-provided language server {:?} for language {language_name:?}, since a builtin language server exists with that name",
+                adapter.name(),
+            );
+            return;
+        }
+
+        let cached = CachedLspAdapter::new(adapter);
+        state
             .lsp_adapters
             .entry(language_name)
             .or_default()
             .push(cached.clone());
-        cached
-    }
-
-    pub fn get_or_register_lsp_adapter(
-        &self,
-        language_name: LanguageName,
-        server_name: LanguageServerName,
-        build_adapter: impl FnOnce() -> Arc<dyn LspAdapter> + 'static,
-    ) -> Arc<CachedLspAdapter> {
-        let registered = self
-            .state
-            .write()
-            .lsp_adapters
-            .entry(language_name.clone())
-            .or_default()
-            .iter()
-            .find(|cached_adapter| cached_adapter.name == server_name)
-            .cloned();
-
-        if let Some(found) = registered {
-            found
-        } else {
-            let adapter = build_adapter();
-            self.register_lsp_adapter(language_name, adapter)
-        }
+        state
+            .all_lsp_adapters
+            .insert(cached.name.clone(), cached.clone());
     }
 
     /// Register a fake language server and adapter
@@ -378,21 +470,14 @@ impl LanguageRegistry {
         language_name: impl Into<LanguageName>,
         mut adapter: crate::FakeLspAdapter,
     ) -> futures::channel::mpsc::UnboundedReceiver<lsp::FakeLanguageServer> {
-        let language_name = language_name.into();
         let adapter_name = LanguageServerName(adapter.name.into());
         let capabilities = adapter.capabilities.clone();
         let initializer = adapter.initializer.take();
-        self.state
-            .write()
-            .lsp_adapters
-            .entry(language_name.clone())
-            .or_default()
-            .push(CachedLspAdapter::new(Arc::new(adapter)));
-        self.register_fake_language_server(adapter_name, capabilities, initializer)
+        self.register_fake_lsp_adapter(language_name, adapter);
+        self.register_fake_lsp_server(adapter_name, capabilities, initializer)
     }
 
     /// Register a fake lsp adapter (without the language server)
-    /// The returned channel receives a new instance of the language server every time it is started
     #[cfg(any(feature = "test-support", test))]
     pub fn register_fake_lsp_adapter(
         &self,
@@ -400,18 +485,22 @@ impl LanguageRegistry {
         adapter: crate::FakeLspAdapter,
     ) {
         let language_name = language_name.into();
-        self.state
-            .write()
+        let mut state = self.state.write();
+        let cached_adapter = CachedLspAdapter::new(Arc::new(adapter));
+        state
             .lsp_adapters
-            .entry(language_name.clone())
+            .entry(language_name)
             .or_default()
-            .push(CachedLspAdapter::new(Arc::new(adapter)));
+            .push(cached_adapter.clone());
+        state
+            .all_lsp_adapters
+            .insert(cached_adapter.name(), cached_adapter);
     }
 
     /// Register a fake language server (without the adapter)
     /// The returned channel receives a new instance of the language server every time it is started
     #[cfg(any(feature = "test-support", test))]
-    pub fn register_fake_language_server(
+    pub fn register_fake_lsp_server(
         &self,
         lsp_name: LanguageServerName,
         capabilities: lsp::ServerCapabilities,
@@ -430,12 +519,19 @@ impl LanguageRegistry {
         servers_rx
     }
 
+    #[cfg(any(feature = "test-support", test))]
+    pub fn has_fake_lsp_server(&self, lsp_name: &LanguageServerName) -> bool {
+        self.state.read().fake_server_entries.contains_key(lsp_name)
+    }
+
     /// Adds a language to the registry, which can be loaded if needed.
     pub fn register_language(
         &self,
         name: LanguageName,
         grammar_name: Option<Arc<str>>,
         matcher: LanguageMatcher,
+        hidden: bool,
+        manifest_name: Option<ManifestName>,
         load: Arc<dyn Fn() -> Result<LoadedLanguage> + 'static + Send + Sync>,
     ) {
         let state = &mut *self.state.write();
@@ -445,6 +541,7 @@ impl LanguageRegistry {
                 existing_language.grammar = grammar_name;
                 existing_language.matcher = matcher;
                 existing_language.load = load;
+                existing_language.manifest_name = manifest_name;
                 return;
             }
         }
@@ -455,7 +552,9 @@ impl LanguageRegistry {
             grammar: grammar_name,
             matcher,
             load,
+            hidden,
             loaded: false,
+            manifest_name,
         });
         state.version += 1;
         state.reload_count += 1;
@@ -476,15 +575,16 @@ impl LanguageRegistry {
     }
 
     /// Adds paths to WASM grammar files, which can be loaded if needed.
-    pub fn register_wasm_grammars(
-        &self,
-        grammars: impl IntoIterator<Item = (impl Into<Arc<str>>, PathBuf)>,
-    ) {
+    pub fn register_wasm_grammars(&self, grammars: Vec<(Arc<str>, PathBuf)>) {
+        if grammars.is_empty() {
+            return;
+        }
+
         let mut state = self.state.write();
         state.grammars.extend(
             grammars
                 .into_iter()
-                .map(|(name, path)| (name.into(), AvailableGrammar::Unloaded(path))),
+                .map(|(name, path)| (name, AvailableGrammar::Unloaded(path))),
         );
         state.version += 1;
         state.reload_count += 1;
@@ -495,15 +595,15 @@ impl LanguageRegistry {
         self.state.read().language_settings.clone()
     }
 
-    pub fn language_names(&self) -> Vec<String> {
+    pub fn language_names(&self) -> Vec<LanguageName> {
         let state = self.state.read();
         let mut result = state
             .available_languages
             .iter()
-            .filter_map(|l| l.loaded.not().then_some(l.name.to_string()))
-            .chain(state.languages.iter().map(|l| l.config.name.to_string()))
+            .filter_map(|l| l.loaded.not().then_some(l.name.clone()))
+            .chain(state.languages.iter().map(|l| l.config.name.clone()))
             .collect::<Vec<_>>();
-        result.sort_unstable_by_key(|language_name| language_name.to_lowercase());
+        result.sort_unstable_by_key(|language_name| language_name.as_ref().to_lowercase());
         result
     }
 
@@ -522,6 +622,8 @@ impl LanguageRegistry {
             name: language.name(),
             grammar: language.config.grammar.clone(),
             matcher: language.config.matcher.clone(),
+            hidden: language.config.hidden,
+            manifest_name: None,
             load: Arc::new(|| Err(anyhow!("already loaded"))),
             loaded: true,
         });
@@ -558,16 +660,53 @@ impl LanguageRegistry {
     pub fn language_for_name(
         self: &Arc<Self>,
         name: &str,
-    ) -> impl Future<Output = Result<Arc<Language>>> {
+    ) -> impl Future<Output = Result<Arc<Language>>> + use<> {
         let name = UniCase::new(name);
-        let rx = self.get_or_load_language(|language_name, _| {
-            if UniCase::new(&language_name.0) == name {
-                1
-            } else {
-                0
+        let rx = self.get_or_load_language(|language_name, _, current_best_match| {
+            match current_best_match {
+                LanguageMatchPrecedence::Undetermined if UniCase::new(&language_name.0) == name => {
+                    Some(LanguageMatchPrecedence::PathOrContent(name.len()))
+                }
+                LanguageMatchPrecedence::Undetermined
+                | LanguageMatchPrecedence::UserConfigured(_)
+                | LanguageMatchPrecedence::PathOrContent(_) => None,
             }
         });
         async move { rx.await? }
+    }
+
+    pub async fn language_for_id(self: &Arc<Self>, id: LanguageId) -> Result<Arc<Language>> {
+        let available_language = {
+            let state = self.state.read();
+
+            let Some(available_language) = state
+                .available_languages
+                .iter()
+                .find(|lang| lang.id == id)
+                .cloned()
+            else {
+                anyhow::bail!(LanguageNotFound);
+            };
+            available_language
+        };
+
+        self.load_language(&available_language).await?
+    }
+
+    pub fn language_name_for_extension(self: &Arc<Self>, extension: &str) -> Option<LanguageName> {
+        self.state.try_read().and_then(|state| {
+            state
+                .available_languages
+                .iter()
+                .find(|language| {
+                    language
+                        .matcher()
+                        .path_suffixes
+                        .iter()
+                        .any(|suffix| *suffix == extension)
+                })
+                .map(|language| language.name.clone())
+        })
     }
 
     pub fn language_for_name_or_extension(
@@ -575,30 +714,34 @@ impl LanguageRegistry {
         string: &str,
     ) -> impl Future<Output = Result<Arc<Language>>> {
         let string = UniCase::new(string);
-        let rx = self.get_or_load_language(|name, config| {
-            if UniCase::new(&name.0) == string
-                || config
-                    .path_suffixes
-                    .iter()
-                    .any(|suffix| UniCase::new(suffix) == string)
-            {
-                1
-            } else {
-                0
+        let rx = self.get_or_load_language(|name, config, current_best_match| {
+            let name_matches = || {
+                UniCase::new(&name.0) == string
+                    || config
+                        .path_suffixes
+                        .iter()
+                        .any(|suffix| UniCase::new(suffix) == string)
+            };
+
+            match current_best_match {
+                LanguageMatchPrecedence::Undetermined => {
+                    name_matches().then_some(LanguageMatchPrecedence::PathOrContent(string.len()))
+                }
+                LanguageMatchPrecedence::PathOrContent(len) => (string.len() > len
+                    && name_matches())
+                .then_some(LanguageMatchPrecedence::PathOrContent(string.len())),
+                LanguageMatchPrecedence::UserConfigured(_) => None,
             }
         });
         async move { rx.await? }
     }
 
-    pub fn available_language_for_name(
-        self: &Arc<Self>,
-        name: &LanguageName,
-    ) -> Option<AvailableLanguage> {
+    pub fn available_language_for_name(self: &Arc<Self>, name: &str) -> Option<AvailableLanguage> {
         let state = self.state.read();
         state
             .available_languages
             .iter()
-            .find(|l| &l.name == name)
+            .find(|l| l.name.0.as_ref() == name)
             .cloned()
     }
 
@@ -606,7 +749,7 @@ impl LanguageRegistry {
         self: &Arc<Self>,
         file: &Arc<dyn File>,
         content: Option<&Rope>,
-        cx: &AppContext,
+        cx: &App,
     ) -> Option<AvailableLanguage> {
         let user_file_types = all_language_settings(Some(file), cx);
 
@@ -617,15 +760,20 @@ impl LanguageRegistry {
         )
     }
 
-    pub fn language_for_file_path<'a>(
+    pub fn language_for_file_path(self: &Arc<Self>, path: &Path) -> Option<AvailableLanguage> {
+        self.language_for_file_internal(path, None, None)
+    }
+
+    #[ztracing::instrument(skip_all)]
+    pub fn load_language_for_file_path<'a>(
         self: &Arc<Self>,
         path: &'a Path,
     ) -> impl Future<Output = Result<Arc<Language>>> + 'a {
-        let available_language = self.language_for_file_internal(path, None, None);
+        let language = self.language_for_file_path(path);
 
         let this = self.clone();
         async move {
-            if let Some(language) = available_language {
+            if let Some(language) = language {
                 this.load_language(&language).await?
             } else {
                 Err(anyhow!(LanguageNotFound))
@@ -637,67 +785,169 @@ impl LanguageRegistry {
         self: &Arc<Self>,
         path: &Path,
         content: Option<&Rope>,
-        user_file_types: Option<&HashMap<Arc<str>, GlobSet>>,
+        user_file_types: Option<&FxHashMap<Arc<str>, (GlobSet, Vec<String>)>>,
     ) -> Option<AvailableLanguage> {
-        let filename = path.file_name().and_then(|name| name.to_str());
-        let extension = path.extension_or_hidden_file_name();
-        let path_suffixes = [extension, filename, path.to_str()];
-        let empty = GlobSet::empty();
+        let filename = path.file_name().and_then(|filename| filename.to_str());
+        // `Path.extension()` returns None for files with a leading '.'
+        // and no other extension which is not the desired behavior here,
+        // as we want `.zshrc` to result in extension being `Some("zshrc")`
+        let extension = filename.and_then(|filename| filename.split('.').next_back());
+        let path_suffixes = [extension, filename, path.to_str()]
+            .iter()
+            .filter_map(|suffix| suffix.map(|suffix| (suffix, globset::Candidate::new(suffix))))
+            .collect::<SmallVec<[_; 3]>>();
+        let content = LazyCell::new(|| {
+            content.map(|content| {
+                let end = content.clip_point(Point::new(0, 256), Bias::Left);
+                let end = content.point_to_offset(end);
+                content.chunks_in_range(0..end).collect::<String>()
+            })
+        });
+        self.find_matching_language(move |language_name, config, current_best_match| {
+            let path_matches_default_suffix = || {
+                let len =
+                    config
+                        .path_suffixes
+                        .iter()
+                        .fold(0, |acc: usize, path_suffix: &String| {
+                            let ext = ".".to_string() + path_suffix;
 
-        self.find_matching_language(move |language_name, config| {
-            let path_matches_default_suffix = config
-                .path_suffixes
-                .iter()
-                .any(|suffix| path_suffixes.contains(&Some(suffix.as_str())));
-            let custom_suffixes = user_file_types
-                .and_then(|types| types.get(&language_name.0))
-                .unwrap_or(&empty);
-            let path_matches_custom_suffix = path_suffixes
-                .iter()
-                .map(|suffix| suffix.unwrap_or(""))
-                .any(|suffix| custom_suffixes.is_match(suffix));
-            let content_matches = content.zip(config.first_line_pattern.as_ref()).map_or(
-                false,
-                |(content, pattern)| {
-                    let end = content.clip_point(Point::new(0, 256), Bias::Left);
-                    let end = content.point_to_offset(end);
-                    let text = content.chunks_in_range(0..end).collect::<String>();
-                    pattern.is_match(&text)
-                },
-            );
-            if path_matches_custom_suffix {
-                2
-            } else if path_matches_default_suffix || content_matches {
-                1
-            } else {
-                0
+                            let matched_suffix_len = path_suffixes
+                                .iter()
+                                .find(|(suffix, _)| suffix.ends_with(&ext) || suffix == path_suffix)
+                                .map(|(suffix, _)| suffix.len());
+
+                            match matched_suffix_len {
+                                Some(len) => acc.max(len),
+                                None => acc,
+                            }
+                        });
+                (len > 0).then_some(len)
+            };
+
+            let path_matches_custom_suffix = || {
+                user_file_types
+                    .and_then(|types| types.get(language_name.as_ref()))
+                    .map_or(None, |(custom_suffixes, _)| {
+                        path_suffixes
+                            .iter()
+                            .find(|(_, candidate)| custom_suffixes.is_match_candidate(candidate))
+                            .map(|(suffix, _)| suffix.len())
+                    })
+            };
+
+            let content_matches = || {
+                config.first_line_pattern.as_ref().is_some_and(|pattern| {
+                    content
+                        .as_ref()
+                        .is_some_and(|content| pattern.is_match(content))
+                })
+            };
+
+            // Only return a match for the given file if we have a better match than
+            // the current one.
+            match current_best_match {
+                LanguageMatchPrecedence::PathOrContent(current_len) => {
+                    if let Some(len) = path_matches_custom_suffix() {
+                        // >= because user config should win tie with system ext len
+                        (len >= current_len).then_some(LanguageMatchPrecedence::UserConfigured(len))
+                    } else if let Some(len) = path_matches_default_suffix() {
+                        // >= because user config should win tie with system ext len
+                        (len >= current_len).then_some(LanguageMatchPrecedence::PathOrContent(len))
+                    } else {
+                        None
+                    }
+                }
+                LanguageMatchPrecedence::Undetermined => {
+                    if let Some(len) = path_matches_custom_suffix() {
+                        Some(LanguageMatchPrecedence::UserConfigured(len))
+                    } else if let Some(len) = path_matches_default_suffix() {
+                        Some(LanguageMatchPrecedence::PathOrContent(len))
+                    } else if content_matches() {
+                        Some(LanguageMatchPrecedence::PathOrContent(1))
+                    } else {
+                        None
+                    }
+                }
+                LanguageMatchPrecedence::UserConfigured(_) => None,
             }
         })
     }
 
     fn find_matching_language(
         self: &Arc<Self>,
-        callback: impl Fn(&LanguageName, &LanguageMatcher) -> usize,
+        callback: impl Fn(
+            &LanguageName,
+            &LanguageMatcher,
+            LanguageMatchPrecedence,
+        ) -> Option<LanguageMatchPrecedence>,
     ) -> Option<AvailableLanguage> {
         let state = self.state.read();
         let available_language = state
             .available_languages
             .iter()
-            .filter_map(|language| {
-                let score = callback(&language.name, &language.matcher);
-                if score > 0 {
-                    Some((language.clone(), score))
-                } else {
-                    None
+            .rev()
+            .fold(None, |best_language_match, language| {
+                let current_match_type = best_language_match
+                    .as_ref()
+                    .map_or(LanguageMatchPrecedence::default(), |(_, score)| *score);
+                let language_score =
+                    callback(&language.name, &language.matcher, current_match_type);
+
+                match (language_score, current_match_type) {
+                    // no current best, so our candidate is better
+                    (
+                        Some(
+                            LanguageMatchPrecedence::PathOrContent(_)
+                            | LanguageMatchPrecedence::UserConfigured(_),
+                        ),
+                        LanguageMatchPrecedence::Undetermined,
+                    ) => language_score.map(|new_score| (language.clone(), new_score)),
+
+                    // our candidate is better only if the name is longer
+                    (
+                        Some(LanguageMatchPrecedence::PathOrContent(new_len)),
+                        LanguageMatchPrecedence::PathOrContent(current_len),
+                    )
+                    | (
+                        Some(LanguageMatchPrecedence::UserConfigured(new_len)),
+                        LanguageMatchPrecedence::UserConfigured(current_len),
+                    )
+                    | (
+                        Some(LanguageMatchPrecedence::PathOrContent(new_len)),
+                        LanguageMatchPrecedence::UserConfigured(current_len),
+                    ) => {
+                        if new_len > current_len {
+                            language_score.map(|new_score| (language.clone(), new_score))
+                        } else {
+                            best_language_match
+                        }
+                    }
+
+                    // our candidate is better if the name is longer or equal to
+                    (
+                        Some(LanguageMatchPrecedence::UserConfigured(new_len)),
+                        LanguageMatchPrecedence::PathOrContent(current_len),
+                    ) => {
+                        if new_len >= current_len {
+                            language_score.map(|new_score| (language.clone(), new_score))
+                        } else {
+                            best_language_match
+                        }
+                    }
+
+                    // no candidate, use current best
+                    (None, _) | (Some(LanguageMatchPrecedence::Undetermined), _) => {
+                        best_language_match
+                    }
                 }
             })
-            .max_by_key(|e| e.1)
-            .clone()
             .map(|(available_language, _)| available_language);
         drop(state);
         available_language
     }
 
+    #[ztracing::instrument(skip_all)]
     pub fn load_language(
         self: &Arc<Self>,
         language: &AvailableLanguage,
@@ -737,10 +987,12 @@ impl LanguageRegistry {
                                 Language::new_with_id(id, loaded_language.config, grammar)
                                     .with_context_provider(loaded_language.context_provider)
                                     .with_toolchain_lister(loaded_language.toolchain_provider)
+                                    .with_manifest(loaded_language.manifest_name)
                                     .with_queries(loaded_language.queries)
                             } else {
                                 Ok(Language::new_with_id(id, loaded_language.config, None)
                                     .with_context_provider(loaded_language.context_provider)
+                                    .with_manifest(loaded_language.manifest_name)
                                     .with_toolchain_lister(loaded_language.toolchain_provider))
                             }
                         }
@@ -760,15 +1012,13 @@ impl LanguageRegistry {
                                 }
                             }
                             Err(e) => {
-                                log::error!("failed to load language {name}:\n{:?}", e);
+                                log::error!("failed to load language {name}:\n{e:?}");
                                 let mut state = this.state.write();
                                 state.mark_language_loaded(id);
                                 if let Some(mut txs) = state.loading_languages.remove(&id) {
                                     for tx in txs.drain(..) {
                                         let _ = tx.send(Err(anyhow!(
-                                            "failed to load language {}: {}",
-                                            name,
-                                            e
+                                            "failed to load language {name}: {e}",
                                         )));
                                     }
                                 }
@@ -785,9 +1035,14 @@ impl LanguageRegistry {
         rx
     }
 
+    #[ztracing::instrument(skip_all)]
     fn get_or_load_language(
         self: &Arc<Self>,
-        callback: impl Fn(&LanguageName, &LanguageMatcher) -> usize,
+        callback: impl Fn(
+            &LanguageName,
+            &LanguageMatcher,
+            LanguageMatchPrecedence,
+        ) -> Option<LanguageMatchPrecedence>,
     ) -> oneshot::Receiver<Result<Arc<Language>>> {
         let Some(language) = self.find_matching_language(callback) else {
             let (tx, rx) = oneshot::channel();
@@ -802,6 +1057,8 @@ impl LanguageRegistry {
         self: &Arc<Self>,
         name: Arc<str>,
     ) -> impl Future<Output = Result<tree_sitter::Language>> {
+        let span = ztracing::debug_span!("get_or_load_grammar", name = &*name.clone());
+        let _enter = span.enter();
         let (tx, rx) = oneshot::channel();
         let mut state = self.state.write();
 
@@ -817,6 +1074,7 @@ impl LanguageRegistry {
                     txs.push(tx);
                 }
                 AvailableGrammar::Unloaded(wasm_path) => {
+                    log::trace!("start loading grammar {name:?}");
                     let this = self.clone();
                     let wasm_path = wasm_path.clone();
                     *grammar = AvailableGrammar::Loading(wasm_path.clone(), vec![tx]);
@@ -827,7 +1085,7 @@ impl LanguageRegistry {
                                 let grammar_name = wasm_path
                                     .file_stem()
                                     .and_then(OsStr::to_str)
-                                    .ok_or_else(|| anyhow!("invalid grammar filename"))?;
+                                    .context("invalid grammar filename")?;
                                 anyhow::Ok(with_parser(|parser| {
                                     let mut store = parser.take_wasm_store().unwrap();
                                     let grammar = store.load_language(grammar_name, &wasm_bytes);
@@ -842,6 +1100,7 @@ impl LanguageRegistry {
                                 Err(error) => AvailableGrammar::LoadFailed(error.clone()),
                             };
 
+                            log::trace!("finish loading grammar {name:?}");
                             let old_value = this.state.write().grammars.insert(name, value);
                             if let Some(AvailableGrammar::Loading(_, txs)) = old_value {
                                 for tx in txs {
@@ -853,7 +1112,7 @@ impl LanguageRegistry {
                 }
             }
         } else {
-            tx.send(Err(Arc::new(anyhow!("no such grammar {}", name))))
+            tx.send(Err(Arc::new(anyhow!("no such grammar {name}"))))
                 .ok();
         }
 
@@ -873,11 +1132,20 @@ impl LanguageRegistry {
             .unwrap_or_default()
     }
 
-    pub fn update_lsp_status(
-        &self,
-        server_name: LanguageServerName,
-        status: LanguageServerBinaryStatus,
-    ) {
+    pub fn all_lsp_adapters(&self) -> Vec<Arc<CachedLspAdapter>> {
+        self.state
+            .read()
+            .all_lsp_adapters
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn adapter_for_name(&self, name: &LanguageServerName) -> Option<Arc<CachedLspAdapter>> {
+        self.state.read().all_lsp_adapters.get(name).cloned()
+    }
+
+    pub fn update_lsp_binary_status(&self, server_name: LanguageServerName, status: BinaryStatus) {
         self.lsp_binary_status_tx.send(server_name, status);
     }
 
@@ -897,16 +1165,17 @@ impl LanguageRegistry {
         server_id: LanguageServerId,
         name: &LanguageServerName,
         binary: lsp::LanguageServerBinary,
-        cx: gpui::AsyncAppContext,
+        cx: &mut gpui::AsyncApp,
     ) -> Option<lsp::LanguageServer> {
         let mut state = self.state.write();
-        let fake_entry = state.fake_server_entries.get_mut(&name)?;
+        let fake_entry = state.fake_server_entries.get_mut(name)?;
+
         let (server, mut fake_server) = lsp::FakeLanguageServer::new(
             server_id,
             binary,
             name.0.to_string(),
             fake_entry.capabilities.clone(),
-            cx.clone(),
+            cx,
         );
         fake_entry._server = Some(fake_server.clone());
 
@@ -914,25 +1183,16 @@ impl LanguageRegistry {
             initializer(&mut fake_server);
         }
 
-        let tx = fake_entry.tx.clone();
-        cx.background_executor()
-            .spawn(async move {
-                if fake_server
-                    .try_receive_notification::<lsp::notification::Initialized>()
-                    .await
-                    .is_some()
-                {
-                    tx.unbounded_send(fake_server.clone()).ok();
-                }
-            })
-            .detach();
+        // Emit synchronously so tests can reliably observe server creation even if the LSP startup
+        // task hasn't progressed to initialization yet.
+        fake_entry.tx.unbounded_send(fake_server).ok();
 
         Some(server)
     }
 
     pub fn language_server_binary_statuses(
         &self,
-    ) -> mpsc::UnboundedReceiver<(LanguageServerName, LanguageServerBinaryStatus)> {
+    ) -> mpsc::UnboundedReceiver<(LanguageServerName, BinaryStatus)> {
         self.lsp_binary_status_tx.subscribe()
     }
 
@@ -958,16 +1218,15 @@ impl LanguageRegistryState {
         if let Some(theme) = self.theme.as_ref() {
             language.set_theme(theme.syntax());
         }
-        self.language_settings.languages.insert(
-            language.name(),
+        self.language_settings.languages.0.insert(
+            language.name().0.to_string(),
             LanguageSettingsContent {
                 tab_size: language.config.tab_size,
                 hard_tabs: language.config.hard_tabs,
                 soft_wrap: language.config.soft_wrap,
                 auto_indent_on_paste: language.config.auto_indent_on_paste,
                 ..Default::default()
-            }
-            .clone(),
+            },
         );
         self.languages.push(language);
         self.version += 1;
@@ -1046,16 +1305,14 @@ impl LanguageRegistryState {
     }
 }
 
-impl LspBinaryStatusSender {
-    fn subscribe(
-        &self,
-    ) -> mpsc::UnboundedReceiver<(LanguageServerName, LanguageServerBinaryStatus)> {
+impl ServerStatusSender {
+    fn subscribe(&self) -> mpsc::UnboundedReceiver<(LanguageServerName, BinaryStatus)> {
         let (tx, rx) = mpsc::unbounded();
         self.txs.lock().push(tx);
         rx
     }
 
-    fn send(&self, name: LanguageServerName, status: LanguageServerBinaryStatus) {
+    fn send(&self, name: LanguageServerName, status: BinaryStatus) {
         let mut txs = self.txs.lock();
         txs.retain(|tx| tx.unbounded_send((name.clone(), status.clone())).is_ok());
     }

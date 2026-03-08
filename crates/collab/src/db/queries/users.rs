@@ -7,6 +7,7 @@ impl Database {
     pub async fn create_user(
         &self,
         email_address: &str,
+        name: Option<&str>,
         admin: bool,
         params: NewUserParams,
     ) -> Result<NewUserResult> {
@@ -14,10 +15,10 @@ impl Database {
             let tx = tx;
             let user = user::Entity::insert(user::ActiveModel {
                 email_address: ActiveValue::set(Some(email_address.into())),
+                name: ActiveValue::set(name.map(|s| s.into())),
                 github_login: ActiveValue::set(params.github_login.clone()),
                 github_user_id: ActiveValue::set(params.github_user_id),
                 admin: ActiveValue::set(admin),
-                metrics_id: ActiveValue::set(Uuid::new_v4()),
                 ..Default::default()
             })
             .on_conflict(
@@ -32,12 +33,7 @@ impl Database {
             .exec_with_returning(&*tx)
             .await?;
 
-            Ok(NewUserResult {
-                user_id: user.id,
-                metrics_id: user.metrics_id.to_string(),
-                signup_device_id: None,
-                inviting_user_id: None,
-            })
+            Ok(NewUserResult { user_id: user.id })
         })
         .await
     }
@@ -63,28 +59,6 @@ impl Database {
         .await
     }
 
-    /// Returns a user by email address. There are no access checks here, so this should only be used internally.
-    pub async fn get_user_by_email(&self, email: &str) -> Result<Option<User>> {
-        self.transaction(|tx| async move {
-            Ok(user::Entity::find()
-                .filter(user::Column::EmailAddress.eq(email))
-                .one(&*tx)
-                .await?)
-        })
-        .await
-    }
-
-    /// Returns a user by GitHub user ID. There are no access checks here, so this should only be used internally.
-    pub async fn get_user_by_github_user_id(&self, github_user_id: i32) -> Result<Option<User>> {
-        self.transaction(|tx| async move {
-            Ok(user::Entity::find()
-                .filter(user::Column::GithubUserId.eq(github_user_id))
-                .one(&*tx)
-                .await?)
-        })
-        .await
-    }
-
     /// Returns a user by GitHub login. There are no access checks here, so this should only be used internally.
     pub async fn get_user_by_github_login(&self, github_login: &str) -> Result<Option<User>> {
         self.transaction(|tx| async move {
@@ -96,19 +70,21 @@ impl Database {
         .await
     }
 
-    pub async fn get_or_create_user_by_github_account(
+    pub async fn update_or_create_user_by_github_account(
         &self,
         github_login: &str,
         github_user_id: i32,
         github_email: Option<&str>,
+        github_name: Option<&str>,
         github_user_created_at: DateTimeUtc,
         initial_channel_id: Option<ChannelId>,
     ) -> Result<User> {
         self.transaction(|tx| async move {
-            self.get_or_create_user_by_github_account_tx(
+            self.update_or_create_user_by_github_account_tx(
                 github_login,
                 github_user_id,
                 github_email,
+                github_name,
                 github_user_created_at.naive_utc(),
                 initial_channel_id,
                 &tx,
@@ -118,45 +94,41 @@ impl Database {
         .await
     }
 
-    pub async fn get_or_create_user_by_github_account_tx(
+    pub async fn update_or_create_user_by_github_account_tx(
         &self,
         github_login: &str,
         github_user_id: i32,
         github_email: Option<&str>,
+        github_name: Option<&str>,
         github_user_created_at: NaiveDateTime,
         initial_channel_id: Option<ChannelId>,
         tx: &DatabaseTransaction,
     ) -> Result<User> {
-        if let Some(user_by_github_user_id) = user::Entity::find()
-            .filter(user::Column::GithubUserId.eq(github_user_id))
-            .one(tx)
+        if let Some(existing_user) = self
+            .get_user_by_github_user_id_or_github_login(github_user_id, github_login, tx)
             .await?
         {
-            let mut user_by_github_user_id = user_by_github_user_id.into_active_model();
-            user_by_github_user_id.github_login = ActiveValue::set(github_login.into());
-            user_by_github_user_id.github_user_created_at =
-                ActiveValue::set(Some(github_user_created_at));
-            Ok(user_by_github_user_id.update(tx).await?)
-        } else if let Some(user_by_github_login) = user::Entity::find()
-            .filter(user::Column::GithubLogin.eq(github_login))
-            .one(tx)
-            .await?
-        {
-            let mut user_by_github_login = user_by_github_login.into_active_model();
-            user_by_github_login.github_user_id = ActiveValue::set(github_user_id);
-            user_by_github_login.github_user_created_at =
-                ActiveValue::set(Some(github_user_created_at));
-            Ok(user_by_github_login.update(tx).await?)
+            let mut existing_user = existing_user.into_active_model();
+            existing_user.github_login = ActiveValue::set(github_login.into());
+            existing_user.github_user_created_at = ActiveValue::set(Some(github_user_created_at));
+
+            if let Some(github_email) = github_email {
+                existing_user.email_address = ActiveValue::set(Some(github_email.into()));
+            }
+
+            if let Some(github_name) = github_name {
+                existing_user.name = ActiveValue::set(Some(github_name.into()));
+            }
+
+            Ok(existing_user.update(tx).await?)
         } else {
             let user = user::Entity::insert(user::ActiveModel {
                 email_address: ActiveValue::set(github_email.map(|email| email.into())),
+                name: ActiveValue::set(github_name.map(|name| name.into())),
                 github_login: ActiveValue::set(github_login.into()),
                 github_user_id: ActiveValue::set(github_user_id),
                 github_user_created_at: ActiveValue::set(Some(github_user_created_at)),
                 admin: ActiveValue::set(false),
-                invite_count: ActiveValue::set(0),
-                invite_code: ActiveValue::set(None),
-                metrics_id: ActiveValue::set(Uuid::new_v4()),
                 ..Default::default()
             })
             .exec_with_returning(tx)
@@ -176,6 +148,34 @@ impl Database {
         }
     }
 
+    /// Tries to retrieve a user, first by their GitHub user ID, and then by their GitHub login.
+    ///
+    /// Returns `None` if a user is not found with this GitHub user ID or GitHub login.
+    pub async fn get_user_by_github_user_id_or_github_login(
+        &self,
+        github_user_id: i32,
+        github_login: &str,
+        tx: &DatabaseTransaction,
+    ) -> Result<Option<User>> {
+        if let Some(user_by_github_user_id) = user::Entity::find()
+            .filter(user::Column::GithubUserId.eq(github_user_id))
+            .one(tx)
+            .await?
+        {
+            return Ok(Some(user_by_github_user_id));
+        }
+
+        if let Some(user_by_github_login) = user::Entity::find()
+            .filter(user::Column::GithubLogin.eq(github_login))
+            .one(tx)
+            .await?
+        {
+            return Ok(Some(user_by_github_login));
+        }
+
+        Ok(None)
+    }
+
     /// get_all_users returns the next page of users. To get more call again with
     /// the same limit and the page incremented by 1.
     pub async fn get_all_users(&self, page: u32, limit: u32) -> Result<Vec<User>> {
@@ -186,26 +186,6 @@ impl Database {
                 .offset(page as u64 * limit as u64)
                 .all(&*tx)
                 .await?)
-        })
-        .await
-    }
-
-    /// Returns the metrics id for the user.
-    pub async fn get_user_metrics_id(&self, id: UserId) -> Result<String> {
-        #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
-        enum QueryAs {
-            MetricsId,
-        }
-
-        self.transaction(|tx| async move {
-            let metrics_id: Uuid = user::Entity::find_by_id(id)
-                .select_only()
-                .column(user::Column::MetricsId)
-                .into_values::<_, QueryAs>()
-                .one(&*tx)
-                .await?
-                .ok_or_else(|| anyhow!("could not find user"))?;
-            Ok(metrics_id.to_string())
         })
         .await
     }
@@ -221,39 +201,6 @@ impl Database {
                 })
                 .exec(&*tx)
                 .await?;
-            Ok(())
-        })
-        .await
-    }
-
-    /// Sets "accepted_tos_at" on the user to the given timestamp.
-    pub async fn set_user_accepted_tos_at(
-        &self,
-        id: UserId,
-        accepted_tos_at: Option<DateTime>,
-    ) -> Result<()> {
-        self.transaction(|tx| async move {
-            user::Entity::update_many()
-                .filter(user::Column::Id.eq(id))
-                .set(user::ActiveModel {
-                    accepted_tos_at: ActiveValue::set(accepted_tos_at),
-                    ..Default::default()
-                })
-                .exec(&*tx)
-                .await?;
-            Ok(())
-        })
-        .await
-    }
-
-    /// hard delete the user.
-    pub async fn destroy_user(&self, id: UserId) -> Result<()> {
-        self.transaction(|tx| async move {
-            access_token::Entity::delete_many()
-                .filter(access_token::Column::UserId.eq(id))
-                .exec(&*tx)
-                .await?;
-            user::Entity::delete_by_id(id).exec(&*tx).await?;
             Ok(())
         })
         .await
@@ -296,88 +243,5 @@ impl Database {
         }
         result.push('%');
         result
-    }
-
-    /// Returns all feature flags.
-    pub async fn list_feature_flags(&self) -> Result<Vec<feature_flag::Model>> {
-        self.transaction(|tx| async move { Ok(feature_flag::Entity::find().all(&*tx).await?) })
-            .await
-    }
-
-    /// Creates a new feature flag.
-    pub async fn create_user_flag(&self, flag: &str, enabled_for_all: bool) -> Result<FlagId> {
-        self.transaction(|tx| async move {
-            let flag = feature_flag::Entity::insert(feature_flag::ActiveModel {
-                flag: ActiveValue::set(flag.to_string()),
-                enabled_for_all: ActiveValue::set(enabled_for_all),
-                ..Default::default()
-            })
-            .exec(&*tx)
-            .await?
-            .last_insert_id;
-
-            Ok(flag)
-        })
-        .await
-    }
-
-    /// Add the given user to the feature flag
-    pub async fn add_user_flag(&self, user: UserId, flag: FlagId) -> Result<()> {
-        self.transaction(|tx| async move {
-            user_feature::Entity::insert(user_feature::ActiveModel {
-                user_id: ActiveValue::set(user),
-                feature_id: ActiveValue::set(flag),
-            })
-            .exec(&*tx)
-            .await?;
-
-            Ok(())
-        })
-        .await
-    }
-
-    /// Returns the active flags for the user.
-    pub async fn get_user_flags(&self, user: UserId) -> Result<Vec<String>> {
-        self.transaction(|tx| async move {
-            #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
-            enum QueryAs {
-                Flag,
-            }
-
-            let flags_enabled_for_all = feature_flag::Entity::find()
-                .filter(feature_flag::Column::EnabledForAll.eq(true))
-                .select_only()
-                .column(feature_flag::Column::Flag)
-                .into_values::<_, QueryAs>()
-                .all(&*tx)
-                .await?;
-
-            let flags_enabled_for_user = user::Model {
-                id: user,
-                ..Default::default()
-            }
-            .find_linked(user::UserFlags)
-            .select_only()
-            .column(feature_flag::Column::Flag)
-            .into_values::<_, QueryAs>()
-            .all(&*tx)
-            .await?;
-
-            let mut all_flags = HashSet::from_iter(flags_enabled_for_all);
-            all_flags.extend(flags_enabled_for_user);
-
-            Ok(all_flags.into_iter().collect())
-        })
-        .await
-    }
-
-    pub async fn get_users_missing_github_user_created_at(&self) -> Result<Vec<user::Model>> {
-        self.transaction(|tx| async move {
-            Ok(user::Entity::find()
-                .filter(user::Column::GithubUserCreatedAt.is_null())
-                .all(&*tx)
-                .await?)
-        })
-        .await
     }
 }

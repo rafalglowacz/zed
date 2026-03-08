@@ -1,17 +1,29 @@
 use std::{cell::RefCell, rc::Rc};
 
 use crate::{
+    Vim,
     insert::NormalBefore,
     motion::Motion,
+    normal::InsertBefore,
     state::{Mode, Operator, RecordedSelection, ReplayableAction, VimGlobals},
-    Vim,
 };
 use editor::Editor;
-use gpui::{actions, Action, ViewContext, WindowContext};
-use util::ResultExt;
+use gpui::{Action, App, Context, Window, actions};
 use workspace::Workspace;
 
-actions!(vim, [Repeat, EndRepeat, ToggleRecord, ReplayLastRecording]);
+actions!(
+    vim,
+    [
+        /// Repeats the last change.
+        Repeat,
+        /// Ends the repeat recording.
+        EndRepeat,
+        /// Toggles macro recording.
+        ToggleRecord,
+        /// Replays the last recorded macro.
+        ReplayLastRecording
+    ]
+);
 
 fn should_replay(action: &dyn Action) -> bool {
     // skip so that we don't leave the character palette open
@@ -44,28 +56,30 @@ fn repeatable_insert(action: &ReplayableAction) -> Option<Box<dyn Action>> {
     }
 }
 
-pub(crate) fn register(editor: &mut Editor, cx: &mut ViewContext<Vim>) {
-    Vim::action(editor, cx, |vim, _: &EndRepeat, cx| {
+pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
+    Vim::action(editor, cx, |vim, _: &EndRepeat, window, cx| {
         Vim::globals(cx).dot_replaying = false;
-        vim.switch_mode(Mode::Normal, false, cx)
+        vim.switch_mode(Mode::Normal, false, window, cx)
     });
 
-    Vim::action(editor, cx, |vim, _: &Repeat, cx| vim.repeat(false, cx));
+    Vim::action(editor, cx, |vim, _: &Repeat, window, cx| {
+        vim.repeat(false, window, cx)
+    });
 
-    Vim::action(editor, cx, |vim, _: &ToggleRecord, cx| {
+    Vim::action(editor, cx, |vim, _: &ToggleRecord, window, cx| {
         let globals = Vim::globals(cx);
         if let Some(char) = globals.recording_register.take() {
             globals.last_recorded_register = Some(char)
         } else {
-            vim.push_operator(Operator::RecordRegister, cx);
+            vim.push_operator(Operator::RecordRegister, window, cx);
         }
     });
 
-    Vim::action(editor, cx, |vim, _: &ReplayLastRecording, cx| {
+    Vim::action(editor, cx, |vim, _: &ReplayLastRecording, window, cx| {
         let Some(register) = Vim::globals(cx).last_recorded_register else {
             return;
         };
-        vim.replay_register(register, cx)
+        vim.replay_register(register, window, cx)
     });
 }
 
@@ -87,7 +101,7 @@ impl Replayer {
         })))
     }
 
-    pub fn replay(&mut self, actions: Vec<ReplayableAction>, cx: &mut WindowContext) {
+    pub fn replay(&mut self, actions: Vec<ReplayableAction>, window: &mut Window, cx: &mut App) {
         let mut lock = self.0.borrow_mut();
         let range = lock.ix..lock.ix;
         lock.actions.splice(range, actions);
@@ -96,14 +110,31 @@ impl Replayer {
         }
         lock.running = true;
         let this = self.clone();
-        cx.defer(move |cx| this.next(cx))
+        window.defer(cx, move |window, cx| {
+            this.next(window, cx);
+            let Some(workspace) = Workspace::for_window(window, cx) else {
+                return;
+            };
+            let Some(editor) = workspace
+                .read(cx)
+                .active_item(cx)
+                .and_then(|item| item.act_as::<Editor>(cx))
+            else {
+                return;
+            };
+            editor.update(cx, |editor, cx| {
+                editor
+                    .buffer()
+                    .update(cx, |multi, cx| multi.finalize_last_transaction(cx))
+            });
+        })
     }
 
     pub fn stop(self) {
         self.0.borrow_mut().actions.clear()
     }
 
-    pub fn next(self, cx: &mut WindowContext) {
+    pub fn next(self, window: &mut Window, cx: &mut App) {
         let mut lock = self.0.borrow_mut();
         let action = if lock.ix < 10000 {
             lock.actions.get(lock.ix).cloned()
@@ -114,13 +145,19 @@ impl Replayer {
         lock.ix += 1;
         drop(lock);
         let Some(action) = action else {
-            Vim::globals(cx).replayer.take();
+            // The `globals.dot_replaying = false` is a fail-safe to ensure that
+            // this value is always reset, in the case that the focus is moved
+            // away from the editor, effectively preventing the `EndRepeat`
+            // action from being handled.
+            let globals = Vim::globals(cx);
+            globals.replayer.take();
+            globals.dot_replaying = false;
             return;
         };
         match action {
             ReplayableAction::Action(action) => {
                 if should_replay(&*action) {
-                    cx.dispatch_action(action.boxed_clone());
+                    window.dispatch_action(action.boxed_clone(), cx);
                     cx.defer(move |cx| Vim::globals(cx).observe_action(action.boxed_clone()));
                 }
             }
@@ -128,37 +165,48 @@ impl Replayer {
                 text,
                 utf16_range_to_replace,
             } => {
-                cx.window_handle()
-                    .update(cx, |handle, cx| {
-                        let Ok(workspace) = handle.downcast::<Workspace>() else {
-                            return;
-                        };
-                        let Some(editor) = workspace.read(cx).active_item_as::<Editor>(cx) else {
-                            return;
-                        };
-                        editor.update(cx, |editor, cx| {
-                            editor.replay_insert_event(&text, utf16_range_to_replace.clone(), cx)
-                        })
-                    })
-                    .log_err();
+                let Some(workspace) = Workspace::for_window(window, cx) else {
+                    return;
+                };
+                let Some(editor) = workspace
+                    .read(cx)
+                    .active_item(cx)
+                    .and_then(|item| item.act_as::<Editor>(cx))
+                else {
+                    return;
+                };
+                editor.update(cx, |editor, cx| {
+                    editor.replay_insert_event(&text, utf16_range_to_replace.clone(), window, cx)
+                })
             }
         }
-        cx.defer(move |cx| self.next(cx));
+        window.defer(cx, move |window, cx| self.next(window, cx));
     }
 }
 
 impl Vim {
-    pub(crate) fn record_register(&mut self, register: char, cx: &mut ViewContext<Self>) {
+    pub(crate) fn record_register(
+        &mut self,
+        register: char,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let globals = Vim::globals(cx);
         globals.recording_register = Some(register);
         globals.recordings.remove(&register);
         globals.ignore_current_insertion = true;
-        self.clear_operator(cx)
+        self.clear_operator(window, cx)
     }
 
-    pub(crate) fn replay_register(&mut self, mut register: char, cx: &mut ViewContext<Self>) {
-        let mut count = self.take_count(cx).unwrap_or(1);
-        self.clear_operator(cx);
+    pub(crate) fn replay_register(
+        &mut self,
+        mut register: char,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut count = Vim::take_count(cx).unwrap_or(1);
+        Vim::take_forced_motion(cx);
+        self.clear_operator(window, cx);
 
         let globals = Vim::globals(cx);
         if register == '@' {
@@ -179,24 +227,42 @@ impl Vim {
 
         globals.last_replayed_register = Some(register);
         let mut replayer = globals.replayer.get_or_insert_with(Replayer::new).clone();
-        replayer.replay(repeated_actions, cx);
+        replayer.replay(repeated_actions, window, cx);
     }
 
-    pub(crate) fn repeat(&mut self, from_insert_mode: bool, cx: &mut ViewContext<Self>) {
-        let count = self.take_count(cx);
+    pub(crate) fn repeat(
+        &mut self,
+        from_insert_mode: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_operator().is_some() {
+            Vim::update_globals(cx, |globals, _| {
+                globals.recording_actions.clear();
+                globals.recording_count = None;
+                globals.dot_recording = false;
+                globals.stop_recording_after_next_action = false;
+            });
+            self.clear_operator(window, cx);
+            return;
+        }
+
+        Vim::take_forced_motion(cx);
+        let count = Vim::take_count(cx);
+
         let Some((mut actions, selection, mode)) = Vim::update_globals(cx, |globals, _| {
             let actions = globals.recorded_actions.clone();
             if actions.is_empty() {
                 return None;
             }
-            if globals.replayer.is_none() {
-                if let Some(recording_register) = globals.recording_register {
-                    globals
-                        .recordings
-                        .entry(recording_register)
-                        .or_default()
-                        .push(ReplayableAction::Action(Repeat.boxed_clone()));
-                }
+            if globals.replayer.is_none()
+                && let Some(recording_register) = globals.recording_register
+            {
+                globals
+                    .recordings
+                    .entry(recording_register)
+                    .or_default()
+                    .push(ReplayableAction::Action(Repeat.boxed_clone()));
             }
 
             let mut mode = None;
@@ -225,67 +291,73 @@ impl Vim {
         }) else {
             return;
         };
-        if let Some(mode) = mode {
-            self.switch_mode(mode, false, cx)
-        }
+        if mode != Some(self.mode) {
+            if let Some(mode) = mode {
+                self.switch_mode(mode, false, window, cx)
+            }
 
-        match selection {
-            RecordedSelection::SingleLine { cols } => {
-                if cols > 1 {
-                    self.visual_motion(Motion::Right, Some(cols as usize - 1), cx)
+            match selection {
+                RecordedSelection::SingleLine { cols } => {
+                    if cols > 1 {
+                        self.visual_motion(Motion::Right, Some(cols as usize - 1), window, cx)
+                    }
                 }
-            }
-            RecordedSelection::Visual { rows, cols } => {
-                self.visual_motion(
-                    Motion::Down {
-                        display_lines: false,
-                    },
-                    Some(rows as usize),
-                    cx,
-                );
-                self.visual_motion(
-                    Motion::StartOfLine {
-                        display_lines: false,
-                    },
-                    None,
-                    cx,
-                );
-                if cols > 1 {
-                    self.visual_motion(Motion::Right, Some(cols as usize - 1), cx)
+                RecordedSelection::Visual { rows, cols } => {
+                    self.visual_motion(
+                        Motion::Down {
+                            display_lines: false,
+                        },
+                        Some(rows as usize),
+                        window,
+                        cx,
+                    );
+                    self.visual_motion(
+                        Motion::StartOfLine {
+                            display_lines: false,
+                        },
+                        None,
+                        window,
+                        cx,
+                    );
+                    if cols > 1 {
+                        self.visual_motion(Motion::Right, Some(cols as usize - 1), window, cx)
+                    }
                 }
-            }
-            RecordedSelection::VisualBlock { rows, cols } => {
-                self.visual_motion(
-                    Motion::Down {
-                        display_lines: false,
-                    },
-                    Some(rows as usize),
-                    cx,
-                );
-                if cols > 1 {
-                    self.visual_motion(Motion::Right, Some(cols as usize - 1), cx);
+                RecordedSelection::VisualBlock { rows, cols } => {
+                    self.visual_motion(
+                        Motion::Down {
+                            display_lines: false,
+                        },
+                        Some(rows as usize),
+                        window,
+                        cx,
+                    );
+                    if cols > 1 {
+                        self.visual_motion(Motion::Right, Some(cols as usize - 1), window, cx);
+                    }
                 }
+                RecordedSelection::VisualLine { rows } => {
+                    self.visual_motion(
+                        Motion::Down {
+                            display_lines: false,
+                        },
+                        Some(rows as usize),
+                        window,
+                        cx,
+                    );
+                }
+                RecordedSelection::None => {}
             }
-            RecordedSelection::VisualLine { rows } => {
-                self.visual_motion(
-                    Motion::Down {
-                        display_lines: false,
-                    },
-                    Some(rows as usize),
-                    cx,
-                );
-            }
-            RecordedSelection::None => {}
         }
 
         // insert internally uses repeat to handle counts
         // vim doesn't treat 3a1 as though you literally repeated a1
         // 3 times, instead it inserts the content thrice at the insert position.
         if let Some(to_repeat) = repeatable_insert(&actions[0]) {
-            if let Some(ReplayableAction::Action(action)) = actions.last() {
-                if NormalBefore.partial_eq(&**action) {
-                    actions.pop();
-                }
+            if let Some(ReplayableAction::Action(action)) = actions.last()
+                && NormalBefore.partial_eq(&**action)
+            {
+                actions.pop();
             }
 
             let mut new_actions = actions.clone();
@@ -308,10 +380,16 @@ impl Vim {
 
         actions.push(ReplayableAction::Action(EndRepeat.boxed_clone()));
 
+        if self.temp_mode {
+            self.temp_mode = false;
+            actions.push(ReplayableAction::Action(InsertBefore.boxed_clone()));
+        }
+
         let globals = Vim::globals(cx);
         globals.dot_replaying = true;
         let mut replayer = globals.replayer.get_or_insert_with(Replayer::new).clone();
-        replayer.replay(actions, cx);
+
+        replayer.replay(actions, window, cx);
     }
 }
 
@@ -321,9 +399,10 @@ mod test {
     use futures::StreamExt;
     use indoc::indoc;
 
-    use gpui::ViewInputHandler;
+    use gpui::EntityInputHandler;
 
     use crate::{
+        VimGlobals,
         state::Mode,
         test::{NeovimBackedTestContext, VimTestContext},
     };
@@ -370,9 +449,9 @@ mod test {
         cx.simulate_keystrokes("i");
 
         // simulate brazilian input for ä.
-        cx.update_editor(|editor, cx| {
-            editor.replace_and_mark_text_in_range(None, "\"", Some(1..1), cx);
-            editor.replace_text_in_range(None, "ä", cx);
+        cx.update_editor(|editor, window, cx| {
+            editor.replace_and_mark_text_in_range(None, "\"", Some(1..1), window, cx);
+            editor.replace_text_in_range(None, "ä", window, cx);
         });
         cx.simulate_keystrokes("escape");
         cx.assert_state("hˇällo", Mode::Normal);
@@ -406,8 +485,8 @@ mod test {
             Mode::Normal,
         );
 
-        let mut request =
-            cx.handle_request::<lsp::request::Completion, _, _>(move |_, params, _| async move {
+        let mut request = cx.set_request_handler::<lsp::request::Completion, _, _>(
+            move |_, params, _| async move {
                 let position = params.text_document_position.position;
                 Ok(Some(lsp::CompletionResponse::Array(vec![
                     lsp::CompletionItem {
@@ -427,7 +506,8 @@ mod test {
                         ..Default::default()
                     },
                 ])))
-            });
+            },
+        );
         cx.simulate_keystrokes("a .");
         request.next().await;
         cx.condition(|editor, _| editor.context_menu_visible())
@@ -448,6 +528,62 @@ mod test {
                 one.second!
                 two.secondˇ!
                 three
+            "},
+            Mode::Normal,
+        );
+    }
+
+    #[gpui::test]
+    async fn test_repeat_completion_unicode_bug(cx: &mut gpui::TestAppContext) {
+        VimTestContext::init(cx);
+        let cx = EditorLspTestContext::new_rust(
+            lsp::ServerCapabilities {
+                completion_provider: Some(lsp::CompletionOptions {
+                    trigger_characters: Some(vec![".".to_string(), ":".to_string()]),
+                    resolve_provider: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            cx,
+        )
+        .await;
+        let mut cx = VimTestContext::new_with_lsp(cx, true);
+
+        cx.set_state(
+            indoc! {"
+                ĩлˇк
+                ĩлк
+            "},
+            Mode::Normal,
+        );
+
+        let mut request = cx.set_request_handler::<lsp::request::Completion, _, _>(
+            move |_, params, _| async move {
+                let position = params.text_document_position.position;
+                let mut to_the_left = position;
+                to_the_left.character -= 2;
+                Ok(Some(lsp::CompletionResponse::Array(vec![
+                    lsp::CompletionItem {
+                        label: "oops".to_string(),
+                        text_edit: Some(lsp::CompletionTextEdit::Edit(lsp::TextEdit {
+                            range: lsp::Range::new(to_the_left, position),
+                            new_text: "к!".to_string(),
+                        })),
+                        ..Default::default()
+                    },
+                ])))
+            },
+        );
+        cx.simulate_keystrokes("i .");
+        request.next().await;
+        cx.condition(|editor, _| editor.context_menu_visible())
+            .await;
+        cx.simulate_keystrokes("enter escape");
+        cx.assert_state(
+            indoc! {"
+                ĩкˇ!к
+                ĩлк
             "},
             Mode::Normal,
         );
@@ -611,6 +747,48 @@ mod test {
     }
 
     #[gpui::test]
+    async fn test_repeat_after_blur_resets_dot_replaying(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+
+        // Bind `ctrl-f` to the `buffer_search::Deploy` action so that this can
+        // be triggered while in Insert mode, ensuring that an action which
+        // moves the focus away from the editor, gets recorded.
+        cx.update(|_, cx| {
+            cx.bind_keys([gpui::KeyBinding::new(
+                "ctrl-f",
+                search::buffer_search::Deploy::find(),
+                None,
+            )])
+        });
+
+        cx.set_state("ˇhello", Mode::Normal);
+
+        // We're going to enter insert mode, which will start recording, type a
+        // character and then immediately use `ctrl-f` to trigger the buffer
+        // search. Triggering the buffer search will move focus away from the
+        // editor, effectively stopping the recording immediately after
+        // `buffer_search::Deploy` is recorded. The first `escape` is used to
+        // dismiss the search bar, while the second is used to move from Insert
+        // to Normal mode.
+        cx.simulate_keystrokes("i x ctrl-f escape escape");
+        cx.run_until_parked();
+
+        // Using the `.` key will dispatch the `vim::Repeat` action, repeating
+        // the set of recorded actions. This will eventually focus on the search
+        // bar, preventing the `EndRepeat` action from being correctly handled.
+        cx.simulate_keystrokes(".");
+        cx.run_until_parked();
+
+        // After replay finishes, even though the `EndRepeat` action wasn't
+        // handled, seeing as the editor lost focus during replay, the
+        // `dot_replaying` value should be set back to `false`.
+        assert!(
+            !cx.update(|_, cx| cx.global::<VimGlobals>().dot_replaying),
+            "dot_replaying should be false after repeat completes"
+        );
+    }
+
+    #[gpui::test]
     async fn test_undo_repeated_insert(cx: &mut gpui::TestAppContext) {
         let mut cx = NeovimBackedTestContext::new(cx).await;
 
@@ -691,5 +869,92 @@ mod test {
         cx.shared_state().await.assert_eq("aaaaaaabˇrld");
         cx.simulate_shared_keystrokes("@ b").await;
         cx.shared_state().await.assert_eq("aaaaaaabbbˇd");
+    }
+
+    #[gpui::test]
+    async fn test_repeat_clear(cx: &mut gpui::TestAppContext) {
+        let mut cx = VimTestContext::new(cx, true).await;
+
+        // Check that, when repeat is preceded by something other than a number,
+        // the current operator is cleared, in order to prevent infinite loops.
+        cx.set_state("ˇhello world", Mode::Normal);
+        cx.simulate_keystrokes("d .");
+        assert_eq!(cx.active_operator(), None);
+    }
+
+    #[gpui::test]
+    async fn test_repeat_clear_repeat(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {
+            "ˇthe quick brown
+            fox jumps over
+            the lazy dog"
+        })
+        .await;
+        cx.simulate_shared_keystrokes("d d").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇfox jumps over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes("d . .").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇthe lazy dog"
+        });
+    }
+
+    #[gpui::test]
+    async fn test_repeat_clear_count(cx: &mut gpui::TestAppContext) {
+        let mut cx = NeovimBackedTestContext::new(cx).await;
+
+        cx.set_shared_state(indoc! {
+            "ˇthe quick brown
+            fox jumps over
+            the lazy dog"
+        })
+        .await;
+        cx.simulate_shared_keystrokes("d d").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇfox jumps over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes("2 d .").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇfox jumps over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes(".").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇthe lazy dog"
+        });
+
+        cx.set_shared_state(indoc! {
+            "ˇthe quick brown
+            fox jumps over
+            the lazy dog
+            the quick brown
+            fox jumps over
+            the lazy dog"
+        })
+        .await;
+        cx.simulate_shared_keystrokes("2 d d").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇthe lazy dog
+            the quick brown
+            fox jumps over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes("5 d .").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇthe lazy dog
+            the quick brown
+            fox jumps over
+            the lazy dog"
+        });
+        cx.simulate_shared_keystrokes(".").await;
+        cx.shared_state().await.assert_eq(indoc! {
+            "ˇfox jumps over
+            the lazy dog"
+        });
     }
 }

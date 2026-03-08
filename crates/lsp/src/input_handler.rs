@@ -1,11 +1,11 @@
 use std::str;
 use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Context as _, Result};
 use collections::HashMap;
 use futures::{
-    channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
     AsyncBufReadExt, AsyncRead, AsyncReadExt as _,
+    channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded},
 };
 use gpui::{BackgroundExecutor, Task};
 use log::warn;
@@ -13,14 +13,15 @@ use parking_lot::Mutex;
 use smol::io::BufReader;
 
 use crate::{
-    AnyNotification, AnyResponse, IoHandler, IoKind, RequestId, ResponseHandler, CONTENT_LEN_HEADER,
+    AnyResponse, CONTENT_LEN_HEADER, IoHandler, IoKind, NotificationOrRequest, RequestId,
+    ResponseHandler,
 };
 
 const HEADER_DELIMITER: &[u8; 4] = b"\r\n\r\n";
 /// Handler for stdout of language server.
 pub struct LspStdoutHandler {
     pub(super) loop_handle: Task<Result<()>>,
-    pub(super) notifications_channel: UnboundedReceiver<AnyNotification>,
+    pub(super) incoming_messages: UnboundedReceiver<NotificationOrRequest>,
 }
 
 async fn read_headers<Stdout>(reader: &mut BufReader<Stdout>, buffer: &mut Vec<u8>) -> Result<()>
@@ -35,7 +36,7 @@ where
         }
 
         if reader.read_until(b'\n', buffer).await? == 0 {
-            return Err(anyhow!("cannot read LSP message headers"));
+            anyhow::bail!("cannot read LSP message headers");
         }
     }
 }
@@ -54,13 +55,13 @@ impl LspStdoutHandler {
         let loop_handle = cx.spawn(Self::handler(stdout, tx, response_handlers, io_handlers));
         Self {
             loop_handle,
-            notifications_channel,
+            incoming_messages: notifications_channel,
         }
     }
 
     async fn handler<Input>(
         stdout: Input,
-        notifications_sender: UnboundedSender<AnyNotification>,
+        notifications_sender: UnboundedSender<NotificationOrRequest>,
         response_handlers: Arc<Mutex<Option<HashMap<RequestId, ResponseHandler>>>>,
         io_handlers: Arc<Mutex<HashMap<i32, IoHandler>>>,
     ) -> anyhow::Result<()>
@@ -82,7 +83,7 @@ impl LspStdoutHandler {
                 .split('\n')
                 .find(|line| line.starts_with(CONTENT_LEN_HEADER))
                 .and_then(|line| line.strip_prefix(CONTENT_LEN_HEADER))
-                .ok_or_else(|| anyhow!("invalid LSP message header {headers:?}"))?
+                .with_context(|| format!("invalid LSP message header {headers:?}"))?
                 .trim_end()
                 .parse()?;
 
@@ -96,24 +97,25 @@ impl LspStdoutHandler {
                 }
             }
 
-            if let Ok(msg) = serde_json::from_slice::<AnyNotification>(&buffer) {
+            if let Ok(msg) = serde_json::from_slice::<NotificationOrRequest>(&buffer) {
                 notifications_sender.unbounded_send(msg)?;
             } else if let Ok(AnyResponse {
                 id, error, result, ..
             }) = serde_json::from_slice(&buffer)
             {
-                let mut response_handlers = response_handlers.lock();
-                if let Some(handler) = response_handlers
-                    .as_mut()
-                    .and_then(|handlers| handlers.remove(&id))
-                {
-                    drop(response_handlers);
+                let handler = {
+                    response_handlers
+                        .lock()
+                        .as_mut()
+                        .and_then(|handlers| handlers.remove(&id))
+                };
+                if let Some(handler) = handler {
                     if let Some(error) = error {
-                        handler(Err(error));
+                        handler(Err(error)).await;
                     } else if let Some(result) = result {
-                        handler(Ok(result.get().into()));
+                        handler(Ok(result.get().into())).await;
                     } else {
-                        handler(Ok("null".into()));
+                        handler(Ok("null".into())).await;
                     }
                 }
             } else {

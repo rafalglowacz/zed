@@ -1,62 +1,41 @@
 {
-  description = "High-performance, multiplayer code editor from the creators of Atom and Tree-sitter";
+  description = "Zed is a minimal code editor crafted for speed and collaboration with humans and AI.";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs?ref=nixos-unstable";
-    fenix = {
-      url = "github:nix-community/fenix";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    flake-parts.url = "github:hercules-ci/flake-parts";
+    crane.url = "github:ipetkov/crane";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
     };
-    crane.url = "github:ipetkov/crane";
-    flake-compat.url = "github:edolstra/flake-compat";
   };
 
-  outputs = {
-    nixpkgs,
-    crane,
-    fenix,
-    ...
-  }: let
-    systems = ["x86_64-linux" "aarch64-linux"];
+  outputs =
+    inputs@{ flake-parts, ... }:
+    flake-parts.lib.mkFlake { inherit inputs; } {
+      systems = [
+        "x86_64-linux"
+        "x86_64-darwin"
+        "aarch64-linux"
+        "aarch64-darwin"
+      ];
 
-    overlays = {
-      fenix = fenix.overlays.default;
-      rust-toolchain = final: prev: {
-        rustToolchain = final.fenix.stable.toolchain;
-      };
-      zed-editor = final: prev: {
-        zed-editor = final.callPackage ./nix/build.nix {
-          craneLib = (crane.mkLib final).overrideToolchain final.rustToolchain;
-          rustPlatform = final.makeRustPlatform {
-            inherit (final.rustToolchain) cargo rustc;
-          };
-        };
-      };
+      imports = [
+        ./nix/modules/overlays.nix
+        ./nix/modules/packages.nix
+        ./nix/modules/partitions.nix
+      ];
     };
 
-    mkPkgs = system:
-      import nixpkgs {
-        inherit system;
-        overlays = builtins.attrValues overlays;
-      };
-
-    forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f (mkPkgs system));
-  in {
-    packages = forAllSystems (pkgs: {
-      zed-editor = pkgs.zed-editor;
-      default = pkgs.zed-editor;
-    });
-
-    devShells = forAllSystems (pkgs: {
-      default = import ./nix/shell.nix {inherit pkgs;};
-    });
-
-    formatter = forAllSystems (pkgs: pkgs.alejandra);
-
-    overlays =
-      overlays
-      // {
-        default = nixpkgs.lib.composeManyExtensions (builtins.attrValues overlays);
-      };
+  nixConfig = {
+    extra-substituters = [
+      "https://zed.cachix.org"
+      "https://cache.garnix.io"
+    ];
+    extra-trusted-public-keys = [
+      "zed.cachix.org-1:/pHQ6dpMsAZk2DiP4WCL0p9YDNKWj2Q5FL20bNmw1cU="
+      "cache.garnix.io:CTFPyKSLcx5RMJKfLo5EEPUObbA78b0YQ2DTCJXqr9g="
+    ];
   };
 }

@@ -2,24 +2,26 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use anyhow::Result;
 use client::proto;
 use fancy_regex::{Captures, Regex, RegexBuilder};
-use gpui::Model;
-use language::{Buffer, BufferSnapshot};
+use gpui::Entity;
+use itertools::Itertools as _;
+use language::{Buffer, BufferSnapshot, CharKind};
 use smol::future::yield_now;
 use std::{
     borrow::Cow,
     io::{BufRead, BufReader, Read},
     ops::Range,
-    path::Path,
-    sync::{Arc, OnceLock},
+    sync::{Arc, LazyLock},
 };
 use text::Anchor;
-use util::paths::PathMatcher;
+use util::{
+    paths::{PathMatcher, PathStyle},
+    rel_path::RelPath,
+};
 
-static TEXT_REPLACEMENT_SPECIAL_CHARACTERS_REGEX: OnceLock<Regex> = OnceLock::new();
-
+#[derive(Debug)]
 pub enum SearchResult {
     Buffer {
-        buffer: Model<Buffer>,
+        buffer: Entity<Buffer>,
         ranges: Vec<Range<Anchor>>,
     },
     LimitReached,
@@ -37,7 +39,8 @@ pub struct SearchInputs {
     query: Arc<str>,
     files_to_include: PathMatcher,
     files_to_exclude: PathMatcher,
-    buffers: Option<Vec<Model<Buffer>>>,
+    match_full_paths: bool,
+    buffers: Option<Vec<Entity<Buffer>>>,
 }
 
 impl SearchInputs {
@@ -50,21 +53,20 @@ impl SearchInputs {
     pub fn files_to_exclude(&self) -> &PathMatcher {
         &self.files_to_exclude
     }
-    pub fn buffers(&self) -> &Option<Vec<Model<Buffer>>> {
+    pub fn buffers(&self) -> &Option<Vec<Entity<Buffer>>> {
         &self.buffers
     }
 }
 #[derive(Clone, Debug)]
 pub enum SearchQuery {
     Text {
-        search: Arc<AhoCorasick>,
+        search: AhoCorasick,
         replacement: Option<String>,
         whole_word: bool,
         case_sensitive: bool,
         include_ignored: bool,
         inner: SearchInputs,
     },
-
     Regex {
         regex: Regex,
         replacement: Option<String>,
@@ -72,11 +74,22 @@ pub enum SearchQuery {
         whole_word: bool,
         case_sensitive: bool,
         include_ignored: bool,
+        one_match_per_line: bool,
         inner: SearchInputs,
     },
 }
 
+static WORD_MATCH_TEST: LazyLock<Regex> = LazyLock::new(|| {
+    RegexBuilder::new(r"\B")
+        .build()
+        .expect("Failed to create WORD_MATCH_TEST")
+});
+
 impl SearchQuery {
+    /// Create a text query
+    ///
+    /// If `match_full_paths` is true, include/exclude patterns will always be matched against fully qualified project paths beginning with a project root.
+    /// If `match_full_paths` is false, patterns will be matched against worktree-relative paths.
     pub fn text(
         query: impl ToString,
         whole_word: bool,
@@ -84,9 +97,26 @@ impl SearchQuery {
         include_ignored: bool,
         files_to_include: PathMatcher,
         files_to_exclude: PathMatcher,
-        buffers: Option<Vec<Model<Buffer>>>,
+        match_full_paths: bool,
+        buffers: Option<Vec<Entity<Buffer>>>,
     ) -> Result<Self> {
         let query = query.to_string();
+        if !case_sensitive && !query.is_ascii() {
+            // AhoCorasickBuilder doesn't support case-insensitive search with unicode characters
+            // Fallback to regex search as recommended by
+            // https://docs.rs/aho-corasick/1.1/aho_corasick/struct.AhoCorasickBuilder.html#method.ascii_case_insensitive
+            return Self::regex(
+                regex::escape(&query),
+                whole_word,
+                case_sensitive,
+                include_ignored,
+                false,
+                files_to_include,
+                files_to_exclude,
+                false,
+                buffers,
+            );
+        }
         let search = AhoCorasickBuilder::new()
             .ascii_case_insensitive(!case_sensitive)
             .build([&query])?;
@@ -94,10 +124,11 @@ impl SearchQuery {
             query: query.into(),
             files_to_exclude,
             files_to_include,
+            match_full_paths,
             buffers,
         };
         Ok(Self::Text {
-            search: Arc::new(search),
+            search,
             replacement: None,
             whole_word,
             case_sensitive,
@@ -106,26 +137,53 @@ impl SearchQuery {
         })
     }
 
+    /// Create a regex query
+    ///
+    /// If `match_full_paths` is true, include/exclude patterns will be matched against fully qualified project paths
+    /// beginning with a project root name. If false, they will be matched against project-relative paths (which don't start
+    /// with their respective project root).
     pub fn regex(
         query: impl ToString,
         whole_word: bool,
-        case_sensitive: bool,
+        mut case_sensitive: bool,
         include_ignored: bool,
+        one_match_per_line: bool,
         files_to_include: PathMatcher,
         files_to_exclude: PathMatcher,
-        buffers: Option<Vec<Model<Buffer>>>,
+        match_full_paths: bool,
+        buffers: Option<Vec<Entity<Buffer>>>,
     ) -> Result<Self> {
         let mut query = query.to_string();
         let initial_query = Arc::from(query.as_str());
+
+        if let Some((case_sensitive_from_pattern, new_query)) =
+            Self::case_sensitive_from_pattern(&query)
+        {
+            case_sensitive = case_sensitive_from_pattern;
+            query = new_query
+        }
+
         if whole_word {
             let mut word_query = String::new();
-            word_query.push_str("\\b");
+            if let Some(first) = query.get(0..1)
+                && WORD_MATCH_TEST.is_match(first).is_ok_and(|x| !x)
+            {
+                word_query.push_str("\\b");
+            }
             word_query.push_str(&query);
-            word_query.push_str("\\b");
+            if let Some(last) = query.get(query.len() - 1..)
+                && WORD_MATCH_TEST.is_match(last).is_ok_and(|x| !x)
+            {
+                word_query.push_str("\\b");
+            }
             query = word_query
         }
 
-        let multiline = query.contains('\n') || query.contains("\\n") || query.contains("\\s");
+        let multiline = query.contains('\n') || query.contains("\\n");
+        if multiline {
+            query.insert_str(0, "(?m)");
+        }
+
         let regex = RegexBuilder::new(&query)
             .case_insensitive(!case_sensitive)
             .build()?;
@@ -133,6 +191,7 @@ impl SearchQuery {
             query: initial_query,
             files_to_exclude,
             files_to_include,
+            match_full_paths,
             buffers,
         };
         Ok(Self::Regex {
@@ -143,18 +202,84 @@ impl SearchQuery {
             case_sensitive,
             include_ignored,
             inner,
+            one_match_per_line,
         })
     }
 
-    pub fn from_proto(message: proto::SearchQuery) -> Result<Self> {
+    /// Extracts case sensitivity settings from pattern items in the provided
+    /// query and returns the same query, with the pattern items removed.
+    ///
+    /// The following pattern modifiers are supported:
+    ///
+    /// - `\c` (case_sensitive: false)
+    /// - `\C` (case_sensitive: true)
+    ///
+    /// If no pattern item were found, `None` will be returned.
+    fn case_sensitive_from_pattern(query: &str) -> Option<(bool, String)> {
+        if !(query.contains("\\c") || query.contains("\\C")) {
+            return None;
+        }
+
+        let mut was_escaped = false;
+        let mut new_query = String::new();
+        let mut is_case_sensitive = None;
+
+        for c in query.chars() {
+            if was_escaped {
+                if c == 'c' {
+                    is_case_sensitive = Some(false);
+                } else if c == 'C' {
+                    is_case_sensitive = Some(true);
+                } else {
+                    new_query.push('\\');
+                    new_query.push(c);
+                }
+                was_escaped = false
+            } else if c == '\\' {
+                was_escaped = true
+            } else {
+                new_query.push(c);
+            }
+        }
+
+        is_case_sensitive.map(|c| (c, new_query))
+    }
+
+    pub fn from_proto(message: proto::SearchQuery, path_style: PathStyle) -> Result<Self> {
+        let files_to_include = if message.files_to_include.is_empty() {
+            message
+                .files_to_include_legacy
+                .split(',')
+                .map(str::trim)
+                .filter(|&glob_str| !glob_str.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            message.files_to_include
+        };
+
+        let files_to_exclude = if message.files_to_exclude.is_empty() {
+            message
+                .files_to_exclude_legacy
+                .split(',')
+                .map(str::trim)
+                .filter(|&glob_str| !glob_str.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        } else {
+            message.files_to_exclude
+        };
+
         if message.regex {
             Self::regex(
                 message.query,
                 message.whole_word,
                 message.case_sensitive,
                 message.include_ignored,
-                deserialize_path_matches(&message.files_to_include)?,
-                deserialize_path_matches(&message.files_to_exclude)?,
+                false,
+                PathMatcher::new(files_to_include, path_style)?,
+                PathMatcher::new(files_to_exclude, path_style)?,
+                message.match_full_paths,
                 None, // search opened only don't need search remote
             )
         } else {
@@ -163,8 +288,9 @@ impl SearchQuery {
                 message.whole_word,
                 message.case_sensitive,
                 message.include_ignored,
-                deserialize_path_matches(&message.files_to_include)?,
-                deserialize_path_matches(&message.files_to_exclude)?,
+                PathMatcher::new(files_to_include, path_style)?,
+                PathMatcher::new(files_to_exclude, path_style)?,
+                message.match_full_paths,
                 None, // search opened only don't need search remote
             )
         }
@@ -187,48 +313,76 @@ impl SearchQuery {
     }
 
     pub fn to_proto(&self) -> proto::SearchQuery {
+        let mut files_to_include = self.files_to_include().sources();
+        let mut files_to_exclude = self.files_to_exclude().sources();
         proto::SearchQuery {
             query: self.as_str().to_string(),
             regex: self.is_regex(),
             whole_word: self.whole_word(),
             case_sensitive: self.case_sensitive(),
             include_ignored: self.include_ignored(),
-            files_to_include: self.files_to_include().sources().join(","),
-            files_to_exclude: self.files_to_exclude().sources().join(","),
+            files_to_include: files_to_include.clone().map(ToOwned::to_owned).collect(),
+            files_to_exclude: files_to_exclude.clone().map(ToOwned::to_owned).collect(),
+            match_full_paths: self.match_full_paths(),
+            // Populate legacy fields for backwards compatibility
+            files_to_include_legacy: files_to_include.join(","),
+            files_to_exclude_legacy: files_to_exclude.join(","),
         }
     }
 
-    pub fn detect<T: Read>(&self, stream: T) -> Result<bool> {
-        if self.as_str().is_empty() {
+    pub(crate) async fn detect(
+        &self,
+        mut reader: BufReader<Box<dyn Read + Send + Sync>>,
+    ) -> Result<bool> {
+        let query_str = self.as_str();
+        if query_str.is_empty() {
             return Ok(false);
         }
 
+        // Yield from this function every 20KB scanned.
+        const YIELD_THRESHOLD: usize = 20 * 1024;
+
         match self {
             Self::Text { search, .. } => {
-                let mat = search.stream_find_iter(stream).next();
-                match mat {
-                    Some(Ok(_)) => Ok(true),
-                    Some(Err(err)) => Err(err.into()),
-                    None => Ok(false),
+                let mut text = String::new();
+                if query_str.contains('\n') {
+                    reader.read_to_string(&mut text)?;
+                    Ok(search.is_match(&text))
+                } else {
+                    let mut bytes_read = 0;
+                    while reader.read_line(&mut text)? > 0 {
+                        if search.is_match(&text) {
+                            return Ok(true);
+                        }
+                        bytes_read += text.len();
+                        if bytes_read >= YIELD_THRESHOLD {
+                            bytes_read = 0;
+                            smol::future::yield_now().await;
+                        }
+                        text.clear();
+                    }
+                    Ok(false)
                 }
             }
             Self::Regex {
                 regex, multiline, ..
             } => {
-                let mut reader = BufReader::new(stream);
+                let mut text = String::new();
                 if *multiline {
-                    let mut text = String::new();
-                    if let Err(err) = reader.read_to_string(&mut text) {
-                        Err(err.into())
-                    } else {
-                        Ok(regex.find(&text)?.is_some())
-                    }
+                    reader.read_to_string(&mut text)?;
+                    Ok(regex.is_match(&text)?)
                 } else {
-                    for line in reader.lines() {
-                        let line = line?;
-                        if regex.find(&line)?.is_some() {
+                    let mut bytes_read = 0;
+                    while reader.read_line(&mut text)? > 0 {
+                        if regex.is_match(&text)? {
                             return Ok(true);
                         }
+                        bytes_read += text.len();
+                        if bytes_read >= YIELD_THRESHOLD {
+                            bytes_read = 0;
+                            smol::future::yield_now().await;
+                        }
+                        text.clear();
                     }
                     Ok(false)
                 }
@@ -251,16 +405,17 @@ impl SearchQuery {
                 regex, replacement, ..
             } => {
                 if let Some(replacement) = replacement {
-                    let replacement = TEXT_REPLACEMENT_SPECIAL_CHARACTERS_REGEX
-                        .get_or_init(|| Regex::new(r"\\\\|\\n|\\t").unwrap())
-                        .replace_all(replacement, |c: &Captures| {
-                            match c.get(0).unwrap().as_str() {
-                                r"\\" => "\\",
-                                r"\n" => "\n",
-                                r"\t" => "\t",
-                                x => unreachable!("Unexpected escape sequence: {}", x),
-                            }
-                        });
+                    static TEXT_REPLACEMENT_SPECIAL_CHARACTERS_REGEX: LazyLock<Regex> =
+                        LazyLock::new(|| Regex::new(r"\\\\|\\n|\\t").unwrap());
+                    let replacement = TEXT_REPLACEMENT_SPECIAL_CHARACTERS_REGEX.replace_all(
+                        replacement,
+                        |c: &Captures| match c.get(0).unwrap().as_str() {
+                            r"\\" => "\\",
+                            r"\n" => "\n",
+                            r"\t" => "\t",
+                            x => unreachable!("Unexpected escape sequence: {}", x),
+                        },
+                    );
                     Some(regex.replace(text, replacement))
                 } else {
                     None
@@ -313,7 +468,9 @@ impl SearchQuery {
                         let end_kind =
                             classifier.kind(rope.reversed_chars_at(mat.end()).next().unwrap());
                         let next_kind = rope.chars_at(mat.end()).next().map(|c| classifier.kind(c));
-                        if Some(start_kind) == prev_kind || Some(end_kind) == next_kind {
+                        if (Some(start_kind) == prev_kind && start_kind == CharKind::Word)
+                            || (Some(end_kind) == next_kind && end_kind == CharKind::Word)
+                        {
                             continue;
                         }
                     }
@@ -349,6 +506,9 @@ impl SearchQuery {
                                     let start = line_offset + mat.start();
                                     let end = line_offset + mat.end();
                                     matches.push(start..end);
+                                    if self.one_match_per_line() == Some(true) {
+                                        break;
+                                    }
                                 }
 
                                 line_offset += line.len() + 1;
@@ -409,7 +569,7 @@ impl SearchQuery {
         self.as_inner().files_to_exclude()
     }
 
-    pub fn buffers(&self) -> Option<&Vec<Model<Buffer>>> {
+    pub fn buffers(&self) -> Option<&Vec<Entity<Buffer>>> {
         self.as_inner().buffers.as_ref()
     }
 
@@ -418,16 +578,22 @@ impl SearchQuery {
     }
 
     pub fn filters_path(&self) -> bool {
-        !(self.files_to_exclude().sources().is_empty()
-            && self.files_to_include().sources().is_empty())
+        !(self.files_to_exclude().sources().next().is_none()
+            && self.files_to_include().sources().next().is_none())
     }
 
-    pub fn file_matches(&self, file_path: &Path) -> bool {
-        let mut path = file_path.to_path_buf();
+    pub fn match_full_paths(&self) -> bool {
+        self.as_inner().match_full_paths
+    }
+
+    /// Check match full paths to determine whether you're required to pass a fully qualified
+    /// project path (starts with a project root).
+    pub fn match_path(&self, file_path: &RelPath) -> bool {
+        let mut path = file_path.to_rel_path_buf();
         loop {
             if self.files_to_exclude().is_match(&path) {
                 return false;
-            } else if self.files_to_include().sources().is_empty()
+            } else if self.files_to_include().sources().next().is_none()
                 || self.files_to_include().is_match(&path)
             {
                 return true;
@@ -441,63 +607,17 @@ impl SearchQuery {
             Self::Regex { inner, .. } | Self::Text { inner, .. } => inner,
         }
     }
-}
 
-pub fn deserialize_path_matches(glob_set: &str) -> anyhow::Result<PathMatcher> {
-    let globs = glob_set
-        .split(',')
-        .map(str::trim)
-        .filter(|&glob_str| (!glob_str.is_empty()))
-        .map(|glob_str| glob_str.to_owned())
-        .collect::<Vec<_>>();
-    Ok(PathMatcher::new(&globs)?)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn path_matcher_creation_for_valid_paths() {
-        for valid_path in [
-            "file",
-            "Cargo.toml",
-            ".DS_Store",
-            "~/dir/another_dir/",
-            "./dir/file",
-            "dir/[a-z].txt",
-            "../dir/filé",
-        ] {
-            let path_matcher = PathMatcher::new(&[valid_path.to_owned()]).unwrap_or_else(|e| {
-                panic!("Valid path {valid_path} should be accepted, but got: {e}")
-            });
-            assert!(
-                path_matcher.is_match(valid_path),
-                "Path matcher for valid path {valid_path} should match itself"
-            )
-        }
-    }
-
-    #[test]
-    fn path_matcher_creation_for_globs() {
-        for invalid_glob in ["dir/[].txt", "dir/[a-z.txt", "dir/{file"] {
-            match PathMatcher::new(&[invalid_glob.to_owned()]) {
-                Ok(_) => panic!("Invalid glob {invalid_glob} should not be accepted"),
-                Err(_expected) => {}
-            }
-        }
-
-        for valid_glob in [
-            "dir/?ile",
-            "dir/*.txt",
-            "dir/**/file",
-            "dir/[a-z].txt",
-            "{dir,file}",
-        ] {
-            match PathMatcher::new(&[valid_glob.to_owned()]) {
-                Ok(_expected) => {}
-                Err(e) => panic!("Valid glob should be accepted, but got: {e}"),
-            }
+    /// Whether this search should replace only one match per line, instead of
+    /// all matches.
+    /// Returns `None` for text searches, as only regex searches support this
+    /// option.
+    pub fn one_match_per_line(&self) -> Option<bool> {
+        match self {
+            Self::Regex {
+                one_match_per_line, ..
+            } => Some(*one_match_per_line),
+            Self::Text { .. } => None,
         }
     }
 }

@@ -1,38 +1,55 @@
-use gpui::{AnyView, DismissEvent, FocusHandle, ManagedView, Subscription, View};
+use gpui::{
+    AnyView, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable as _, ManagedView,
+    MouseButton, Subscription,
+};
 use ui::prelude::*;
 
+#[derive(Debug)]
 pub enum DismissDecision {
     Dismiss(bool),
     Pending,
 }
 
 pub trait ModalView: ManagedView {
-    fn on_before_dismiss(&mut self, _: &mut ViewContext<Self>) -> DismissDecision {
+    fn on_before_dismiss(
+        &mut self,
+        _window: &mut Window,
+        _: &mut Context<Self>,
+    ) -> DismissDecision {
         DismissDecision::Dismiss(true)
     }
 
     fn fade_out_background(&self) -> bool {
         false
     }
+
+    fn render_bare(&self) -> bool {
+        false
+    }
 }
 
 trait ModalViewHandle {
-    fn on_before_dismiss(&mut self, cx: &mut WindowContext) -> DismissDecision;
+    fn on_before_dismiss(&mut self, window: &mut Window, cx: &mut App) -> DismissDecision;
     fn view(&self) -> AnyView;
-    fn fade_out_background(&self, cx: &WindowContext) -> bool;
+    fn fade_out_background(&self, cx: &mut App) -> bool;
+    fn render_bare(&self, cx: &mut App) -> bool;
 }
 
-impl<V: ModalView> ModalViewHandle for View<V> {
-    fn on_before_dismiss(&mut self, cx: &mut WindowContext) -> DismissDecision {
-        self.update(cx, |this, cx| this.on_before_dismiss(cx))
+impl<V: ModalView> ModalViewHandle for Entity<V> {
+    fn on_before_dismiss(&mut self, window: &mut Window, cx: &mut App) -> DismissDecision {
+        self.update(cx, |this, cx| this.on_before_dismiss(window, cx))
     }
 
     fn view(&self) -> AnyView {
         self.clone().into()
     }
 
-    fn fade_out_background(&self, cx: &WindowContext) -> bool {
+    fn fade_out_background(&self, cx: &mut App) -> bool {
         self.read(cx).fade_out_background()
+    }
+
+    fn render_bare(&self, cx: &mut App) -> bool {
+        self.read(cx).render_bare()
     }
 }
 
@@ -48,6 +65,10 @@ pub struct ModalLayer {
     dismiss_on_focus_lost: bool,
 }
 
+pub(crate) struct ModalOpenedEvent;
+
+impl EventEmitter<ModalOpenedEvent> for ModalLayer {}
+
 impl Default for ModalLayer {
     fn default() -> Self {
         Self::new()
@@ -62,23 +83,33 @@ impl ModalLayer {
         }
     }
 
-    pub fn toggle_modal<V, B>(&mut self, cx: &mut ViewContext<Self>, build_view: B)
+    /// Toggles a modal of type `V`. If a modal of the same type is currently active,
+    /// it will be hidden. If a different modal is active, it will be replaced with the new one.
+    /// If no modal is active, the new modal will be shown.
+    ///
+    /// If closing the current modal fails (e.g., due to `on_before_dismiss` returning
+    /// `DismissDecision::Dismiss(false)` or `DismissDecision::Pending`), the new modal
+    /// will not be shown.
+    pub fn toggle_modal<V, B>(&mut self, window: &mut Window, cx: &mut Context<Self>, build_view: B)
     where
         V: ModalView,
-        B: FnOnce(&mut ViewContext<V>) -> V,
+        B: FnOnce(&mut Window, &mut Context<V>) -> V,
     {
         if let Some(active_modal) = &self.active_modal {
-            let is_close = active_modal.modal.view().downcast::<V>().is_ok();
-            let did_close = self.hide_modal(cx);
-            if is_close || !did_close {
+            let should_close = active_modal.modal.view().downcast::<V>().is_ok();
+            let did_close = self.hide_modal(window, cx);
+            if should_close || !did_close {
                 return;
             }
         }
-        let new_modal = cx.new_view(build_view);
-        self.show_modal(new_modal, cx);
+        let new_modal = cx.new(|cx| build_view(window, cx));
+        self.show_modal(new_modal, window, cx);
+        cx.emit(ModalOpenedEvent);
     }
 
-    fn show_modal<V>(&mut self, new_modal: View<V>, cx: &mut ViewContext<Self>)
+    /// Shows a modal and sets up subscriptions for dismiss events and focus tracking.
+    /// The modal is automatically focused after being shown.
+    fn show_modal<V>(&mut self, new_modal: Entity<V>, window: &mut Window, cx: &mut Context<Self>)
     where
         V: ModalView,
     {
@@ -86,34 +117,45 @@ impl ModalLayer {
         self.active_modal = Some(ActiveModal {
             modal: Box::new(new_modal.clone()),
             _subscriptions: [
-                cx.subscribe(&new_modal, |this, _, _: &DismissEvent, cx| {
-                    this.hide_modal(cx);
-                }),
-                cx.on_focus_out(&focus_handle, |this, _event, cx| {
+                cx.subscribe_in(
+                    &new_modal,
+                    window,
+                    |this, _, _: &DismissEvent, window, cx| {
+                        this.hide_modal(window, cx);
+                    },
+                ),
+                cx.on_focus_out(&focus_handle, window, |this, _event, window, cx| {
                     if this.dismiss_on_focus_lost {
-                        this.hide_modal(cx);
+                        this.hide_modal(window, cx);
                     }
                 }),
             ],
-            previous_focus_handle: cx.focused(),
+            previous_focus_handle: window.focused(cx),
             focus_handle,
         });
-        cx.defer(move |_, cx| {
-            cx.focus_view(&new_modal);
+        cx.defer_in(window, move |_, window, cx| {
+            window.focus(&new_modal.focus_handle(cx), cx);
         });
         cx.notify();
     }
 
-    fn hide_modal(&mut self, cx: &mut ViewContext<Self>) -> bool {
+    /// Attempts to hide the currently active modal.
+    ///
+    /// The modal's `on_before_dismiss` method is called to determine if dismissal should proceed.
+    /// If dismissal is allowed, the modal is removed and focus is restored to the previously
+    /// focused element.
+    ///
+    /// Returns `true` if the modal was successfully hidden, `false` otherwise.
+    pub fn hide_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(active_modal) = self.active_modal.as_mut() else {
             self.dismiss_on_focus_lost = false;
             return false;
         };
 
-        match active_modal.modal.on_before_dismiss(cx) {
-            DismissDecision::Dismiss(dismiss) => {
-                self.dismiss_on_focus_lost = !dismiss;
-                if !dismiss {
+        match active_modal.modal.on_before_dismiss(window, cx) {
+            DismissDecision::Dismiss(should_dismiss) => {
+                if !should_dismiss {
+                    self.dismiss_on_focus_lost = !should_dismiss;
                     return false;
                 }
             }
@@ -124,17 +166,19 @@ impl ModalLayer {
         }
 
         if let Some(active_modal) = self.active_modal.take() {
-            if let Some(previous_focus) = active_modal.previous_focus_handle {
-                if active_modal.focus_handle.contains_focused(cx) {
-                    previous_focus.focus(cx);
-                }
+            if let Some(previous_focus) = active_modal.previous_focus_handle
+                && active_modal.focus_handle.contains_focused(window, cx)
+            {
+                previous_focus.focus(window, cx);
             }
             cx.notify();
         }
+        self.dismiss_on_focus_lost = false;
         true
     }
 
-    pub fn active_modal<V>(&self) -> Option<View<V>>
+    /// Returns the currently active modal if it is of type `V`.
+    pub fn active_modal<V>(&self) -> Option<Entity<V>>
     where
         V: 'static,
     {
@@ -148,34 +192,46 @@ impl ModalLayer {
 }
 
 impl Render for ModalLayer {
-    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(active_modal) = &self.active_modal else {
-            return div();
+            return div().into_any_element();
         };
+
+        if active_modal.modal.render_bare(cx) {
+            return active_modal.modal.view().into_any_element();
+        }
 
         div()
             .absolute()
             .size_full()
-            .top_0()
-            .left_0()
-            .when(active_modal.modal.fade_out_background(cx), |el| {
+            .inset_0()
+            .occlude()
+            .when(active_modal.modal.fade_out_background(cx), |this| {
                 let mut background = cx.theme().colors().elevated_surface_background;
                 background.fade_out(0.2);
-                el.bg(background)
-                    .occlude()
-                    .on_mouse_down_out(cx.listener(|this, _, cx| {
-                        this.hide_modal(cx);
-                    }))
+                this.bg(background)
             })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.hide_modal(window, cx);
+                }),
+            )
             .child(
                 v_flex()
                     .h(px(0.0))
                     .top_20()
-                    .flex()
-                    .flex_col()
                     .items_center()
                     .track_focus(&active_modal.focus_handle)
-                    .child(h_flex().occlude().child(active_modal.modal.view())),
+                    .child(
+                        h_flex()
+                            .occlude()
+                            .child(active_modal.modal.view())
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            }),
+                    ),
             )
+            .into_any_element()
     }
 }

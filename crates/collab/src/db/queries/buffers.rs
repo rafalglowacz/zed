@@ -1,4 +1,5 @@
 use super::*;
+use anyhow::Context as _;
 use prost::Message;
 use text::{EditOperation, UndoOperation};
 
@@ -61,9 +62,9 @@ impl Database {
                 .iter()
                 .map(|c| c.replica_id)
                 .collect::<HashSet<_>>();
-            let mut replica_id = ReplicaId(0);
+            let mut replica_id = ReplicaId(clock::ReplicaId::FIRST_COLLAB_ID.as_u16() as i32);
             while replica_ids.contains(&replica_id) {
-                replica_id.0 += 1;
+                replica_id = ReplicaId(replica_id.0 + 1);
             }
             let collaborator = channel_buffer_collaborator::ActiveModel {
                 channel_id: ActiveValue::Set(channel_id),
@@ -117,6 +118,8 @@ impl Database {
                         user_id: collaborator.user_id.to_proto(),
                         replica_id: collaborator.replica_id.0 as u32,
                         is_host: false,
+                        committer_name: None,
+                        committer_email: None,
                     })
                     .collect(),
             })
@@ -200,7 +203,7 @@ impl Database {
                 while let Some(row) = rows.next().await {
                     let row = row?;
                     let timestamp = clock::Lamport {
-                        replica_id: row.replica_id as u16,
+                        replica_id: clock::ReplicaId::new(row.replica_id as u16),
                         value: row.lamport_timestamp as u32,
                     };
                     server_version.observe(timestamp);
@@ -224,6 +227,8 @@ impl Database {
                                 user_id: collaborator.user_id.to_proto(),
                                 replica_id: collaborator.replica_id.0 as u32,
                                 is_host: false,
+                                committer_name: None,
+                                committer_email: None,
                             })
                             .collect(),
                     },
@@ -260,6 +265,8 @@ impl Database {
                         replica_id: db_collaborator.replica_id.0 as u32,
                         user_id: db_collaborator.user_id.to_proto(),
                         is_host: false,
+                        committer_name: None,
+                        committer_email: None,
                     })
                 } else {
                     collaborator_ids_to_remove.push(db_collaborator.id);
@@ -389,6 +396,8 @@ impl Database {
                 replica_id: row.replica_id.0 as u32,
                 user_id: row.user_id.to_proto(),
                 is_host: false,
+                committer_name: None,
+                committer_email: None,
             });
         }
 
@@ -467,7 +476,7 @@ impl Database {
                 .filter(buffer::Column::ChannelId.eq(channel_id))
                 .one(&*tx)
                 .await?
-                .ok_or_else(|| anyhow!("no such buffer"))?;
+                .context("no such buffer")?;
 
             let serialization_version = self
                 .get_buffer_operation_serialization_version(buffer.id, buffer.epoch, &tx)
@@ -606,7 +615,7 @@ impl Database {
             .into_values::<_, QueryOperationSerializationVersion>()
             .one(tx)
             .await?
-            .ok_or_else(|| anyhow!("missing buffer snapshot"))?)
+            .context("missing buffer snapshot")?)
     }
 
     pub async fn get_channel_buffer(
@@ -621,7 +630,7 @@ impl Database {
         .find_related(buffer::Entity)
         .one(tx)
         .await?
-        .ok_or_else(|| anyhow!("no such buffer"))?)
+        .context("no such buffer")?)
     }
 
     async fn get_buffer_state(
@@ -643,7 +652,7 @@ impl Database {
                 )
                 .one(tx)
                 .await?
-                .ok_or_else(|| anyhow!("no such snapshot"))?;
+                .context("no such snapshot")?;
 
             let version = snapshot.operation_serialization_version;
             (snapshot.text, version)
@@ -692,7 +701,11 @@ impl Database {
             return Ok(());
         }
 
-        let mut text_buffer = text::Buffer::new(0, text::BufferId::new(1).unwrap(), base_text);
+        let mut text_buffer = text::Buffer::new(
+            clock::ReplicaId::LOCAL,
+            text::BufferId::new(1).unwrap(),
+            base_text,
+        );
         text_buffer.apply_ops(operations.into_iter().filter_map(operation_from_wire));
 
         let base_text = text_buffer.text();
@@ -777,6 +790,32 @@ impl Database {
             })
             .collect())
     }
+
+    /// Update language server capabilities for a given id.
+    pub async fn update_server_capabilities(
+        &self,
+        project_id: ProjectId,
+        server_id: u64,
+        new_capabilities: String,
+    ) -> Result<()> {
+        self.transaction(|tx| {
+            let new_capabilities = new_capabilities.clone();
+            async move {
+                Ok(
+                    language_server::Entity::update(language_server::ActiveModel {
+                        project_id: ActiveValue::unchanged(project_id),
+                        id: ActiveValue::unchanged(server_id as i64),
+                        capabilities: ActiveValue::set(new_capabilities),
+                        ..Default::default()
+                    })
+                    .exec(&*tx)
+                    .await?,
+                )
+            }
+        })
+        .await?;
+        Ok(())
+    }
 }
 
 fn operation_to_storage(
@@ -839,7 +878,7 @@ fn operation_from_storage(
     _format_version: i32,
 ) -> Result<proto::operation::Variant, Error> {
     let operation =
-        storage::Operation::decode(row.value.as_slice()).map_err(|error| anyhow!("{}", error))?;
+        storage::Operation::decode(row.value.as_slice()).map_err(|error| anyhow!("{error}"))?;
     let version = version_from_storage(&operation.version);
     Ok(if operation.is_undo {
         proto::operation::Variant::Undo(proto::operation::Undo {
@@ -899,7 +938,7 @@ pub fn operation_from_wire(operation: proto::Operation) -> Option<text::Operatio
     match operation.variant? {
         proto::operation::Variant::Edit(edit) => Some(text::Operation::Edit(EditOperation {
             timestamp: clock::Lamport {
-                replica_id: edit.replica_id as text::ReplicaId,
+                replica_id: clock::ReplicaId::new(edit.replica_id as u16),
                 value: edit.lamport_timestamp,
             },
             version: version_from_wire(&edit.version),
@@ -914,7 +953,7 @@ pub fn operation_from_wire(operation: proto::Operation) -> Option<text::Operatio
         })),
         proto::operation::Variant::Undo(undo) => Some(text::Operation::Undo(UndoOperation {
             timestamp: clock::Lamport {
-                replica_id: undo.replica_id as text::ReplicaId,
+                replica_id: clock::ReplicaId::new(undo.replica_id as u16),
                 value: undo.lamport_timestamp,
             },
             version: version_from_wire(&undo.version),
@@ -924,7 +963,7 @@ pub fn operation_from_wire(operation: proto::Operation) -> Option<text::Operatio
                 .map(|c| {
                     (
                         clock::Lamport {
-                            replica_id: c.replica_id as text::ReplicaId,
+                            replica_id: clock::ReplicaId::new(c.replica_id as u16),
                             value: c.lamport_timestamp,
                         },
                         c.count,
@@ -940,7 +979,7 @@ fn version_from_wire(message: &[proto::VectorClockEntry]) -> clock::Global {
     let mut version = clock::Global::new();
     for entry in message {
         version.observe(clock::Lamport {
-            replica_id: entry.replica_id as text::ReplicaId,
+            replica_id: clock::ReplicaId::new(entry.replica_id as u16),
             value: entry.timestamp,
         });
     }
@@ -951,7 +990,7 @@ fn version_to_wire(version: &clock::Global) -> Vec<proto::VectorClockEntry> {
     let mut message = Vec::new();
     for entry in version.iter() {
         message.push(proto::VectorClockEntry {
-            replica_id: entry.replica_id as u32,
+            replica_id: entry.replica_id.as_u16() as u32,
             timestamp: entry.value,
         });
     }

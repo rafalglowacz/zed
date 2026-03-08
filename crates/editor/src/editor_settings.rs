@@ -1,79 +1,67 @@
-use gpui::AppContext;
-use language::CursorShape;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use settings::{Settings, SettingsSources};
+use core::num;
 
-#[derive(Deserialize, Clone)]
+use gpui::App;
+use language::CursorShape;
+use project::project_settings::DiagnosticSeverity;
+pub use settings::{
+    CompletionDetailAlignment, CurrentLineHighlight, DelayMs, DiffViewStyle, DisplayIn,
+    DocumentColorsRenderMode, DoubleClickInMultibuffer, GoToDefinitionFallback, HideMouseMode,
+    MinimapThumb, MinimapThumbBorder, MultiCursorModifier, ScrollBeyondLastLine,
+    ScrollbarDiagnostics, SeedQuerySetting, ShowMinimap, SnippetSortOrder,
+};
+use settings::{RegisterSetting, RelativeLineNumbers, Settings};
+use ui::scrollbars::{ScrollbarVisibility, ShowScrollbar};
+
+/// Imports from the VSCode settings at
+/// https://code.visualstudio.com/docs/reference/default-settings
+#[derive(Clone, RegisterSetting)]
 pub struct EditorSettings {
     pub cursor_blink: bool,
     pub cursor_shape: Option<CursorShape>,
     pub current_line_highlight: CurrentLineHighlight,
+    pub selection_highlight: bool,
+    pub rounded_selection: bool,
+    pub lsp_highlight_debounce: DelayMs,
     pub hover_popover_enabled: bool,
-    pub show_completions_on_input: bool,
-    pub show_completion_documentation: bool,
-    pub completion_documentation_secondary_query_debounce: u64,
+    pub hover_popover_delay: DelayMs,
     pub toolbar: Toolbar,
     pub scrollbar: Scrollbar,
+    pub minimap: Minimap,
     pub gutter: Gutter,
     pub scroll_beyond_last_line: ScrollBeyondLastLine,
-    pub vertical_scroll_margin: f32,
+    pub vertical_scroll_margin: f64,
+    pub autoscroll_on_clicks: bool,
+    pub horizontal_scroll_margin: f32,
     pub scroll_sensitivity: f32,
-    pub relative_line_numbers: bool,
+    pub fast_scroll_sensitivity: f32,
+    pub sticky_scroll: StickyScroll,
+    pub relative_line_numbers: RelativeLineNumbers,
     pub seed_search_query_from_cursor: SeedQuerySetting,
     pub use_smartcase_search: bool,
     pub multi_cursor_modifier: MultiCursorModifier,
     pub redact_private_values: bool,
     pub expand_excerpt_lines: u32,
+    pub excerpt_context_lines: u32,
     pub middle_click_paste: bool,
-    #[serde(default)]
     pub double_click_in_multibuffer: DoubleClickInMultibuffer,
     pub search_wrap: bool,
-    #[serde(default)]
     pub search: SearchSettings,
     pub auto_signature_help: bool,
     pub show_signature_help_after_edits: bool,
+    pub go_to_definition_fallback: GoToDefinitionFallback,
     pub jupyter: Jupyter,
+    pub hide_mouse: Option<HideMouseMode>,
+    pub snippet_sort_order: SnippetSortOrder,
+    pub diagnostics_max_severity: Option<DiagnosticSeverity>,
+    pub inline_code_actions: bool,
+    pub drag_and_drop_selection: DragAndDropSelection,
+    pub lsp_document_colors: DocumentColorsRenderMode,
+    pub minimum_contrast_for_highlights: f32,
+    pub completion_menu_scrollbar: ShowScrollbar,
+    pub completion_detail_alignment: CompletionDetailAlignment,
+    pub diff_view_style: DiffViewStyle,
 }
-
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum CurrentLineHighlight {
-    // Don't highlight the current line.
-    None,
-    // Highlight the gutter area.
-    Gutter,
-    // Highlight the editor area.
-    Line,
-    // Highlight the full line.
-    All,
-}
-
-/// When to populate a new search's query based on the text under the cursor.
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum SeedQuerySetting {
-    /// Always populate the search query with the word under the cursor.
-    Always,
-    /// Only populate the search query when there is text selected.
-    Selection,
-    /// Never populate the search query
-    Never,
-}
-
-/// What to do when multibuffer is double clicked in some of its excerpts (parts of singleton buffers).
-#[derive(Default, Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum DoubleClickInMultibuffer {
-    /// Behave as a regular buffer and select the whole word.
-    #[default]
-    Select,
-    /// Open the excerpt clicked as a new buffer in the new tab, if no `alt` modifier was pressed during double click.
-    /// Otherwise, behave as a regular buffer and select the whole word.
-    Open,
-}
-
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Jupyter {
     /// Whether the Jupyter feature is enabled.
     ///
@@ -81,294 +69,234 @@ pub struct Jupyter {
     pub enabled: bool,
 }
 
-#[derive(Default, Copy, Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub struct JupyterContent {
-    /// Whether the Jupyter feature is enabled.
-    ///
-    /// Default: true
-    pub enabled: Option<bool>,
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct StickyScroll {
+    pub enabled: bool,
 }
 
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Toolbar {
     pub breadcrumbs: bool,
     pub quick_actions: bool,
     pub selections_menu: bool,
+    pub agent_review: bool,
+    pub code_actions: bool,
 }
 
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Scrollbar {
     pub show: ShowScrollbar,
     pub git_diff: bool,
+    pub selected_text: bool,
     pub selected_symbol: bool,
     pub search_results: bool,
-    pub diagnostics: bool,
+    pub diagnostics: ScrollbarDiagnostics,
     pub cursors: bool,
+    pub axes: ScrollbarAxes,
 }
 
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Minimap {
+    pub show: ShowMinimap,
+    pub display_in: DisplayIn,
+    pub thumb: MinimapThumb,
+    pub thumb_border: MinimapThumbBorder,
+    pub current_line_highlight: Option<CurrentLineHighlight>,
+    pub max_width_columns: num::NonZeroU32,
+}
+
+impl Minimap {
+    pub fn minimap_enabled(&self) -> bool {
+        self.show != ShowMinimap::Never
+    }
+
+    #[inline]
+    pub fn on_active_editor(&self) -> bool {
+        self.display_in == DisplayIn::ActiveEditor
+    }
+
+    pub fn with_show_override(self) -> Self {
+        Self {
+            show: ShowMinimap::Always,
+            ..self
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct Gutter {
+    pub min_line_number_digits: usize,
     pub line_numbers: bool,
-    pub code_actions: bool,
     pub runnables: bool,
+    pub breakpoints: bool,
     pub folds: bool,
 }
 
-/// When to show the scrollbar in the editor.
-///
-/// Default: auto
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ShowScrollbar {
-    /// Show the scrollbar if there's important information or
-    /// follow the system's configured behavior.
-    Auto,
-    /// Match the system's configured behavior.
-    System,
-    /// Always show the scrollbar.
-    Always,
-    /// Never show the scrollbar.
-    Never,
+/// Forcefully enable or disable the scrollbar for each axis
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ScrollbarAxes {
+    /// When false, forcefully disables the horizontal scrollbar. Otherwise, obey other settings.
+    ///
+    /// Default: true
+    pub horizontal: bool,
+
+    /// When false, forcefully disables the vertical scrollbar. Otherwise, obey other settings.
+    ///
+    /// Default: true
+    pub vertical: bool,
 }
 
-/// The key to use for adding multiple cursors
-///
-/// Default: alt
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum MultiCursorModifier {
-    Alt,
-    #[serde(alias = "cmd", alias = "ctrl")]
-    CmdOrCtrl,
-}
+/// Whether to allow drag and drop text selection in buffer.
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
+pub struct DragAndDropSelection {
+    /// When true, enables drag and drop text selection in buffer.
+    ///
+    /// Default: true
+    pub enabled: bool,
 
-/// Whether the editor will scroll beyond the last line.
-///
-/// Default: one_page
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ScrollBeyondLastLine {
-    /// The editor will not scroll beyond the last line.
-    Off,
-
-    /// The editor will scroll beyond the last line by one page.
-    OnePage,
-
-    /// The editor will scroll beyond the last line by the same number of lines as vertical_scroll_margin.
-    VerticalScrollMargin,
+    /// The delay in milliseconds that must elapse before drag and drop is allowed. Otherwise, a new text selection is created.
+    ///
+    /// Default: 300
+    pub delay: DelayMs,
 }
 
 /// Default options for buffer and project search items.
-#[derive(Copy, Clone, Default, Debug, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Copy, Clone, Default, Debug, PartialEq, Eq)]
 pub struct SearchSettings {
-    #[serde(default)]
+    /// Whether to show the project search button in the status bar.
+    pub button: bool,
+    /// Whether to only match on whole words.
     pub whole_word: bool,
-    #[serde(default)]
+    /// Whether to match case sensitively.
     pub case_sensitive: bool,
-    #[serde(default)]
+    /// Whether to include gitignored files in search results.
     pub include_ignored: bool,
-    #[serde(default)]
+    /// Whether to interpret the search query as a regular expression.
     pub regex: bool,
-}
-
-#[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
-pub struct EditorSettingsContent {
-    /// Whether the cursor blinks in the editor.
-    ///
-    /// Default: true
-    pub cursor_blink: Option<bool>,
-    /// Cursor shape for the default editor.
-    /// Can be "bar", "block", "underline", or "hollow".
-    ///
-    /// Default: None
-    pub cursor_shape: Option<CursorShape>,
-    /// How to highlight the current line in the editor.
-    ///
-    /// Default: all
-    pub current_line_highlight: Option<CurrentLineHighlight>,
-    /// Whether to show the informational hover box when moving the mouse
-    /// over symbols in the editor.
-    ///
-    /// Default: true
-    pub hover_popover_enabled: Option<bool>,
-
-    /// Whether to pop the completions menu while typing in an editor without
-    /// explicitly requesting it.
-    ///
-    /// Default: true
-    pub show_completions_on_input: Option<bool>,
-    /// Whether to display inline and alongside documentation for items in the
-    /// completions menu.
-    ///
-    /// Default: true
-    pub show_completion_documentation: Option<bool>,
-    /// The debounce delay before re-querying the language server for completion
-    /// documentation when not included in original completion list.
-    ///
-    /// Default: 300 ms
-    pub completion_documentation_secondary_query_debounce: Option<u64>,
-    /// Toolbar related settings
-    pub toolbar: Option<ToolbarContent>,
-    /// Scrollbar related settings
-    pub scrollbar: Option<ScrollbarContent>,
-    /// Gutter related settings
-    pub gutter: Option<GutterContent>,
-    /// Whether the editor will scroll beyond the last line.
-    ///
-    /// Default: one_page
-    pub scroll_beyond_last_line: Option<ScrollBeyondLastLine>,
-    /// The number of lines to keep above/below the cursor when auto-scrolling.
-    ///
-    /// Default: 3.
-    pub vertical_scroll_margin: Option<f32>,
-    /// Scroll sensitivity multiplier. This multiplier is applied
-    /// to both the horizontal and vertical delta values while scrolling.
-    ///
-    /// Default: 1.0
-    pub scroll_sensitivity: Option<f32>,
-    /// Whether the line numbers on editors gutter are relative or not.
-    ///
-    /// Default: false
-    pub relative_line_numbers: Option<bool>,
-    /// When to populate a new search's query based on the text under the cursor.
-    ///
-    /// Default: always
-    pub seed_search_query_from_cursor: Option<SeedQuerySetting>,
-    pub use_smartcase_search: Option<bool>,
-    /// The key to use for adding multiple cursors
-    ///
-    /// Default: alt
-    pub multi_cursor_modifier: Option<MultiCursorModifier>,
-    /// Hide the values of variables in `private` files, as defined by the
-    /// private_files setting. This only changes the visual representation,
-    /// the values are still present in the file and can be selected / copied / pasted
-    ///
-    /// Default: false
-    pub redact_private_values: Option<bool>,
-
-    /// How many lines to expand the multibuffer excerpts by default
-    ///
-    /// Default: 3
-    pub expand_excerpt_lines: Option<u32>,
-
-    /// Whether to enable middle-click paste on Linux
-    ///
-    /// Default: true
-    pub middle_click_paste: Option<bool>,
-
-    /// What to do when multibuffer is double clicked in some of its excerpts
-    /// (parts of singleton buffers).
-    ///
-    /// Default: select
-    pub double_click_in_multibuffer: Option<DoubleClickInMultibuffer>,
-    /// Whether the editor search results will loop
-    ///
-    /// Default: true
-    pub search_wrap: Option<bool>,
-
-    /// Defaults to use when opening a new buffer and project search items.
-    ///
-    /// Default: nothing is enabled
-    pub search: Option<SearchSettings>,
-
-    /// Whether to automatically show a signature help pop-up or not.
-    ///
-    /// Default: false
-    pub auto_signature_help: Option<bool>,
-
-    /// Whether to show the signature help pop-up after completions or bracket pairs inserted.
-    ///
-    /// Default: true
-    pub show_signature_help_after_edits: Option<bool>,
-
-    /// Jupyter REPL settings.
-    pub jupyter: Option<JupyterContent>,
-}
-
-// Toolbar related settings
-#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct ToolbarContent {
-    /// Whether to display breadcrumbs in the editor toolbar.
-    ///
-    /// Default: true
-    pub breadcrumbs: Option<bool>,
-    /// Whether to display quick action buttons in the editor toolbar.
-    ///
-    /// Default: true
-    pub quick_actions: Option<bool>,
-
-    /// Whether to show the selections menu in the editor toolbar
-    ///
-    /// Default: true
-    pub selections_menu: Option<bool>,
-}
-
-/// Scrollbar related settings
-#[derive(Copy, Clone, Debug, Serialize, Deserialize, JsonSchema, PartialEq)]
-pub struct ScrollbarContent {
-    /// When to show the scrollbar in the editor.
-    ///
-    /// Default: auto
-    pub show: Option<ShowScrollbar>,
-    /// Whether to show git diff indicators in the scrollbar.
-    ///
-    /// Default: true
-    pub git_diff: Option<bool>,
-    /// Whether to show buffer search result indicators in the scrollbar.
-    ///
-    /// Default: true
-    pub search_results: Option<bool>,
-    /// Whether to show selected symbol occurrences in the scrollbar.
-    ///
-    /// Default: true
-    pub selected_symbol: Option<bool>,
-    /// Whether to show diagnostic indicators in the scrollbar.
-    ///
-    /// Default: true
-    pub diagnostics: Option<bool>,
-    /// Whether to show cursor positions in the scrollbar.
-    ///
-    /// Default: true
-    pub cursors: Option<bool>,
-}
-
-/// Gutter related settings
-#[derive(Copy, Clone, Debug, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
-pub struct GutterContent {
-    /// Whether to show line numbers in the gutter.
-    ///
-    /// Default: true
-    pub line_numbers: Option<bool>,
-    /// Whether to show code action buttons in the gutter.
-    ///
-    /// Default: true
-    pub code_actions: Option<bool>,
-    /// Whether to show runnable buttons in the gutter.
-    ///
-    /// Default: true
-    pub runnables: Option<bool>,
-    /// Whether to show fold buttons in the gutter.
-    ///
-    /// Default: true
-    pub folds: Option<bool>,
+    /// Whether to center the cursor on each search match when navigating.
+    pub center_on_match: bool,
 }
 
 impl EditorSettings {
-    pub fn jupyter_enabled(cx: &AppContext) -> bool {
+    pub fn jupyter_enabled(cx: &App) -> bool {
         EditorSettings::get_global(cx).jupyter.enabled
     }
 }
 
+impl ScrollbarVisibility for EditorSettings {
+    fn visibility(&self, _cx: &App) -> ShowScrollbar {
+        self.scrollbar.show
+    }
+}
+
 impl Settings for EditorSettings {
-    const KEY: Option<&'static str> = None;
-
-    type FileContent = EditorSettingsContent;
-
-    fn load(
-        sources: SettingsSources<Self::FileContent>,
-        _: &mut AppContext,
-    ) -> anyhow::Result<Self> {
-        sources.json_merge()
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let editor = content.editor.clone();
+        let scrollbar = editor.scrollbar.unwrap();
+        let minimap = editor.minimap.unwrap();
+        let gutter = editor.gutter.unwrap();
+        let axes = scrollbar.axes.unwrap();
+        let toolbar = editor.toolbar.unwrap();
+        let search = editor.search.unwrap();
+        let drag_and_drop_selection = editor.drag_and_drop_selection.unwrap();
+        let sticky_scroll = editor.sticky_scroll.unwrap();
+        Self {
+            cursor_blink: editor.cursor_blink.unwrap(),
+            cursor_shape: editor.cursor_shape.map(Into::into),
+            current_line_highlight: editor.current_line_highlight.unwrap(),
+            selection_highlight: editor.selection_highlight.unwrap(),
+            rounded_selection: editor.rounded_selection.unwrap(),
+            lsp_highlight_debounce: editor.lsp_highlight_debounce.unwrap(),
+            hover_popover_enabled: editor.hover_popover_enabled.unwrap(),
+            hover_popover_delay: editor.hover_popover_delay.unwrap(),
+            toolbar: Toolbar {
+                breadcrumbs: toolbar.breadcrumbs.unwrap(),
+                quick_actions: toolbar.quick_actions.unwrap(),
+                selections_menu: toolbar.selections_menu.unwrap(),
+                agent_review: toolbar.agent_review.unwrap(),
+                code_actions: toolbar.code_actions.unwrap(),
+            },
+            scrollbar: Scrollbar {
+                show: scrollbar.show.map(Into::into).unwrap(),
+                git_diff: scrollbar.git_diff.unwrap()
+                    && content
+                        .git
+                        .as_ref()
+                        .unwrap()
+                        .enabled
+                        .unwrap()
+                        .is_git_diff_enabled(),
+                selected_text: scrollbar.selected_text.unwrap(),
+                selected_symbol: scrollbar.selected_symbol.unwrap(),
+                search_results: scrollbar.search_results.unwrap(),
+                diagnostics: scrollbar.diagnostics.unwrap(),
+                cursors: scrollbar.cursors.unwrap(),
+                axes: ScrollbarAxes {
+                    horizontal: axes.horizontal.unwrap(),
+                    vertical: axes.vertical.unwrap(),
+                },
+            },
+            minimap: Minimap {
+                show: minimap.show.unwrap(),
+                display_in: minimap.display_in.unwrap(),
+                thumb: minimap.thumb.unwrap(),
+                thumb_border: minimap.thumb_border.unwrap(),
+                current_line_highlight: minimap.current_line_highlight,
+                max_width_columns: minimap.max_width_columns.unwrap(),
+            },
+            gutter: Gutter {
+                min_line_number_digits: gutter.min_line_number_digits.unwrap(),
+                line_numbers: gutter.line_numbers.unwrap(),
+                runnables: gutter.runnables.unwrap(),
+                breakpoints: gutter.breakpoints.unwrap(),
+                folds: gutter.folds.unwrap(),
+            },
+            scroll_beyond_last_line: editor.scroll_beyond_last_line.unwrap(),
+            vertical_scroll_margin: editor.vertical_scroll_margin.unwrap() as f64,
+            autoscroll_on_clicks: editor.autoscroll_on_clicks.unwrap(),
+            horizontal_scroll_margin: editor.horizontal_scroll_margin.unwrap(),
+            scroll_sensitivity: editor.scroll_sensitivity.unwrap(),
+            fast_scroll_sensitivity: editor.fast_scroll_sensitivity.unwrap(),
+            sticky_scroll: StickyScroll {
+                enabled: sticky_scroll.enabled.unwrap(),
+            },
+            relative_line_numbers: editor.relative_line_numbers.unwrap(),
+            seed_search_query_from_cursor: editor.seed_search_query_from_cursor.unwrap(),
+            use_smartcase_search: editor.use_smartcase_search.unwrap(),
+            multi_cursor_modifier: editor.multi_cursor_modifier.unwrap(),
+            redact_private_values: editor.redact_private_values.unwrap(),
+            expand_excerpt_lines: editor.expand_excerpt_lines.unwrap(),
+            excerpt_context_lines: editor.excerpt_context_lines.unwrap(),
+            middle_click_paste: editor.middle_click_paste.unwrap(),
+            double_click_in_multibuffer: editor.double_click_in_multibuffer.unwrap(),
+            search_wrap: editor.search_wrap.unwrap(),
+            search: SearchSettings {
+                button: search.button.unwrap(),
+                whole_word: search.whole_word.unwrap(),
+                case_sensitive: search.case_sensitive.unwrap(),
+                include_ignored: search.include_ignored.unwrap(),
+                regex: search.regex.unwrap(),
+                center_on_match: search.center_on_match.unwrap(),
+            },
+            auto_signature_help: editor.auto_signature_help.unwrap(),
+            show_signature_help_after_edits: editor.show_signature_help_after_edits.unwrap(),
+            go_to_definition_fallback: editor.go_to_definition_fallback.unwrap(),
+            jupyter: Jupyter {
+                enabled: editor.jupyter.unwrap().enabled.unwrap(),
+            },
+            hide_mouse: editor.hide_mouse,
+            snippet_sort_order: editor.snippet_sort_order.unwrap(),
+            diagnostics_max_severity: editor.diagnostics_max_severity.map(Into::into),
+            inline_code_actions: editor.inline_code_actions.unwrap(),
+            drag_and_drop_selection: DragAndDropSelection {
+                enabled: drag_and_drop_selection.enabled.unwrap(),
+                delay: drag_and_drop_selection.delay.unwrap(),
+            },
+            lsp_document_colors: editor.lsp_document_colors.unwrap(),
+            minimum_contrast_for_highlights: editor.minimum_contrast_for_highlights.unwrap().0,
+            completion_menu_scrollbar: editor.completion_menu_scrollbar.map(Into::into).unwrap(),
+            completion_detail_alignment: editor.completion_detail_alignment.unwrap(),
+            diff_view_style: editor.diff_view_style.unwrap(),
+        }
     }
 }

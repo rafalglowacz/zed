@@ -1,6 +1,7 @@
-use gpui::{
-    div, img, prelude::*, App, AppContext, ImageSource, Render, ViewContext, WindowOptions,
-};
+#![cfg_attr(target_family = "wasm", no_main)]
+
+use gpui::{App, Context, Render, Window, WindowOptions, div, img, prelude::*};
+use gpui_platform::application;
 use std::path::PathBuf;
 
 struct GifViewer {
@@ -14,9 +15,9 @@ impl GifViewer {
 }
 
 impl Render for GifViewer {
-    fn render(&mut self, _cx: &mut ViewContext<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div().size_full().child(
-            img(ImageSource::File(self.gif_path.clone().into()))
+            img(self.gif_path.clone())
                 .size_full()
                 .object_fit(gpui::ObjectFit::Contain)
                 .id("gif"),
@@ -24,27 +25,32 @@ impl Render for GifViewer {
     }
 }
 
-fn main() {
-    env_logger::init();
-    App::new().run(|cx: &mut AppContext| {
-        let cwd = std::env::current_dir().expect("Failed to get current working directory");
-        let gif_path = cwd.join("crates/gpui/examples/image/black-cat-typing.gif");
-
-        if !gif_path.exists() {
-            eprintln!("Image file not found at {:?}", gif_path);
-            eprintln!("Make sure you're running this example from the root of the gpui crate");
-            cx.quit();
-            return;
-        }
+fn run_example() {
+    application().run(|cx: &mut App| {
+        let gif_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("examples/image/black-cat-typing.gif");
 
         cx.open_window(
             WindowOptions {
                 focus: true,
                 ..Default::default()
             },
-            |cx| cx.new_view(|_cx| GifViewer::new(gif_path)),
+            |_, cx| cx.new(|_| GifViewer::new(gif_path)),
         )
         .unwrap();
         cx.activate(true);
     });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn main() {
+    env_logger::init();
+    run_example();
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    gpui_platform::web_init();
+    run_example();
 }

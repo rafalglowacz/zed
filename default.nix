@@ -1,14 +1,10 @@
-(
-  import
-  (
-    let
-      lock = builtins.fromJSON (builtins.readFile ./flake.lock);
-    in
-      fetchTarball {
-        url = lock.nodes.flake-compat.locked.url or "https://github.com/edolstra/flake-compat/archive/${lock.nodes.flake-compat.locked.rev}.tar.gz";
-        sha256 = lock.nodes.flake-compat.locked.narHash;
-      }
-  )
-  {src = ./.;}
-)
-.defaultNix
+(import (
+  let
+    rev = "v1.1.0";
+    sha256 = "sha256:19d2z6xsvpxm184m41qrpi1bplilwipgnzv9jy17fgw421785q1m";
+  in
+  fetchTarball {
+    inherit sha256;
+    url = "https://github.com/NixOS/flake-compat/archive/${rev}.tar.gz";
+  }
+) { src = ./.; }).defaultNix

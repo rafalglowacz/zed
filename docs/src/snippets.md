@@ -1,32 +1,45 @@
+---
+title: Snippets - Zed
+description: Create and use code snippets in Zed with tab stops, placeholders, variables, and language-scoped triggers.
+---
+
 # Snippets
 
-Place your snippet files in `~/.config/zed/snippets` directory.
+Use the {#action snippets::ConfigureSnippets} action to create a new snippets file or edit an existing snippets file for a specified [scope](#scopes).
 
-Ex: If you want to create snippets that targeted JavaScript files, your file would be `javascript.json` and it might contain:
+The snippets are located in `~/.config/zed/snippets` directory to which you can navigate to with the {#action snippets::OpenFolder} action.
+
+## Example configuration
 
 ```json
 {
-  "Log to the console": {
+  // Each snippet must have a name and body, but the prefix and description are optional.
+  // The prefix is used to trigger the snippet, but when omitted then the name is used.
+  // Use placeholders like $1, $2 or ${1:defaultValue} to define tab stops.
+  // The $0 determines the final cursor position.
+  // Placeholders with the same value are linked.
+  // If the snippet contains the $ symbol outside of a placeholder, it must be escaped with two slashes (e.g. \\$var).
+  "Log to console": {
     "prefix": "log",
-    "body": ["console.log($1);", "$0"],
-    "description": "Log to the console"
-  },
-  "Log warning to console": {
-    "prefix": "warn",
-    "body": ["console.warn($1);", "$0"],
-    "description": "Log warning to the console"
-  },
-  "Log error to console": {
-    "prefix": "error",
-    "body": ["console.error($1);", "$0"],
-    "description": "Log error to the console"
-  },
-  "Throw Exception": {
-    "prefix": "throw",
-    "body": ["throw new Error(\"$1\");", "$0"],
-    "description": "Throw Exception"
+    "body": ["console.info(\"Hello, ${1:World}!\")", "$0"],
+    "description": "Logs to console"
   }
 }
 ```
 
-For more configuration information, see the [`simple-completion-language-server` instructions](https://github.com/zed-industries/simple-completion-language-server/tree/main).
+## Scopes
+
+The scope is determined by the language name in lowercase e.g. `python.json` for Python, `shell script.json` for Shell Script, but there are some exceptions to this rule:
+
+| Scope      | Filename        |
+| ---------- | --------------- |
+| Global     | snippets.json   |
+| JSX        | javascript.json |
+| Plain Text | plaintext.json  |
+
+To create JSX snippets you have to use `javascript.json` snippets file, instead of `jsx.json`, but this does not apply to TSX and TypeScript which follow the above rule.
+
+## Known Limitations
+
+- Only the first prefix is used when a list of prefixes is passed in.
+- Currently only the `json` snippet file format is supported.

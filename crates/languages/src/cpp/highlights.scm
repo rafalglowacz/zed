@@ -1,10 +1,31 @@
 (identifier) @variable
+
 (field_identifier) @property
+
 (namespace_identifier) @namespace
 
 (concept_definition
-    (identifier) @concept)
+  name: (identifier) @concept)
 
+(requires_clause
+  constraint: (template_type
+    name: (type_identifier) @concept))
+
+(module_name
+  (identifier) @module)
+
+(module_declaration
+  name: (module_name
+    (identifier) @module))
+
+(import_declaration
+  name: (module_name
+    (identifier) @module))
+
+(import_declaration
+  partition: (module_partition
+    (module_name
+      (identifier) @module)))
 
 (call_expression
   function: (qualified_identifier
@@ -61,84 +82,113 @@
 (operator_name
   (identifier)? @operator) @function
 
-(destructor_name (identifier) @function)
+(operator_name
+  "<=>" @operator.spaceship)
+
+(destructor_name
+  (identifier) @function)
 
 ((namespace_identifier) @type
- (#match? @type "^[A-Z]"))
+  (#match? @type "^[A-Z]"))
 
 (auto) @type
-(type_identifier) @type
-type :(primitive_type) @type.primitive
 
-(requires_clause
-    constraint: (template_type
-        name: (type_identifier) @concept))
+(type_identifier) @type
+
+type: (primitive_type) @type.builtin
+
+(sized_type_specifier) @type.builtin
+
+; GNU __attribute__
+(attribute_specifier) @attribute
+
+(attribute_specifier
+  (argument_list
+    (identifier) @attribute))
+
+; C++11 [[attributes]]
+(attribute
+  prefix: (identifier) @attribute)
 
 (attribute
-    name: (identifier) @keyword)
+  name: (identifier) @attribute)
 
-((identifier) @constant
- (#match? @constant "^_*[A-Z][A-Z\\d_]*$"))
+((identifier) @constant.builtin
+  (#match? @constant.builtin "^_*[A-Z][A-Z\\d_]*$"))
 
 (statement_identifier) @label
-(this) @variable.special
-("static_assert") @function.builtin
+
+(this) @variable.builtin
+
+"static_assert" @function.builtin
 
 [
   "alignas"
   "alignof"
-  "break"
-  "case"
-  "catch"
   "class"
-  "co_await"
-  "co_return"
-  "co_yield"
   "concept"
+  "consteval"
   "constexpr"
-  "continue"
+  "constinit"
   "decltype"
-  "default"
   "delete"
-  "do"
-  "else"
   "enum"
   "explicit"
+  "export"
   "extern"
   "final"
-  "for"
   "friend"
-  "if"
+  "import"
   "inline"
+  "module"
   "namespace"
   "new"
   "noexcept"
+  "operator"
   "override"
   "private"
   "protected"
   "public"
   "requires"
-  "return"
   "sizeof"
   "struct"
-  "switch"
   "template"
-  "throw"
-  "try"
+  "thread_local"
   "typedef"
   "typename"
   "union"
   "using"
   "virtual"
-  "while"
-  (sized_type_specifier)
   (storage_class_specifier)
   (type_qualifier)
 ] @keyword
 
 [
+  "break"
+  "case"
+  "catch"
+  "co_await"
+  "co_return"
+  "co_yield"
+  "continue"
+  "default"
+  "do"
+  "else"
+  "for"
+  "goto"
+  "if"
+  "return"
+  "switch"
+  "throw"
+  "try"
+  "while"
+] @keyword.control
+
+[
   "#define"
   "#elif"
+  "#elifdef"
+  "#elifndef"
   "#else"
   "#endif"
   "#if"
@@ -146,16 +196,19 @@ type :(primitive_type) @type.primitive
   "#ifndef"
   "#include"
   (preproc_directive)
-] @keyword
+] @preproc
 
 (comment) @comment
 
 [
   (true)
   (false)
+] @boolean
+
+[
   (null)
-  ("nullptr")
-] @constant
+  "nullptr"
+] @constant.builtin
 
 (number_literal) @number
 
@@ -165,6 +218,8 @@ type :(primitive_type) @type.primitive
   (char_literal)
   (raw_string_literal)
 ] @string
+
+(escape_sequence) @string.escape
 
 [
   ","
@@ -221,10 +276,27 @@ type :(primitive_type) @type.primitive
   ">"
   "<="
   ">="
-  "<=>"
-  "||"
   "?"
+  "and"
+  "and_eq"
+  "bitand"
+  "bitor"
+  "compl"
+  "not"
+  "not_eq"
+  "or"
+  "or_eq"
+  "xor"
+  "xor_eq"
 ] @operator
 
-(conditional_expression ":" @operator)
-(user_defined_literal (literal_suffix) @operator)
+"<=>" @operator.spaceship
+
+(binary_expression
+  operator: "<=>" @operator.spaceship)
+
+(conditional_expression
+  ":" @operator)
+
+(user_defined_literal
+  (literal_suffix) @operator)

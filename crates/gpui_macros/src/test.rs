@@ -3,76 +3,131 @@ use proc_macro2::Ident;
 use quote::{format_ident, quote};
 use std::mem;
 use syn::{
-    parse_macro_input, parse_quote, spanned::Spanned as _, AttributeArgs, FnArg, ItemFn, Lit, Meta,
-    NestedMeta, Type,
+    self, Expr, ExprLit, FnArg, ItemFn, Lit, Meta, MetaList, PathSegment, Token, Type,
+    parse::{Parse, ParseStream},
+    parse_quote,
+    punctuated::Punctuated,
+    spanned::Spanned,
 };
 
-pub fn test(args: TokenStream, function: TokenStream) -> TokenStream {
-    let args = syn::parse_macro_input!(args as AttributeArgs);
-    let mut max_retries = 0;
-    let mut num_iterations = 1;
-    let mut on_failure_fn_name = quote!(None);
+struct Args {
+    seeds: Vec<u64>,
+    max_retries: usize,
+    max_iterations: usize,
+    on_failure_fn_name: proc_macro2::TokenStream,
+}
 
-    for arg in args {
-        match arg {
-            NestedMeta::Meta(Meta::NameValue(meta)) => {
-                let key_name = meta.path.get_ident().map(|i| i.to_string());
-                let result = (|| {
-                    match key_name.as_deref() {
-                        Some("retries") => max_retries = parse_int(&meta.lit)?,
-                        Some("iterations") => num_iterations = parse_int(&meta.lit)?,
-                        Some("on_failure") => {
-                            if let Lit::Str(name) = meta.lit {
-                                let mut path = syn::Path {
-                                    leading_colon: None,
-                                    segments: Default::default(),
-                                };
-                                for part in name.value().split("::") {
-                                    path.segments.push(Ident::new(part, name.span()).into());
-                                }
-                                on_failure_fn_name = quote!(Some(#path));
-                            } else {
-                                return Err(TokenStream::from(
-                                    syn::Error::new(
-                                        meta.lit.span(),
-                                        "on_failure argument must be a string",
-                                    )
-                                    .into_compile_error(),
-                                ));
-                            }
-                        }
-                        _ => {
-                            return Err(TokenStream::from(
-                                syn::Error::new(meta.path.span(), "invalid argument")
-                                    .into_compile_error(),
-                            ))
-                        }
+impl Parse for Args {
+    fn parse(input: ParseStream) -> Result<Self, syn::Error> {
+        let mut seeds = Vec::<u64>::new();
+        let mut max_retries = 0;
+        let mut max_iterations = 1;
+        let mut on_failure_fn_name = quote!(None);
+
+        let metas = Punctuated::<Meta, Token![,]>::parse_terminated(input)?;
+
+        for meta in metas {
+            let ident = {
+                let meta_path = match &meta {
+                    Meta::NameValue(meta) => &meta.path,
+                    Meta::List(list) => &list.path,
+                    Meta::Path(path) => {
+                        return Err(syn::Error::new(path.span(), "invalid path argument"));
                     }
-                    Ok(())
-                })();
+                };
+                let Some(ident) = meta_path.get_ident() else {
+                    return Err(syn::Error::new(meta_path.span(), "unexpected path"));
+                };
+                ident.to_string()
+            };
 
-                if let Err(tokens) = result {
-                    return tokens;
+            match (&meta, ident.as_str()) {
+                (Meta::NameValue(meta), "retries") => {
+                    max_retries = parse_usize_from_expr(&meta.value)?
+                }
+                (Meta::NameValue(meta), "iterations") => {
+                    max_iterations = parse_usize_from_expr(&meta.value)?
+                }
+                (Meta::NameValue(meta), "on_failure") => {
+                    let Expr::Lit(ExprLit {
+                        lit: Lit::Str(name),
+                        ..
+                    }) = &meta.value
+                    else {
+                        return Err(syn::Error::new(
+                            meta.value.span(),
+                            "on_failure argument must be a string",
+                        ));
+                    };
+                    let segments = name
+                        .value()
+                        .split("::")
+                        .map(|part| PathSegment::from(Ident::new(part, name.span())))
+                        .collect();
+                    let path = syn::Path {
+                        leading_colon: None,
+                        segments,
+                    };
+                    on_failure_fn_name = quote!(Some(#path));
+                }
+                (Meta::NameValue(meta), "seed") => {
+                    seeds = vec![parse_usize_from_expr(&meta.value)? as u64]
+                }
+                (Meta::List(list), "seeds") => seeds = parse_u64_array(list)?,
+                (Meta::Path(_), _) => {
+                    return Err(syn::Error::new(meta.span(), "invalid path argument"));
+                }
+                (_, _) => {
+                    return Err(syn::Error::new(meta.span(), "invalid argument name"));
                 }
             }
-            other => {
-                return TokenStream::from(
-                    syn::Error::new_spanned(other, "invalid argument").into_compile_error(),
-                )
-            }
         }
-    }
 
-    let mut inner_fn = parse_macro_input!(function as ItemFn);
-    if max_retries > 0 && num_iterations > 1 {
-        return TokenStream::from(
-            syn::Error::new_spanned(inner_fn, "retries and randomized iterations can't be mixed")
-                .into_compile_error(),
-        );
+        Ok(Args {
+            seeds,
+            max_retries,
+            max_iterations,
+            on_failure_fn_name,
+        })
     }
+}
+
+pub fn test(args: TokenStream, function: TokenStream) -> TokenStream {
+    let args = syn::parse_macro_input!(args as Args);
+    let mut inner_fn = match syn::parse::<ItemFn>(function) {
+        Ok(f) => f,
+        Err(err) => return error_to_stream(err),
+    };
+
     let inner_fn_attributes = mem::take(&mut inner_fn.attrs);
-    let inner_fn_name = format_ident!("_{}", inner_fn.sig.ident);
+    let inner_fn_name = format_ident!("__{}", inner_fn.sig.ident);
     let outer_fn_name = mem::replace(&mut inner_fn.sig.ident, inner_fn_name.clone());
+
+    let result = generate_test_function(
+        args,
+        inner_fn,
+        inner_fn_attributes,
+        inner_fn_name,
+        outer_fn_name,
+    );
+    match result {
+        Ok(tokens) => tokens,
+        Err(tokens) => tokens,
+    }
+}
+
+fn generate_test_function(
+    args: Args,
+    inner_fn: ItemFn,
+    inner_fn_attributes: Vec<syn::Attribute>,
+    inner_fn_name: Ident,
+    outer_fn_name: Ident,
+) -> Result<TokenStream, TokenStream> {
+    let seeds = &args.seeds;
+    let max_retries = args.max_retries;
+    let num_iterations = args.max_iterations;
+    let on_failure_fn_name = &args.on_failure_fn_name;
+    let seeds = quote!( #(#seeds),* );
 
     let mut outer_fn: ItemFn = if inner_fn.sig.asyncness.is_some() {
         // Pass to the test function the number of app contexts that it needs,
@@ -97,34 +152,34 @@ pub fn test(args: TokenStream, function: TokenStream) -> TokenStream {
                         }
                         _ => {}
                     }
-                } else if let Type::Reference(ty) = &*arg.ty {
-                    if let Type::Path(ty) = &*ty.elem {
-                        let last_segment = ty.path.segments.last();
-                        if let Some("TestAppContext") =
-                            last_segment.map(|s| s.ident.to_string()).as_deref()
-                        {
-                            let cx_varname = format_ident!("cx_{}", ix);
-                            cx_vars.extend(quote!(
-                                let mut #cx_varname = gpui::TestAppContext::new(
-                                    dispatcher.clone(),
-                                    Some(stringify!(#outer_fn_name)),
-                                );
-                            ));
-                            cx_teardowns.extend(quote!(
-                                dispatcher.run_until_parked();
-                                #cx_varname.quit();
-                                dispatcher.run_until_parked();
-                            ));
-                            inner_fn_args.extend(quote!(&mut #cx_varname,));
-                            continue;
-                        }
+                } else if let Type::Reference(ty) = &*arg.ty
+                    && let Type::Path(ty) = &*ty.elem
+                {
+                    let last_segment = ty.path.segments.last();
+                    if let Some("TestAppContext") =
+                        last_segment.map(|s| s.ident.to_string()).as_deref()
+                    {
+                        let cx_varname = format_ident!("cx_{}", ix);
+                        cx_vars.extend(quote!(
+                            let mut #cx_varname = gpui::TestAppContext::build(
+                                dispatcher.clone(),
+                                Some(stringify!(#outer_fn_name)),
+                            );
+                            let _entity_refcounts = #cx_varname.app.borrow().ref_counts_drop_handle();
+                        ));
+                        cx_teardowns.extend(quote!(
+                            #cx_varname.run_until_parked();
+                            #cx_varname.update(|cx| { cx.background_executor().forbid_parking(); cx.quit(); });
+                            #cx_varname.run_until_parked();
+                            drop(#cx_varname);
+                        ));
+                        inner_fn_args.extend(quote!(&mut #cx_varname,));
+                        continue;
                     }
                 }
             }
 
-            return TokenStream::from(
-                syn::Error::new_spanned(arg, "invalid argument").into_compile_error(),
-            );
+            return Err(error_with_message("invalid function signature", arg));
         }
 
         parse_quote! {
@@ -133,13 +188,21 @@ pub fn test(args: TokenStream, function: TokenStream) -> TokenStream {
                 #inner_fn
 
                 gpui::run_test(
-                    #num_iterations as u64,
+                    #num_iterations,
+                    &[#seeds],
                     #max_retries,
                     &mut |dispatcher, _seed| {
-                        let executor = gpui::BackgroundExecutor::new(std::sync::Arc::new(dispatcher.clone()));
+                        let exec = std::sync::Arc::new(dispatcher.clone());
                         #cx_vars
-                        executor.block_test(#inner_fn_name(#inner_fn_args));
+                        gpui::ForegroundExecutor::new(exec.clone()).block_test(#inner_fn_name(#inner_fn_args));
+                        drop(exec);
                         #cx_teardowns
+                        // Ideally we would only drop cancelled tasks, that way we could detect leaks due to task <-> entity
+                        // cycles as cancelled tasks will be dropped properly once the runnable gets run again
+                        //
+                        // async-task does not give us the power to do this just yet though
+                        dispatcher.drain_tasks();
+                        drop(dispatcher);
                     },
                     #on_failure_fn_name
                 );
@@ -160,54 +223,56 @@ pub fn test(args: TokenStream, function: TokenStream) -> TokenStream {
                         inner_fn_args.extend(quote!(rand::SeedableRng::seed_from_u64(_seed),));
                         continue;
                     }
-                } else if let Type::Reference(ty) = &*arg.ty {
-                    if let Type::Path(ty) = &*ty.elem {
-                        let last_segment = ty.path.segments.last();
-                        match last_segment.map(|s| s.ident.to_string()).as_deref() {
-                            Some("AppContext") => {
-                                let cx_varname = format_ident!("cx_{}", ix);
-                                let cx_varname_lock = format_ident!("cx_{}_lock", ix);
-                                cx_vars.extend(quote!(
-                                    let mut #cx_varname = gpui::TestAppContext::new(
-                                       dispatcher.clone(),
-                                       Some(stringify!(#outer_fn_name))
-                                    );
-                                    let mut #cx_varname_lock = #cx_varname.app.borrow_mut();
-                                ));
-                                inner_fn_args.extend(quote!(&mut #cx_varname_lock,));
-                                cx_teardowns.extend(quote!(
+                } else if let Type::Reference(ty) = &*arg.ty
+                    && let Type::Path(ty) = &*ty.elem
+                {
+                    let last_segment = ty.path.segments.last();
+                    match last_segment.map(|s| s.ident.to_string()).as_deref() {
+                        Some("App") => {
+                            let cx_varname = format_ident!("cx_{}", ix);
+                            let cx_varname_lock = format_ident!("cx_{}_lock", ix);
+                            cx_vars.extend(quote!(
+                                let mut #cx_varname = gpui::TestAppContext::build(
+                                   dispatcher.clone(),
+                                   Some(stringify!(#outer_fn_name))
+                                );
+                                let mut #cx_varname_lock = #cx_varname.app.borrow_mut();
+                                let _entity_refcounts = #cx_varname_lock.ref_counts_drop_handle();
+                            ));
+                            inner_fn_args.extend(quote!(&mut #cx_varname_lock,));
+                            cx_teardowns.extend(quote!(
                                     drop(#cx_varname_lock);
-                                    dispatcher.run_until_parked();
-                                    #cx_varname.update(|cx| { cx.quit() });
-                                    dispatcher.run_until_parked();
+                                    #cx_varname.run_until_parked();
+                                    #cx_varname.update(|cx| { cx.background_executor().forbid_parking(); cx.quit(); });
+                                    #cx_varname.run_until_parked();
+                                    drop(#cx_varname);
                                 ));
-                                continue;
-                            }
-                            Some("TestAppContext") => {
-                                let cx_varname = format_ident!("cx_{}", ix);
-                                cx_vars.extend(quote!(
-                                    let mut #cx_varname = gpui::TestAppContext::new(
-                                        dispatcher.clone(),
-                                        Some(stringify!(#outer_fn_name))
-                                    );
-                                ));
-                                cx_teardowns.extend(quote!(
-                                    dispatcher.run_until_parked();
-                                    #cx_varname.quit();
-                                    dispatcher.run_until_parked();
-                                ));
-                                inner_fn_args.extend(quote!(&mut #cx_varname,));
-                                continue;
-                            }
-                            _ => {}
+                            continue;
                         }
+                        Some("TestAppContext") => {
+                            let cx_varname = format_ident!("cx_{}", ix);
+                            cx_vars.extend(quote!(
+                                let mut #cx_varname = gpui::TestAppContext::build(
+                                    dispatcher.clone(),
+                                    Some(stringify!(#outer_fn_name))
+                                );
+                                let _entity_refcounts = #cx_varname.app.borrow().ref_counts_drop_handle();
+                            ));
+                            cx_teardowns.extend(quote!(
+                                #cx_varname.run_until_parked();
+                                #cx_varname.update(|cx| { cx.background_executor().forbid_parking(); cx.quit(); });
+                                #cx_varname.run_until_parked();
+                                drop(#cx_varname);
+                            ));
+                            inner_fn_args.extend(quote!(&mut #cx_varname,));
+                            continue;
+                        }
+                        _ => {}
                     }
                 }
             }
 
-            return TokenStream::from(
-                syn::Error::new_spanned(arg, "invalid argument").into_compile_error(),
-            );
+            return Err(error_with_message("invalid function signature", arg));
         }
 
         parse_quote! {
@@ -216,12 +281,19 @@ pub fn test(args: TokenStream, function: TokenStream) -> TokenStream {
                 #inner_fn
 
                 gpui::run_test(
-                    #num_iterations as u64,
+                    #num_iterations,
+                    &[#seeds],
                     #max_retries,
                     &mut |dispatcher, _seed| {
                         #cx_vars
                         #inner_fn_name(#inner_fn_args);
                         #cx_teardowns
+                        // Ideally we would only drop cancelled tasks, that way we could detect leaks due to task <-> entity
+                        // cycles as cancelled tasks will be dropped properly once they runnable gets run again
+                        //
+                        // async-task does not give us the power to do this just yet though
+                        dispatcher.drain_tasks();
+                        drop(dispatcher);
                     },
                     #on_failure_fn_name,
                 );
@@ -230,15 +302,46 @@ pub fn test(args: TokenStream, function: TokenStream) -> TokenStream {
     };
     outer_fn.attrs.extend(inner_fn_attributes);
 
-    TokenStream::from(quote!(#outer_fn))
+    Ok(TokenStream::from(quote!(#outer_fn)))
 }
 
-fn parse_int(literal: &Lit) -> Result<usize, TokenStream> {
-    let result = if let Lit::Int(int) = &literal {
-        int.base10_parse()
-    } else {
-        Err(syn::Error::new(literal.span(), "must be an integer"))
+fn parse_usize_from_expr(expr: &Expr) -> Result<usize, syn::Error> {
+    let Expr::Lit(ExprLit {
+        lit: Lit::Int(int), ..
+    }) = expr
+    else {
+        return Err(syn::Error::new(expr.span(), "expected an integer"));
     };
+    int.base10_parse()
+        .map_err(|_| syn::Error::new(int.span(), "failed to parse integer"))
+}
 
-    result.map_err(|err| TokenStream::from(err.into_compile_error()))
+fn parse_u64_array(meta_list: &MetaList) -> Result<Vec<u64>, syn::Error> {
+    let mut result = Vec::new();
+    let tokens = &meta_list.tokens;
+    let parser = |input: ParseStream| {
+        let exprs = Punctuated::<Expr, Token![,]>::parse_terminated(input)?;
+        for expr in exprs {
+            if let Expr::Lit(ExprLit {
+                lit: Lit::Int(int), ..
+            }) = expr
+            {
+                let value: usize = int.base10_parse()?;
+                result.push(value as u64);
+            } else {
+                return Err(syn::Error::new(expr.span(), "expected an integer"));
+            }
+        }
+        Ok(())
+    };
+    syn::parse::Parser::parse2(parser, tokens.clone())?;
+    Ok(result)
+}
+
+fn error_with_message(message: &str, spanned: impl Spanned) -> TokenStream {
+    error_to_stream(syn::Error::new(spanned.span(), message))
+}
+
+fn error_to_stream(err: syn::Error) -> TokenStream {
+    TokenStream::from(err.into_compile_error())
 }

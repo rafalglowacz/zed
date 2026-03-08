@@ -1,56 +1,129 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context as _, Result, bail};
 use async_compression::futures::bufread::GzipDecoder;
 use async_tar::Archive;
 use async_trait::async_trait;
 use collections::HashMap;
 use futures::StreamExt;
-use gpui::{AppContext, AsyncAppContext};
-use http_client::github::{latest_github_release, GitHubLspBinaryVersion};
-use language::{LanguageRegistry, LanguageToolchainStore, LspAdapter, LspAdapterDelegate};
-use lsp::{LanguageServerBinary, LanguageServerName};
-use node_runtime::NodeRuntime;
-use project::ContextProviderWithTasks;
-use serde_json::{json, Value};
-use settings::{KeymapFile, SettingsJsonSchemaParams, SettingsStore};
+use gpui::{App, AsyncApp, Task};
+use http_client::github::{GitHubLspBinaryVersion, latest_github_release};
+use language::{
+    ContextProvider, LanguageName, LanguageRegistry, LocalFile as _, LspAdapter,
+    LspAdapterDelegate, LspInstaller, Toolchain,
+};
+use lsp::{LanguageServerBinary, LanguageServerName, Uri};
+use node_runtime::{NodeRuntime, VersionStrategy};
+use project::lsp_store::language_server_settings;
+use semver::Version;
+use serde_json::{Value, json};
+use settings::SettingsLocation;
 use smol::{
     fs::{self},
     io::BufReader,
 };
 use std::{
-    any::Any,
+    borrow::Cow,
     env::consts,
     ffi::OsString,
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{Arc, OnceLock},
+    sync::Arc,
 };
 use task::{TaskTemplate, TaskTemplates, VariableName};
-use util::{fs::remove_matching, maybe, ResultExt};
+use util::{
+    ResultExt, archive::extract_zip, fs::remove_matching, maybe, merge_json_value_into,
+    paths::PathStyle, rel_path::RelPath,
+};
+
+use crate::PackageJsonData;
 
 const SERVER_PATH: &str =
     "node_modules/vscode-langservers-extracted/bin/vscode-json-language-server";
 
-// Origin: https://github.com/SchemaStore/schemastore
-const TSCONFIG_SCHEMA: &str = include_str!("json/schemas/tsconfig.json");
-const PACKAGE_JSON_SCHEMA: &str = include_str!("json/schemas/package.json");
+pub(crate) struct JsonTaskProvider;
 
-pub(super) fn json_task_context() -> ContextProviderWithTasks {
-    ContextProviderWithTasks::new(TaskTemplates(vec![
-        TaskTemplate {
-            label: "package script $ZED_CUSTOM_script".to_owned(),
-            command: "npm --prefix $ZED_DIRNAME run".to_owned(),
-            args: vec![VariableName::Custom("script".into()).template_value()],
-            tags: vec!["package-script".into()],
-            ..TaskTemplate::default()
-        },
-        TaskTemplate {
-            label: "composer script $ZED_CUSTOM_script".to_owned(),
-            command: "composer -d $ZED_DIRNAME".to_owned(),
-            args: vec![VariableName::Custom("script".into()).template_value()],
-            tags: vec!["composer-script".into()],
-            ..TaskTemplate::default()
-        },
-    ]))
+impl ContextProvider for JsonTaskProvider {
+    fn associated_tasks(
+        &self,
+        file: Option<Arc<dyn language::File>>,
+        cx: &App,
+    ) -> gpui::Task<Option<TaskTemplates>> {
+        let Some(file) = project::File::from_dyn(file.as_ref()).cloned() else {
+            return Task::ready(None);
+        };
+        let is_package_json = file.path.ends_with(RelPath::unix("package.json").unwrap());
+        let is_composer_json = file.path.ends_with(RelPath::unix("composer.json").unwrap());
+        if !is_package_json && !is_composer_json {
+            return Task::ready(None);
+        }
+
+        cx.spawn(async move |cx| {
+            let contents = file
+                .worktree
+                .update(cx, |this, cx| this.load_file(&file.path, cx))
+                .await
+                .ok()?;
+            let path = cx.update(|cx| file.abs_path(cx)).as_path().into();
+
+            let task_templates = if is_package_json {
+                let package_json = serde_json_lenient::from_str::<
+                    HashMap<String, serde_json_lenient::Value>,
+                >(&contents.text)
+                .ok()?;
+                let package_json = PackageJsonData::new(path, package_json);
+                let command = package_json.package_manager.unwrap_or("npm").to_owned();
+                package_json
+                    .scripts
+                    .into_iter()
+                    .map(|(_, key)| TaskTemplate {
+                        label: format!("run {key}"),
+                        command: command.clone(),
+                        args: vec!["run".into(), key],
+                        cwd: Some(VariableName::Dirname.template_value()),
+                        ..TaskTemplate::default()
+                    })
+                    .chain([TaskTemplate {
+                        label: "package script $ZED_CUSTOM_script".to_owned(),
+                        command: command.clone(),
+                        args: vec![
+                            "run".into(),
+                            VariableName::Custom("script".into()).template_value(),
+                        ],
+                        cwd: Some(VariableName::Dirname.template_value()),
+                        tags: vec!["package-script".into()],
+                        ..TaskTemplate::default()
+                    }])
+                    .collect()
+            } else if is_composer_json {
+                serde_json_lenient::Value::from_str(&contents.text)
+                    .ok()?
+                    .get("scripts")?
+                    .as_object()?
+                    .keys()
+                    .map(|key| TaskTemplate {
+                        label: format!("run {key}"),
+                        command: "composer".to_owned(),
+                        args: vec!["-d".into(), "$ZED_DIRNAME".into(), key.into()],
+                        ..TaskTemplate::default()
+                    })
+                    .chain([TaskTemplate {
+                        label: "composer script $ZED_CUSTOM_script".to_owned(),
+                        command: "composer".to_owned(),
+                        args: vec![
+                            "-d".into(),
+                            "$ZED_DIRNAME".into(),
+                            VariableName::Custom("script".into()).template_value(),
+                        ],
+                        tags: vec!["composer-script".into()],
+                        ..TaskTemplate::default()
+                    }])
+                    .collect()
+            } else {
+                vec![]
+            };
+
+            Some(TaskTemplates(task_templates))
+        })
+    }
 }
 
 fn server_binary_arguments(server_path: &Path) -> Vec<OsString> {
@@ -58,115 +131,94 @@ fn server_binary_arguments(server_path: &Path) -> Vec<OsString> {
 }
 
 pub struct JsonLspAdapter {
-    node: NodeRuntime,
     languages: Arc<LanguageRegistry>,
-    workspace_config: OnceLock<Value>,
+    node: NodeRuntime,
 }
 
 impl JsonLspAdapter {
-    pub fn new(node: NodeRuntime, languages: Arc<LanguageRegistry>) -> Self {
-        Self {
-            node,
-            languages,
-            workspace_config: Default::default(),
-        }
-    }
+    const PACKAGE_NAME: &str = "vscode-langservers-extracted";
 
-    fn get_workspace_config(language_names: Vec<String>, cx: &mut AppContext) -> Value {
-        let action_names = cx.all_action_names();
-
-        let font_names = &cx.text_system().all_font_names();
-        let settings_schema = cx.global::<SettingsStore>().json_schema(
-            &SettingsJsonSchemaParams {
-                language_names: &language_names,
-                font_names,
-            },
-            cx,
-        );
-        let tasks_schema = task::TaskTemplates::generate_json_schema();
-        let tsconfig_schema = serde_json::Value::from_str(TSCONFIG_SCHEMA).unwrap();
-        let package_json_schema = serde_json::Value::from_str(PACKAGE_JSON_SCHEMA).unwrap();
-
-        serde_json::json!({
-            "json": {
-                "format": {
-                    "enable": true,
-                },
-                "validate":
-                {
-                    "enable": true,
-                },
-                "schemas": [
-                    {
-                        "fileMatch": ["tsconfig.json"],
-                        "schema":tsconfig_schema
-                    },
-                    {
-                        "fileMatch": ["package.json"],
-                        "schema":package_json_schema
-                    },
-                    {
-                        "fileMatch": [
-                            schema_file_match(paths::settings_file()),
-                            paths::local_settings_file_relative_path()
-                        ],
-                        "schema": settings_schema,
-                    },
-                    {
-                        "fileMatch": [schema_file_match(paths::keymap_file())],
-                        "schema": KeymapFile::generate_json_schema(action_names),
-                    },
-                    {
-                        "fileMatch": [
-                            schema_file_match(paths::tasks_file()),
-                            paths::local_tasks_file_relative_path()
-                        ],
-                        "schema": tasks_schema,
-                    }
-
-                ]
-            }
-        })
+    pub fn new(languages: Arc<LanguageRegistry>, node: NodeRuntime) -> Self {
+        Self { languages, node }
     }
 }
 
-#[async_trait(?Send)]
-impl LspAdapter for JsonLspAdapter {
-    fn name(&self) -> LanguageServerName {
-        LanguageServerName("json-language-server".into())
-    }
+impl LspInstaller for JsonLspAdapter {
+    type BinaryVersion = Version;
 
     async fn fetch_latest_server_version(
         &self,
         _: &dyn LspAdapterDelegate,
-    ) -> Result<Box<dyn 'static + Send + Any>> {
-        Ok(Box::new(
-            self.node
-                .npm_package_latest_version("vscode-langservers-extracted")
-                .await?,
-        ) as Box<_>)
+        _: bool,
+        _: &mut AsyncApp,
+    ) -> Result<Self::BinaryVersion> {
+        self.node
+            .npm_package_latest_version(Self::PACKAGE_NAME)
+            .await
+    }
+
+    async fn check_if_user_installed(
+        &self,
+        delegate: &dyn LspAdapterDelegate,
+        _: Option<Toolchain>,
+        _: &AsyncApp,
+    ) -> Option<LanguageServerBinary> {
+        let path = delegate
+            .which("vscode-json-language-server".as_ref())
+            .await?;
+        let env = delegate.shell_env().await;
+
+        Some(LanguageServerBinary {
+            path,
+            env: Some(env),
+            arguments: vec!["--stdio".into()],
+        })
+    }
+
+    async fn check_if_version_installed(
+        &self,
+        version: &Self::BinaryVersion,
+        container_dir: &PathBuf,
+        _: &dyn LspAdapterDelegate,
+    ) -> Option<LanguageServerBinary> {
+        let server_path = container_dir.join(SERVER_PATH);
+
+        let should_install_language_server = self
+            .node
+            .should_install_npm_package(
+                Self::PACKAGE_NAME,
+                &server_path,
+                container_dir,
+                VersionStrategy::Latest(version),
+            )
+            .await;
+
+        if should_install_language_server {
+            None
+        } else {
+            Some(LanguageServerBinary {
+                path: self.node.binary_path().await.ok()?,
+                env: None,
+                arguments: server_binary_arguments(&server_path),
+            })
+        }
     }
 
     async fn fetch_server_binary(
         &self,
-        latest_version: Box<dyn 'static + Send + Any>,
+        latest_version: Self::BinaryVersion,
         container_dir: PathBuf,
         _: &dyn LspAdapterDelegate,
     ) -> Result<LanguageServerBinary> {
-        let latest_version = latest_version.downcast::<String>().unwrap();
         let server_path = container_dir.join(SERVER_PATH);
-        let package_name = "vscode-langservers-extracted";
+        let latest_version = latest_version.to_string();
 
-        let should_install_language_server = self
-            .node
-            .should_install_npm_package(package_name, &server_path, &container_dir, &latest_version)
-            .await;
-
-        if should_install_language_server {
-            self.node
-                .npm_install_packages(&container_dir, &[(package_name, latest_version.as_str())])
-                .await?;
-        }
+        self.node
+            .npm_install_packages(
+                &container_dir,
+                &[(Self::PACKAGE_NAME, latest_version.as_str())],
+            )
+            .await?;
 
         Ok(LanguageServerBinary {
             path: self.node.binary_path().await?,
@@ -182,10 +234,18 @@ impl LspAdapter for JsonLspAdapter {
     ) -> Option<LanguageServerBinary> {
         get_cached_server_binary(container_dir, &self.node).await
     }
+}
+
+#[async_trait(?Send)]
+impl LspAdapter for JsonLspAdapter {
+    fn name(&self) -> LanguageServerName {
+        LanguageServerName("json-language-server".into())
+    }
 
     async fn initialization_options(
         self: Arc<Self>,
         _: &Arc<dyn LspAdapterDelegate>,
+        _: &mut AsyncApp,
     ) -> Result<Option<serde_json::Value>> {
         Ok(Some(json!({
             "provideFormatter": true
@@ -194,25 +254,105 @@ impl LspAdapter for JsonLspAdapter {
 
     async fn workspace_configuration(
         self: Arc<Self>,
-        _: &Arc<dyn LspAdapterDelegate>,
-        _: Arc<dyn LanguageToolchainStore>,
-        cx: &mut AsyncAppContext,
+        delegate: &Arc<dyn LspAdapterDelegate>,
+        _: Option<Toolchain>,
+        requested_uri: Option<Uri>,
+        cx: &mut AsyncApp,
     ) -> Result<Value> {
-        cx.update(|cx| {
-            self.workspace_config
-                .get_or_init(|| Self::get_workspace_config(self.languages.language_names(), cx))
-                .clone()
-        })
+        let requested_path = requested_uri.as_ref().and_then(|uri| {
+            (uri.scheme() == "file")
+                .then(|| uri.to_file_path().ok())
+                .flatten()
+        });
+        let path_in_worktree = requested_path
+            .as_ref()
+            .and_then(|abs_path| {
+                let rel_path = abs_path.strip_prefix(delegate.worktree_root_path()).ok()?;
+                RelPath::new(rel_path, PathStyle::local()).ok()
+            })
+            .unwrap_or_else(|| Cow::Borrowed(RelPath::empty()));
+        let mut config = cx.update(|cx| {
+            let schemas = json_schema_store::all_schema_file_associations(
+                &self.languages,
+                Some(SettingsLocation {
+                    worktree_id: delegate.worktree_id(),
+                    path: path_in_worktree.as_ref(),
+                }),
+                cx,
+            );
+
+            // This can be viewed via `dev: open language server logs` -> `json-language-server` ->
+            // `Server Info`
+            serde_json::json!({
+                "json": {
+                    "format": {
+                        "enable": true,
+                    },
+                    "validate": {
+                        "enable": true,
+                    },
+                    "schemas": schemas
+                }
+            })
+        });
+        let project_options = cx.update(|cx| {
+            language_server_settings(delegate.as_ref(), &self.name(), cx)
+                .and_then(|s| worktree_root(delegate, s.settings.clone()))
+        });
+
+        if let Some(override_options) = project_options {
+            merge_json_value_into(override_options, &mut config);
+        }
+
+        Ok(config)
     }
 
-    fn language_ids(&self) -> HashMap<String, String> {
+    fn language_ids(&self) -> HashMap<LanguageName, String> {
         [
-            ("JSON".into(), "json".into()),
-            ("JSONC".into(), "jsonc".into()),
+            (LanguageName::new_static("JSON"), "json".into()),
+            (LanguageName::new_static("JSONC"), "jsonc".into()),
         ]
         .into_iter()
         .collect()
     }
+
+    fn is_primary_zed_json_schema_adapter(&self) -> bool {
+        true
+    }
+}
+
+fn worktree_root(delegate: &Arc<dyn LspAdapterDelegate>, settings: Option<Value>) -> Option<Value> {
+    let Some(Value::Object(mut settings_map)) = settings else {
+        return settings;
+    };
+
+    let Some(Value::Object(json_config)) = settings_map.get_mut("json") else {
+        return Some(Value::Object(settings_map));
+    };
+
+    let Some(Value::Array(schemas)) = json_config.get_mut("schemas") else {
+        return Some(Value::Object(settings_map));
+    };
+
+    for schema in schemas.iter_mut() {
+        let Value::Object(schema_map) = schema else {
+            continue;
+        };
+        let Some(Value::String(url)) = schema_map.get_mut("url") else {
+            continue;
+        };
+
+        if !url.starts_with(".") && !url.starts_with("~") {
+            continue;
+        }
+
+        *url = delegate
+            .resolve_relative_path(url.clone().into())
+            .to_string_lossy()
+            .into_owned();
+    }
+
+    Some(Value::Object(settings_map))
 }
 
 async fn get_cached_server_binary(
@@ -220,55 +360,37 @@ async fn get_cached_server_binary(
     node: &NodeRuntime,
 ) -> Option<LanguageServerBinary> {
     maybe!(async {
-        let mut last_version_dir = None;
-        let mut entries = fs::read_dir(&container_dir).await?;
-        while let Some(entry) = entries.next().await {
-            let entry = entry?;
-            if entry.file_type().await?.is_dir() {
-                last_version_dir = Some(entry.path());
-            }
-        }
-
-        let last_version_dir = last_version_dir.ok_or_else(|| anyhow!("no cached binary"))?;
-        let server_path = last_version_dir.join(SERVER_PATH);
-        if server_path.exists() {
-            Ok(LanguageServerBinary {
-                path: node.binary_path().await?,
-                env: None,
-                arguments: server_binary_arguments(&server_path),
-            })
-        } else {
-            Err(anyhow!(
-                "missing executable in directory {:?}",
-                last_version_dir
-            ))
-        }
+        let server_path = container_dir.join(SERVER_PATH);
+        anyhow::ensure!(
+            server_path.exists(),
+            "missing executable in directory {server_path:?}"
+        );
+        Ok(LanguageServerBinary {
+            path: node.binary_path().await?,
+            env: None,
+            arguments: server_binary_arguments(&server_path),
+        })
     })
     .await
     .log_err()
 }
 
-#[inline]
-fn schema_file_match(path: &Path) -> String {
-    path.strip_prefix(path.parent().unwrap().parent().unwrap())
-        .unwrap()
-        .display()
-        .to_string()
-        .replace('\\', "/")
+pub struct NodeVersionAdapter;
+
+impl NodeVersionAdapter {
+    const SERVER_NAME: LanguageServerName =
+        LanguageServerName::new_static("package-version-server");
 }
 
-pub(super) struct NodeVersionAdapter;
-
-#[async_trait(?Send)]
-impl LspAdapter for NodeVersionAdapter {
-    fn name(&self) -> LanguageServerName {
-        LanguageServerName("package-version-server".into())
-    }
+impl LspInstaller for NodeVersionAdapter {
+    type BinaryVersion = GitHubLspBinaryVersion;
 
     async fn fetch_latest_server_version(
         &self,
         delegate: &dyn LspAdapterDelegate,
-    ) -> Result<Box<dyn 'static + Send + Any>> {
+        _: bool,
+        _: &mut AsyncApp,
+    ) -> Result<GitHubLspBinaryVersion> {
         let release = latest_github_release(
             "zed-industries/package-version-server",
             true,
@@ -287,44 +409,56 @@ impl LspAdapter for NodeVersionAdapter {
         } else {
             ".tar.gz"
         };
-        let asset_name = format!("package-version-server-{}-{os}{suffix}", consts::ARCH);
+        let asset_name = format!("{}-{}-{os}{suffix}", Self::SERVER_NAME, consts::ARCH);
         let asset = release
             .assets
             .iter()
             .find(|asset| asset.name == asset_name)
             .with_context(|| format!("no asset found matching `{asset_name:?}`"))?;
-        Ok(Box::new(GitHubLspBinaryVersion {
+        Ok(GitHubLspBinaryVersion {
             name: release.tag_name,
             url: asset.browser_download_url.clone(),
-        }))
+            digest: asset.digest.clone(),
+        })
+    }
+
+    async fn check_if_user_installed(
+        &self,
+        delegate: &dyn LspAdapterDelegate,
+        _: Option<Toolchain>,
+        _: &AsyncApp,
+    ) -> Option<LanguageServerBinary> {
+        let path = delegate.which(Self::SERVER_NAME.as_ref()).await?;
+        Some(LanguageServerBinary {
+            path,
+            env: None,
+            arguments: Default::default(),
+        })
     }
 
     async fn fetch_server_binary(
         &self,
-        latest_version: Box<dyn 'static + Send + Any>,
+        latest_version: GitHubLspBinaryVersion,
         container_dir: PathBuf,
         delegate: &dyn LspAdapterDelegate,
     ) -> Result<LanguageServerBinary> {
-        let version = latest_version.downcast::<GitHubLspBinaryVersion>().unwrap();
+        let version = &latest_version;
         let destination_path = container_dir.join(format!(
-            "package-version-server-{}{}",
+            "{}-{}{}",
+            Self::SERVER_NAME,
             version.name,
             std::env::consts::EXE_SUFFIX
         ));
         let destination_container_path =
-            container_dir.join(format!("package-version-server-{}-tmp", version.name));
+            container_dir.join(format!("{}-{}-tmp", Self::SERVER_NAME, version.name));
         if fs::metadata(&destination_path).await.is_err() {
             let mut response = delegate
                 .http_client()
                 .get(&version.url, Default::default(), true)
                 .await
-                .map_err(|err| anyhow!("error downloading release: {}", err))?;
+                .context("downloading release")?;
             if version.url.ends_with(".zip") {
-                node_runtime::extract_zip(
-                    &destination_container_path,
-                    BufReader::new(response.body_mut()),
-                )
-                .await?;
+                extract_zip(&destination_container_path, response.body_mut()).await?;
             } else if version.url.ends_with(".tar.gz") {
                 let decompressed_bytes = GzipDecoder::new(BufReader::new(response.body_mut()));
                 let archive = Archive::new(decompressed_bytes);
@@ -333,21 +467,13 @@ impl LspAdapter for NodeVersionAdapter {
 
             fs::copy(
                 destination_container_path.join(format!(
-                    "package-version-server{}",
+                    "{}{}",
+                    Self::SERVER_NAME,
                     std::env::consts::EXE_SUFFIX
                 )),
                 &destination_path,
             )
             .await?;
-            // todo("windows")
-            #[cfg(not(windows))]
-            {
-                fs::set_permissions(
-                    &destination_path,
-                    <fs::Permissions as fs::unix::PermissionsExt>::from_mode(0o755),
-                )
-                .await?;
-            }
             remove_matching(&container_dir, |entry| entry != destination_path).await;
         }
         Ok(LanguageServerBinary {
@@ -366,6 +492,13 @@ impl LspAdapter for NodeVersionAdapter {
     }
 }
 
+#[async_trait(?Send)]
+impl LspAdapter for NodeVersionAdapter {
+    fn name(&self) -> LanguageServerName {
+        Self::SERVER_NAME
+    }
+}
+
 async fn get_cached_version_server_binary(container_dir: PathBuf) -> Option<LanguageServerBinary> {
     maybe!(async {
         let mut last = None;
@@ -375,7 +508,7 @@ async fn get_cached_version_server_binary(container_dir: PathBuf) -> Option<Lang
         }
 
         anyhow::Ok(LanguageServerBinary {
-            path: last.ok_or_else(|| anyhow!("no cached binary"))?,
+            path: last.context("no cached binary")?,
             env: None,
             arguments: Default::default(),
         })

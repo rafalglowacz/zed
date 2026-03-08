@@ -1,37 +1,65 @@
-use anyhow::Context;
-use gpui::{AppContext, UpdateGlobal};
-use json::json_task_context;
-pub use language::*;
-use lsp::LanguageServerName;
+use anyhow::Context as _;
+use gpui::{App, SharedString, UpdateGlobal};
 use node_runtime::NodeRuntime;
-use python::{PythonContextProvider, PythonToolchainProvider};
+use project::Fs;
+use python::PyprojectTomlManifestProvider;
+use rust::CargoManifestProvider;
 use rust_embed::RustEmbed;
-use settings::SettingsStore;
+use settings::{SemanticTokenRules, SettingsStore};
 use smol::stream::StreamExt;
 use std::{str, sync::Arc};
-use typescript::typescript_task_context;
-use util::{asset_str, ResultExt};
+use util::{ResultExt, asset_str};
 
-use crate::{bash::bash_task_context, go::GoContextProvider, rust::RustContextProvider};
+pub use language::*;
+
+use crate::{
+    json::JsonTaskProvider,
+    python::{BasedPyrightLspAdapter, RuffLspAdapter},
+};
 
 mod bash;
 mod c;
+mod cpp;
 mod css;
+mod eslint;
 mod go;
 mod json;
+mod package_json;
 mod python;
 mod rust;
 mod tailwind;
+mod tailwindcss;
 mod typescript;
 mod vtsls;
 mod yaml;
+
+pub(crate) use package_json::{PackageJson, PackageJsonData};
 
 #[derive(RustEmbed)]
 #[folder = "src/"]
 #[exclude = "*.rs"]
 struct LanguageDir;
 
-pub fn init(languages: Arc<LanguageRegistry>, node_runtime: NodeRuntime, cx: &mut AppContext) {
+/// A shared grammar for plain text, exposed for reuse by downstream crates.
+#[cfg(feature = "tree-sitter-gitcommit")]
+pub static LANGUAGE_GIT_COMMIT: std::sync::LazyLock<Arc<Language>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(Language::new(
+            LanguageConfig {
+                name: "Git Commit".into(),
+                soft_wrap: Some(language::language_settings::SoftWrap::EditorWidth),
+                matcher: LanguageMatcher {
+                    path_suffixes: vec!["COMMIT_EDITMSG".to_owned()],
+                    first_line_pattern: None,
+                },
+                line_comments: vec![Arc::from("#")],
+                ..LanguageConfig::default()
+            },
+            Some(tree_sitter_gitcommit::LANGUAGE.into()),
+        ))
+    });
+
+pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime, cx: &mut App) {
     #[cfg(feature = "load-grammars")]
     languages.register_native_grammars([
         ("bash", tree_sitter_bash::LANGUAGE),
@@ -53,175 +81,180 @@ pub fn init(languages: Arc<LanguageRegistry>, node_runtime: NodeRuntime, cx: &mu
         ("tsx", tree_sitter_typescript::LANGUAGE_TSX),
         ("typescript", tree_sitter_typescript::LANGUAGE_TYPESCRIPT),
         ("yaml", tree_sitter_yaml::LANGUAGE),
+        ("gitcommit", tree_sitter_gitcommit::LANGUAGE),
     ]);
 
-    macro_rules! language {
-        ($name:literal) => {
-            let config = load_config($name);
-            languages.register_language(
-                config.name.clone(),
-                config.grammar.clone(),
-                config.matcher.clone(),
-                Arc::new(move || {
-                    Ok(LoadedLanguage {
-                        config: config.clone(),
-                        queries: load_queries($name),
-                        context_provider: None,
-                        toolchain_provider: None,
-                    })
-                }),
-            );
-        };
-        ($name:literal, $adapters:expr) => {
-            let config = load_config($name);
-            // typeck helper
-            let adapters: Vec<Arc<dyn LspAdapter>> = $adapters;
-            for adapter in adapters {
-                languages.register_lsp_adapter(config.name.clone(), adapter);
-            }
-            languages.register_language(
-                config.name.clone(),
-                config.grammar.clone(),
-                config.matcher.clone(),
-                Arc::new(move || {
-                    Ok(LoadedLanguage {
-                        config: config.clone(),
-                        queries: load_queries($name),
-                        context_provider: None,
-                        toolchain_provider: None,
-                    })
-                }),
-            );
-        };
-        ($name:literal, $adapters:expr, $context_provider:expr) => {
-            let config = load_config($name);
-            // typeck helper
-            let adapters: Vec<Arc<dyn LspAdapter>> = $adapters;
-            for adapter in adapters {
-                languages.register_lsp_adapter(config.name.clone(), adapter);
-            }
-            languages.register_language(
-                config.name.clone(),
-                config.grammar.clone(),
-                config.matcher.clone(),
-                Arc::new(move || {
-                    Ok(LoadedLanguage {
-                        config: config.clone(),
-                        queries: load_queries($name),
-                        context_provider: Some(Arc::new($context_provider)),
-                        toolchain_provider: None,
-                    })
-                }),
-            );
-        };
-        ($name:literal, $adapters:expr, $context_provider:expr, $toolchain_provider:expr) => {
-            let config = load_config($name);
-            // typeck helper
-            let adapters: Vec<Arc<dyn LspAdapter>> = $adapters;
-            for adapter in adapters {
-                languages.register_lsp_adapter(config.name.clone(), adapter);
-            }
-            languages.register_language(
-                config.name.clone(),
-                config.grammar.clone(),
-                config.matcher.clone(),
-                Arc::new(move || {
-                    Ok(LoadedLanguage {
-                        config: config.clone(),
-                        queries: load_queries($name),
-                        context_provider: Some(Arc::new($context_provider)),
-                        toolchain_provider: Some($toolchain_provider),
-                    })
-                }),
-            );
-        };
-    }
-    language!("bash", Vec::new(), bash_task_context());
-    language!("c", vec![Arc::new(c::CLspAdapter) as Arc<dyn LspAdapter>]);
-    language!("cpp", vec![Arc::new(c::CLspAdapter)]);
-    language!(
-        "css",
-        vec![Arc::new(css::CssLspAdapter::new(node_runtime.clone())),]
-    );
-    language!("diff");
-    language!("go", vec![Arc::new(go::GoLspAdapter)], GoContextProvider);
-    language!("gomod", vec![Arc::new(go::GoLspAdapter)], GoContextProvider);
-    language!(
-        "gowork",
-        vec![Arc::new(go::GoLspAdapter)],
-        GoContextProvider
-    );
+    let c_lsp_adapter = Arc::new(c::CLspAdapter);
+    let css_lsp_adapter = Arc::new(css::CssLspAdapter::new(node.clone()));
+    let eslint_adapter = Arc::new(eslint::EsLintLspAdapter::new(node.clone()));
+    let go_context_provider = Arc::new(go::GoContextProvider);
+    let go_lsp_adapter = Arc::new(go::GoLspAdapter);
+    let json_context_provider = Arc::new(JsonTaskProvider);
+    let json_lsp_adapter = Arc::new(json::JsonLspAdapter::new(languages.clone(), node.clone()));
+    let node_version_lsp_adapter = Arc::new(json::NodeVersionAdapter);
+    let py_lsp_adapter = Arc::new(python::PyLspAdapter::new());
+    let ty_lsp_adapter = Arc::new(python::TyLspAdapter::new(fs.clone()));
+    let python_context_provider = Arc::new(python::PythonContextProvider);
+    let python_lsp_adapter = Arc::new(python::PyrightLspAdapter::new(node.clone()));
+    let basedpyright_lsp_adapter = Arc::new(BasedPyrightLspAdapter::new(node.clone()));
+    let ruff_lsp_adapter = Arc::new(RuffLspAdapter::new(fs.clone()));
+    let python_toolchain_provider = Arc::new(python::PythonToolchainProvider);
+    let rust_context_provider = Arc::new(rust::RustContextProvider);
+    let rust_lsp_adapter = Arc::new(rust::RustLspAdapter);
+    let tailwind_adapter = Arc::new(tailwind::TailwindLspAdapter::new(node.clone()));
+    let tailwindcss_adapter = Arc::new(tailwindcss::TailwindCssLspAdapter::new(node.clone()));
+    let typescript_context = Arc::new(typescript::TypeScriptContextProvider::new(fs.clone()));
+    let typescript_lsp_adapter = Arc::new(typescript::TypeScriptLspAdapter::new(
+        node.clone(),
+        fs.clone(),
+    ));
+    let vtsls_adapter = Arc::new(vtsls::VtslsLspAdapter::new(node.clone(), fs.clone()));
+    let yaml_lsp_adapter = Arc::new(yaml::YamlLspAdapter::new(node));
 
-    language!(
-        "json",
-        vec![
-            Arc::new(json::JsonLspAdapter::new(
-                node_runtime.clone(),
-                languages.clone(),
-            )),
-            Arc::new(json::NodeVersionAdapter)
-        ],
-        json_task_context()
-    );
-    language!(
-        "jsonc",
-        vec![Arc::new(json::JsonLspAdapter::new(
-            node_runtime.clone(),
-            languages.clone(),
-        ))],
-        json_task_context()
-    );
-    language!("markdown");
-    language!("markdown-inline");
-    language!(
-        "python",
-        vec![Arc::new(python::PythonLspAdapter::new(
-            node_runtime.clone(),
-        ))],
-        PythonContextProvider,
-        Arc::new(PythonToolchainProvider::default()) as Arc<dyn ToolchainLister>
-    );
-    language!(
-        "rust",
-        vec![Arc::new(rust::RustLspAdapter)],
-        RustContextProvider
-    );
-    language!(
-        "tsx",
-        vec![
-            Arc::new(typescript::TypeScriptLspAdapter::new(node_runtime.clone())),
-            Arc::new(vtsls::VtslsLspAdapter::new(node_runtime.clone()))
-        ],
-        typescript_task_context()
-    );
-    language!(
-        "typescript",
-        vec![
-            Arc::new(typescript::TypeScriptLspAdapter::new(node_runtime.clone())),
-            Arc::new(vtsls::VtslsLspAdapter::new(node_runtime.clone()))
-        ],
-        typescript_task_context()
-    );
-    language!(
-        "javascript",
-        vec![
-            Arc::new(typescript::TypeScriptLspAdapter::new(node_runtime.clone())),
-            Arc::new(vtsls::VtslsLspAdapter::new(node_runtime.clone()))
-        ],
-        typescript_task_context()
-    );
-    language!(
-        "jsdoc",
-        vec![
-            Arc::new(typescript::TypeScriptLspAdapter::new(node_runtime.clone(),)),
-            Arc::new(vtsls::VtslsLspAdapter::new(node_runtime.clone()))
-        ]
-    );
-    language!("regex");
-    language!(
-        "yaml",
-        vec![Arc::new(yaml::YamlLspAdapter::new(node_runtime.clone()))]
-    );
+    let built_in_languages = [
+        LanguageInfo {
+            name: "bash",
+            context: Some(Arc::new(bash::bash_task_context())),
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "c",
+            adapters: vec![c_lsp_adapter.clone()],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "cpp",
+            adapters: vec![c_lsp_adapter],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "css",
+            adapters: vec![css_lsp_adapter],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "diff",
+            adapters: vec![],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "go",
+            adapters: vec![go_lsp_adapter.clone()],
+            context: Some(go_context_provider.clone()),
+            semantic_token_rules: Some(go::semantic_token_rules()),
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "gomod",
+            adapters: vec![go_lsp_adapter.clone()],
+            context: Some(go_context_provider.clone()),
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "gowork",
+            adapters: vec![go_lsp_adapter],
+            context: Some(go_context_provider),
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "json",
+            adapters: vec![json_lsp_adapter.clone(), node_version_lsp_adapter],
+            context: Some(json_context_provider.clone()),
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "jsonc",
+            adapters: vec![json_lsp_adapter],
+            context: Some(json_context_provider),
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "markdown",
+            adapters: vec![],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "markdown-inline",
+            adapters: vec![],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "python",
+            adapters: vec![
+                basedpyright_lsp_adapter,
+                ruff_lsp_adapter,
+                ty_lsp_adapter,
+                py_lsp_adapter,
+                python_lsp_adapter,
+            ],
+            context: Some(python_context_provider),
+            toolchain: Some(python_toolchain_provider),
+            manifest_name: Some(SharedString::new_static("pyproject.toml").into()),
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "rust",
+            adapters: vec![rust_lsp_adapter],
+            context: Some(rust_context_provider),
+            manifest_name: Some(SharedString::new_static("Cargo.toml").into()),
+            semantic_token_rules: Some(rust::semantic_token_rules()),
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "tsx",
+            adapters: vec![typescript_lsp_adapter.clone(), vtsls_adapter.clone()],
+            context: Some(typescript_context.clone()),
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "typescript",
+            adapters: vec![typescript_lsp_adapter.clone(), vtsls_adapter.clone()],
+            context: Some(typescript_context.clone()),
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "javascript",
+            adapters: vec![typescript_lsp_adapter.clone(), vtsls_adapter.clone()],
+            context: Some(typescript_context),
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "jsdoc",
+            adapters: vec![typescript_lsp_adapter.clone(), vtsls_adapter.clone()],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "regex",
+            adapters: vec![],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "yaml",
+            adapters: vec![yaml_lsp_adapter],
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "gitcommit",
+            ..Default::default()
+        },
+        LanguageInfo {
+            name: "zed-keybind-context",
+            ..Default::default()
+        },
+    ];
+
+    for registration in built_in_languages {
+        register_language(
+            &languages,
+            registration.name,
+            registration.adapters,
+            registration.context,
+            registration.toolchain,
+            registration.manifest_name,
+            registration.semantic_token_rules,
+            cx,
+        );
+    }
 
     // Register globally available language servers.
     //
@@ -239,15 +272,21 @@ pub fn init(languages: Arc<LanguageRegistry>, node_runtime: NodeRuntime, cx: &mu
     // ```
     languages.register_available_lsp_adapter(
         LanguageServerName("tailwindcss-language-server".into()),
-        {
-            let node_runtime = node_runtime.clone();
-            move || Arc::new(tailwind::TailwindLspAdapter::new(node_runtime.clone()))
-        },
+        tailwind_adapter.clone(),
     );
-    languages.register_available_lsp_adapter(LanguageServerName("eslint".into()), {
-        let node_runtime = node_runtime.clone();
-        move || Arc::new(typescript::EsLintLspAdapter::new(node_runtime.clone()))
-    });
+    languages.register_available_lsp_adapter(
+        LanguageServerName("tailwindcss-intellisense-css".into()),
+        tailwindcss_adapter,
+    );
+    languages.register_available_lsp_adapter(
+        LanguageServerName("eslint".into()),
+        eslint_adapter.clone(),
+    );
+    languages.register_available_lsp_adapter(LanguageServerName("vtsls".into()), vtsls_adapter);
+    languages.register_available_lsp_adapter(
+        LanguageServerName("typescript-language-server".into()),
+        typescript_lsp_adapter,
+    );
 
     // Register Tailwind for the existing languages that should have it by default.
     //
@@ -257,9 +296,11 @@ pub fn init(languages: Arc<LanguageRegistry>, node_runtime: NodeRuntime, cx: &mu
         "Astro",
         "CSS",
         "ERB",
+        "HTML+ERB",
         "HEEX",
         "HTML",
         "JavaScript",
+        "TypeScript",
         "PHP",
         "Svelte",
         "TSX",
@@ -267,40 +308,93 @@ pub fn init(languages: Arc<LanguageRegistry>, node_runtime: NodeRuntime, cx: &mu
     ];
 
     for language in tailwind_languages {
-        languages.register_lsp_adapter(
-            language.into(),
-            Arc::new(tailwind::TailwindLspAdapter::new(node_runtime.clone())),
-        );
+        languages.register_lsp_adapter(language.into(), tailwind_adapter.clone());
     }
 
     let eslint_languages = ["TSX", "TypeScript", "JavaScript", "Vue.js", "Svelte"];
     for language in eslint_languages {
-        languages.register_lsp_adapter(
-            language.into(),
-            Arc::new(typescript::EsLintLspAdapter::new(node_runtime.clone())),
-        );
+        languages.register_lsp_adapter(language.into(), eslint_adapter.clone());
     }
 
     let mut subscription = languages.subscribe();
     let mut prev_language_settings = languages.language_settings();
 
-    cx.spawn(|cx| async move {
+    cx.spawn(async move |cx| {
         while subscription.next().await.is_some() {
             let language_settings = languages.language_settings();
             if language_settings != prev_language_settings {
                 cx.update(|cx| {
                     SettingsStore::update_global(cx, |settings, cx| {
                         settings
-                            .set_extension_settings(language_settings.clone(), cx)
+                            .set_extension_settings(
+                                settings::ExtensionsSettingsContent {
+                                    all_languages: language_settings.clone(),
+                                },
+                                cx,
+                            )
                             .log_err();
                     });
-                })?;
+                });
                 prev_language_settings = language_settings;
             }
         }
         anyhow::Ok(())
     })
     .detach();
+    let manifest_providers: [Arc<dyn ManifestProvider>; 2] = [
+        Arc::from(CargoManifestProvider),
+        Arc::from(PyprojectTomlManifestProvider),
+    ];
+    for provider in manifest_providers {
+        project::ManifestProvidersStore::global(cx).register(provider);
+    }
+}
+
+#[derive(Default)]
+struct LanguageInfo {
+    name: &'static str,
+    adapters: Vec<Arc<dyn LspAdapter>>,
+    context: Option<Arc<dyn ContextProvider>>,
+    toolchain: Option<Arc<dyn ToolchainLister>>,
+    manifest_name: Option<ManifestName>,
+    semantic_token_rules: Option<SemanticTokenRules>,
+}
+
+fn register_language(
+    languages: &LanguageRegistry,
+    name: &'static str,
+    adapters: Vec<Arc<dyn LspAdapter>>,
+    context: Option<Arc<dyn ContextProvider>>,
+    toolchain: Option<Arc<dyn ToolchainLister>>,
+    manifest_name: Option<ManifestName>,
+    semantic_token_rules: Option<SemanticTokenRules>,
+    cx: &mut App,
+) {
+    let config = load_config(name);
+    if let Some(rules) = &semantic_token_rules {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.set_language_semantic_token_rules(config.name.0.clone(), rules.clone(), cx);
+        });
+    }
+    for adapter in adapters {
+        languages.register_lsp_adapter(config.name.clone(), adapter);
+    }
+    languages.register_language(
+        config.name.clone(),
+        config.grammar.clone(),
+        config.matcher.clone(),
+        config.hidden,
+        manifest_name.clone(),
+        Arc::new(move || {
+            Ok(LoadedLanguage {
+                config: config.clone(),
+                queries: load_queries(name),
+                context_provider: context.clone(),
+                toolchain_provider: toolchain.clone(),
+                manifest_name: manifest_name.clone(),
+            })
+        }),
+    );
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -331,6 +425,7 @@ fn load_config(name: &str) -> LanguageConfig {
         config = LanguageConfig {
             name: config.name,
             matcher: config.matcher,
+            jsx_tag_auto_close: config.jsx_tag_auto_close,
             ..Default::default()
         }
     }

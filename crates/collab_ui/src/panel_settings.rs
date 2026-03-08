@@ -1,103 +1,41 @@
 use gpui::Pixels;
-use schemars::JsonSchema;
-use serde_derive::{Deserialize, Serialize};
-use settings::{Settings, SettingsSources};
+use settings::{RegisterSetting, Settings};
+use ui::px;
 use workspace::dock::DockPosition;
 
-#[derive(Deserialize, Debug)]
+#[derive(Debug, RegisterSetting)]
 pub struct CollaborationPanelSettings {
     pub button: bool,
     pub dock: DockPosition,
     pub default_width: Pixels,
 }
 
-#[derive(Deserialize, Debug)]
-pub struct ChatPanelSettings {
-    pub button: bool,
-    pub dock: DockPosition,
-    pub default_width: Pixels,
-}
-
-#[derive(Deserialize, Debug)]
+#[derive(Debug, RegisterSetting)]
 pub struct NotificationPanelSettings {
     pub button: bool,
     pub dock: DockPosition,
     pub default_width: Pixels,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, Debug)]
-pub struct PanelSettingsContent {
-    /// Whether to show the panel button in the status bar.
-    ///
-    /// Default: true
-    pub button: Option<bool>,
-    /// Where to dock the panel.
-    ///
-    /// Default: left
-    pub dock: Option<DockPosition>,
-    /// Default width of the panel in pixels.
-    ///
-    /// Default: 240
-    pub default_width: Option<f32>,
-}
-
-#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, Debug)]
-pub struct MessageEditorSettings {
-    /// Whether to automatically replace emoji shortcodes with emoji characters.
-    /// For example: typing `:wave:` gets replaced with `👋`.
-    ///
-    /// Default: false
-    pub auto_replace_emoji_shortcode: Option<bool>,
-}
-
 impl Settings for CollaborationPanelSettings {
-    const KEY: Option<&'static str> = Some("collaboration_panel");
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let panel = content.collaboration_panel.as_ref().unwrap();
 
-    type FileContent = PanelSettingsContent;
-
-    fn load(
-        sources: SettingsSources<Self::FileContent>,
-        _: &mut gpui::AppContext,
-    ) -> anyhow::Result<Self> {
-        sources.json_merge()
-    }
-}
-
-impl Settings for ChatPanelSettings {
-    const KEY: Option<&'static str> = Some("chat_panel");
-
-    type FileContent = PanelSettingsContent;
-
-    fn load(
-        sources: SettingsSources<Self::FileContent>,
-        _: &mut gpui::AppContext,
-    ) -> anyhow::Result<Self> {
-        sources.json_merge()
+        Self {
+            button: panel.button.unwrap(),
+            dock: panel.dock.unwrap().into(),
+            default_width: panel.default_width.map(px).unwrap(),
+        }
     }
 }
 
 impl Settings for NotificationPanelSettings {
-    const KEY: Option<&'static str> = Some("notification_panel");
-
-    type FileContent = PanelSettingsContent;
-
-    fn load(
-        sources: SettingsSources<Self::FileContent>,
-        _: &mut gpui::AppContext,
-    ) -> anyhow::Result<Self> {
-        sources.json_merge()
-    }
-}
-
-impl Settings for MessageEditorSettings {
-    const KEY: Option<&'static str> = Some("message_editor");
-
-    type FileContent = MessageEditorSettings;
-
-    fn load(
-        sources: SettingsSources<Self::FileContent>,
-        _: &mut gpui::AppContext,
-    ) -> anyhow::Result<Self> {
-        sources.json_merge()
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let panel = content.notification_panel.as_ref().unwrap();
+        return Self {
+            button: panel.button.unwrap(),
+            dock: panel.dock.unwrap().into(),
+            default_width: panel.default_width.map(px).unwrap(),
+        };
     }
 }

@@ -4,21 +4,20 @@
     "config:recommended",
     ":semanticCommitsDisabled",
     ":separateMultipleMajorReleases",
+    ":dependencyDashboardApproval",
     "helpers:pinGitHubActionDigests",
     "group:serdeMonorepo"
   ],
   "dependencyDashboard": true,
   "timezone": "America/New_York",
   "schedule": ["after 3pm on Wednesday"],
-  "major": {
-    "dependencyDashboardApproval": true
-  },
   "prFooter": "Release Notes:\n\n- N/A",
+  "ignorePaths": ["**/node_modules/**"],
   "packageRules": [
     {
       "description": "Group wasmtime crates together.",
-      "matchPackagePrefixes": ["wasmtime"],
-      "groupName": "wasmtime"
+      "groupName": "wasmtime",
+      "matchPackageNames": ["wasmtime{/,}**"]
     }
   ]
 }

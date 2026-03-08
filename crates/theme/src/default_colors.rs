@@ -1,12 +1,43 @@
 use gpui::{Hsla, Rgba};
 
-use crate::scale::{ColorScaleSet, ColorScales};
 use crate::ColorScale;
+use crate::scale::{ColorScaleSet, ColorScales};
 use crate::{SystemColors, ThemeColors};
 
 pub(crate) fn neutral() -> ColorScaleSet {
     sand()
 }
+
+const ADDED_COLOR: Hsla = Hsla {
+    h: 134. / 360.,
+    s: 0.55,
+    l: 0.40,
+    a: 1.0,
+};
+const WORD_ADDED_COLOR: Hsla = Hsla {
+    h: 134. / 360.,
+    s: 0.55,
+    l: 0.40,
+    a: 0.35,
+};
+const MODIFIED_COLOR: Hsla = Hsla {
+    h: 48. / 360.,
+    s: 0.76,
+    l: 0.47,
+    a: 1.0,
+};
+const REMOVED_COLOR: Hsla = Hsla {
+    h: 350. / 360.,
+    s: 0.88,
+    l: 0.25,
+    a: 1.0,
+};
+const WORD_DELETED_COLOR: Hsla = Hsla {
+    h: 350. / 360.,
+    s: 0.88,
+    l: 0.25,
+    a: 0.80,
+};
 
 /// The default colors for the theme.
 ///
@@ -33,7 +64,9 @@ impl ThemeColors {
             element_active: neutral().light_alpha().step_5(),
             element_selected: neutral().light_alpha().step_5(),
             element_disabled: neutral().light_alpha().step_3(),
+            element_selection_background: blue().light().step_3().alpha(0.25),
             drop_target_background: blue().light_alpha().step_2(),
+            drop_target_border: neutral().light().step_12(),
             ghost_element_background: system.transparent,
             ghost_element_hover: neutral().light_alpha().step_3(),
             ghost_element_active: neutral().light_alpha().step_4(),
@@ -49,6 +82,7 @@ impl ThemeColors {
             icon_disabled: neutral().light().step_9(),
             icon_placeholder: neutral().light().step_10(),
             icon_accent: blue().light().step_11(),
+            debugger_accent: red().light().step_10(),
             status_bar_background: neutral().light().step_2(),
             title_bar_background: neutral().light().step_2(),
             title_bar_inactive_background: neutral().light().step_3(),
@@ -57,25 +91,35 @@ impl ThemeColors {
             tab_inactive_background: neutral().light().step_2(),
             tab_active_background: neutral().light().step_1(),
             search_match_background: neutral().light().step_5(),
+            search_active_match_background: neutral().light().step_7(),
             panel_background: neutral().light().step_2(),
-            panel_focused_border: blue().light().step_5(),
+            panel_focused_border: blue().light().step_10(),
             panel_indent_guide: neutral().light_alpha().step_5(),
             panel_indent_guide_hover: neutral().light_alpha().step_6(),
             panel_indent_guide_active: neutral().light_alpha().step_6(),
+            panel_overlay_background: neutral().light().step_2(),
+            panel_overlay_hover: neutral().light().step_4(),
             pane_focused_border: blue().light().step_5(),
             pane_group_border: neutral().light().step_6(),
             scrollbar_thumb_background: neutral().light_alpha().step_3(),
             scrollbar_thumb_hover_background: neutral().light_alpha().step_4(),
+            scrollbar_thumb_active_background: neutral().light_alpha().step_5(),
             scrollbar_thumb_border: gpui::transparent_black(),
             scrollbar_track_background: gpui::transparent_black(),
             scrollbar_track_border: neutral().light().step_5(),
+            minimap_thumb_background: neutral().light_alpha().step_3().alpha(0.7),
+            minimap_thumb_hover_background: neutral().light_alpha().step_4().alpha(0.7),
+            minimap_thumb_active_background: neutral().light_alpha().step_5().alpha(0.7),
+            minimap_thumb_border: gpui::transparent_black(),
             editor_foreground: neutral().light().step_12(),
             editor_background: neutral().light().step_1(),
             editor_gutter_background: neutral().light().step_1(),
             editor_subheader_background: neutral().light().step_2(),
             editor_active_line_background: neutral().light_alpha().step_3(),
             editor_highlighted_line_background: neutral().light_alpha().step_3(),
+            editor_debugger_active_line_background: yellow().dark_alpha().step_3(),
             editor_line_number: neutral().light().step_10(),
+            editor_hover_line_number: neutral().light().step_12(),
             editor_active_line_number: neutral().light().step_11(),
             editor_invisible: neutral().light().step_10(),
             editor_wrap_guide: neutral().light_alpha().step_7(),
@@ -115,6 +159,33 @@ impl ThemeColors {
             terminal_ansi_dim_cyan: cyan().light().step_10(),
             terminal_ansi_dim_white: neutral().light().step_11(),
             link_text_hover: orange().light().step_10(),
+            version_control_added: ADDED_COLOR,
+            version_control_deleted: REMOVED_COLOR,
+            version_control_modified: MODIFIED_COLOR,
+            version_control_renamed: MODIFIED_COLOR,
+            version_control_conflict: orange().light().step_12(),
+            version_control_ignored: gray().light().step_12(),
+            version_control_word_added: WORD_ADDED_COLOR,
+            version_control_word_deleted: WORD_DELETED_COLOR,
+            version_control_conflict_marker_ours: green().light().step_10().alpha(0.5),
+            version_control_conflict_marker_theirs: blue().light().step_10().alpha(0.5),
+            vim_normal_background: system.transparent,
+            vim_insert_background: system.transparent,
+            vim_replace_background: system.transparent,
+            vim_visual_background: system.transparent,
+            vim_visual_line_background: system.transparent,
+            vim_visual_block_background: system.transparent,
+            vim_yank_background: neutral().light_alpha().step_3(),
+            vim_helix_normal_background: system.transparent,
+            vim_helix_select_background: system.transparent,
+            vim_normal_foreground: system.transparent,
+            vim_insert_foreground: system.transparent,
+            vim_replace_foreground: system.transparent,
+            vim_visual_foreground: system.transparent,
+            vim_visual_line_foreground: system.transparent,
+            vim_visual_block_foreground: system.transparent,
+            vim_helix_normal_foreground: system.transparent,
+            vim_helix_select_foreground: system.transparent,
         }
     }
 
@@ -139,7 +210,9 @@ impl ThemeColors {
             element_active: neutral().dark_alpha().step_5(),
             element_selected: neutral().dark_alpha().step_5(),
             element_disabled: neutral().dark_alpha().step_3(),
+            element_selection_background: blue().dark().step_3().alpha(0.25),
             drop_target_background: blue().dark_alpha().step_2(),
+            drop_target_border: neutral().dark().step_12(),
             ghost_element_background: system.transparent,
             ghost_element_hover: neutral().dark_alpha().step_4(),
             ghost_element_active: neutral().dark_alpha().step_5(),
@@ -155,6 +228,7 @@ impl ThemeColors {
             icon_disabled: neutral().dark().step_9(),
             icon_placeholder: neutral().dark().step_10(),
             icon_accent: blue().dark().step_11(),
+            debugger_accent: red().light().step_10(),
             status_bar_background: neutral().dark().step_2(),
             title_bar_background: neutral().dark().step_2(),
             title_bar_inactive_background: neutral().dark().step_3(),
@@ -163,26 +237,36 @@ impl ThemeColors {
             tab_inactive_background: neutral().dark().step_2(),
             tab_active_background: neutral().dark().step_1(),
             search_match_background: neutral().dark().step_5(),
+            search_active_match_background: neutral().dark().step_3(),
             panel_background: neutral().dark().step_2(),
-            panel_focused_border: blue().dark().step_5(),
+            panel_focused_border: blue().dark().step_8(),
             panel_indent_guide: neutral().dark_alpha().step_4(),
             panel_indent_guide_hover: neutral().dark_alpha().step_6(),
             panel_indent_guide_active: neutral().dark_alpha().step_6(),
+            panel_overlay_background: neutral().dark().step_2(),
+            panel_overlay_hover: neutral().dark().step_4(),
             pane_focused_border: blue().dark().step_5(),
             pane_group_border: neutral().dark().step_6(),
             scrollbar_thumb_background: neutral().dark_alpha().step_3(),
             scrollbar_thumb_hover_background: neutral().dark_alpha().step_4(),
+            scrollbar_thumb_active_background: neutral().dark_alpha().step_5(),
             scrollbar_thumb_border: gpui::transparent_black(),
             scrollbar_track_background: gpui::transparent_black(),
             scrollbar_track_border: neutral().dark().step_5(),
+            minimap_thumb_background: neutral().dark_alpha().step_3().alpha(0.7),
+            minimap_thumb_hover_background: neutral().dark_alpha().step_4().alpha(0.7),
+            minimap_thumb_active_background: neutral().dark_alpha().step_5().alpha(0.7),
+            minimap_thumb_border: gpui::transparent_black(),
             editor_foreground: neutral().dark().step_12(),
             editor_background: neutral().dark().step_1(),
             editor_gutter_background: neutral().dark().step_1(),
             editor_subheader_background: neutral().dark().step_3(),
             editor_active_line_background: neutral().dark_alpha().step_3(),
-            editor_highlighted_line_background: neutral().dark_alpha().step_4(),
+            editor_highlighted_line_background: yellow().dark_alpha().step_4(),
+            editor_debugger_active_line_background: yellow().dark_alpha().step_3(),
             editor_line_number: neutral().dark_alpha().step_10(),
-            editor_active_line_number: neutral().dark_alpha().step_12(),
+            editor_hover_line_number: neutral().dark_alpha().step_12(),
+            editor_active_line_number: neutral().dark_alpha().step_11(),
             editor_invisible: neutral().dark_alpha().step_4(),
             editor_wrap_guide: neutral().dark_alpha().step_4(),
             editor_active_wrap_guide: neutral().dark_alpha().step_4(),
@@ -221,6 +305,33 @@ impl ThemeColors {
             terminal_ansi_bright_white: neutral().dark().step_11(),
             terminal_ansi_dim_white: neutral().dark().step_10(),
             link_text_hover: orange().dark().step_10(),
+            version_control_added: ADDED_COLOR,
+            version_control_deleted: REMOVED_COLOR,
+            version_control_modified: MODIFIED_COLOR,
+            version_control_renamed: MODIFIED_COLOR,
+            version_control_conflict: orange().dark().step_12(),
+            version_control_ignored: gray().dark().step_12(),
+            version_control_word_added: WORD_ADDED_COLOR,
+            version_control_word_deleted: WORD_DELETED_COLOR,
+            version_control_conflict_marker_ours: green().dark().step_10().alpha(0.5),
+            version_control_conflict_marker_theirs: blue().dark().step_10().alpha(0.5),
+            vim_normal_background: system.transparent,
+            vim_insert_background: system.transparent,
+            vim_replace_background: system.transparent,
+            vim_visual_background: system.transparent,
+            vim_visual_line_background: system.transparent,
+            vim_visual_block_background: system.transparent,
+            vim_yank_background: neutral().dark_alpha().step_4(),
+            vim_helix_normal_background: system.transparent,
+            vim_helix_select_background: system.transparent,
+            vim_normal_foreground: system.transparent,
+            vim_insert_foreground: system.transparent,
+            vim_replace_foreground: system.transparent,
+            vim_visual_foreground: system.transparent,
+            vim_visual_line_foreground: system.transparent,
+            vim_visual_block_foreground: system.transparent,
+            vim_helix_normal_foreground: system.transparent,
+            vim_helix_select_foreground: system.transparent,
         }
     }
 }
@@ -239,7 +350,7 @@ impl TryFrom<StaticColorScaleSet> for ColorScaleSet {
     type Error = anyhow::Error;
 
     fn try_from(value: StaticColorScaleSet) -> Result<Self, Self::Error> {
-        fn to_color_scale(scale: StaticColorScale) -> Result<ColorScale, anyhow::Error> {
+        fn to_color_scale(scale: StaticColorScale) -> anyhow::Result<ColorScale> {
             scale
                 .into_iter()
                 .map(|color| Rgba::try_from(color).map(Hsla::from))

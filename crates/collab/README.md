@@ -8,7 +8,12 @@ It contains our back-end logic for collaboration, to which we connect from the Z
 
 ## Database setup
 
-Before you can run the collab server locally, you'll need to set up a zed Postgres database.
+Before you can run the collab server locally, you'll need to set up a zed Postgres database. Follow the steps sequentially:
+
+1. Ensure you have postgres installed. If not, install with `brew install postgresql@15`.
+2. Follow the steps on Brew's formula and verify your `$PATH` contains `/opt/homebrew/opt/postgresql@15/bin`.
+3. If you hadn't done it before, create the `postgres` user with `createuser -s postgres`.
+4. You are now ready to run the `bootstrap` script:
 
 ```sh
 script/bootstrap
@@ -52,21 +57,9 @@ We run two instances of collab:
 
 Both of these run on the Kubernetes cluster hosted in Digital Ocean.
 
-Deployment is triggered by pushing to the `collab-staging` (or `collab-production`) tag in Github. The best way to do this is:
+Deployment is triggered by pushing to the `collab-staging` (or `collab-production`) tag in GitHub. The best way to do this is:
 
 - `./script/deploy-collab staging`
 - `./script/deploy-collab production`
 
 You can tell what is currently deployed with `./script/what-is-deployed`.
-
-# Database Migrations
-
-To create a new migration:
-
-```sh
-./script/create-migration <name>
-```
-
-Migrations are run automatically on service start, so run `foreman start` again. The service will crash if the migrations fail.
-
-When you create a new migration, you also need to update the [SQLite schema](./migrations.sqlite/20221109000000_test_schema.sql) that is used for testing.

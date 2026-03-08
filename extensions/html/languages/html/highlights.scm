@@ -1,11 +1,20 @@
 (tag_name) @tag
-(erroneous_end_tag_name) @keyword
+
 (doctype) @tag.doctype
-(attribute_name) @property
-(attribute_value) @string
+
+(attribute_name) @attribute
+
+[
+  "\""
+  "'"
+  (attribute_value)
+] @string
+
 (comment) @comment
 
-"=" @operator
+(entity) @string.special
+
+"=" @punctuation.delimiter.html
 
 [
   "<"
@@ -13,4 +22,4 @@
   "<!"
   "</"
   "/>"
-] @punctuation.bracket
+] @punctuation.bracket.html

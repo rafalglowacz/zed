@@ -1,7 +1,7 @@
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use syn::{
-    parse::Parse, parse::ParseStream, parse_macro_input, punctuated::Punctuated, LitInt, Token,
+    LitInt, Token, parse::Parse, parse::ParseStream, parse_macro_input, punctuated::Punctuated,
 };
 
 struct DynamicSpacingInput {
@@ -23,7 +23,7 @@ enum DynamicSpacingValue {
 impl Parse for DynamicSpacingInput {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         Ok(DynamicSpacingInput {
-            values: input.parse_terminated(DynamicSpacingValue::parse)?,
+            values: input.parse_terminated(DynamicSpacingValue::parse, Token![,])?,
         })
     }
 }
@@ -66,9 +66,9 @@ pub fn derive_spacing(input: TokenStream) -> TokenStream {
                     let n = n.base10_parse::<f32>().unwrap();
                     quote! {
                         DynamicSpacing::#variant => match ThemeSettings::get_global(cx).ui_density {
-                            UiDensity::Compact => (#n - 4.0).max(0.0) / BASE_REM_SIZE_IN_PX,
-                            UiDensity::Default => #n / BASE_REM_SIZE_IN_PX,
-                            UiDensity::Comfortable => (#n + 4.0) / BASE_REM_SIZE_IN_PX,
+                            ::theme::UiDensity::Compact => (#n - 4.0).max(0.0) / BASE_REM_SIZE_IN_PX,
+                            ::theme::UiDensity::Default => #n / BASE_REM_SIZE_IN_PX,
+                            ::theme::UiDensity::Comfortable => (#n + 4.0) / BASE_REM_SIZE_IN_PX,
                         }
                     }
                 }
@@ -78,9 +78,9 @@ pub fn derive_spacing(input: TokenStream) -> TokenStream {
                     let c = c.base10_parse::<f32>().unwrap();
                     quote! {
                         DynamicSpacing::#variant => match ThemeSettings::get_global(cx).ui_density {
-                            UiDensity::Compact => #a / BASE_REM_SIZE_IN_PX,
-                            UiDensity::Default => #b / BASE_REM_SIZE_IN_PX,
-                            UiDensity::Comfortable => #c / BASE_REM_SIZE_IN_PX,
+                            ::theme::UiDensity::Compact => #a / BASE_REM_SIZE_IN_PX,
+                            ::theme::UiDensity::Default => #b / BASE_REM_SIZE_IN_PX,
+                            ::theme::UiDensity::Comfortable => #c / BASE_REM_SIZE_IN_PX,
                         }
                     }
                 }
@@ -143,7 +143,7 @@ pub fn derive_spacing(input: TokenStream) -> TokenStream {
 
         impl DynamicSpacing {
             /// Returns the spacing ratio, should only be used internally.
-            fn spacing_ratio(&self, cx: &WindowContext) -> f32 {
+            fn spacing_ratio(&self, cx: &App) -> f32 {
                 const BASE_REM_SIZE_IN_PX: f32 = 16.0;
                 match self {
                     #(#spacing_ratios,)*
@@ -151,13 +151,13 @@ pub fn derive_spacing(input: TokenStream) -> TokenStream {
             }
 
             /// Returns the spacing value in rems.
-            pub fn rems(&self, cx: &WindowContext) -> Rems {
+            pub fn rems(&self, cx: &App) -> Rems {
                 rems(self.spacing_ratio(cx))
             }
 
             /// Returns the spacing value in pixels.
-            pub fn px(&self, cx: &WindowContext) -> Pixels {
-                let ui_font_size_f32: f32 = ThemeSettings::get_global(cx).ui_font_size.into();
+            pub fn px(&self, cx: &App) -> Pixels {
+                let ui_font_size_f32: f32 = ThemeSettings::get_global(cx).ui_font_size(cx).into();
                 px(ui_font_size_f32 * self.spacing_ratio(cx))
             }
         }

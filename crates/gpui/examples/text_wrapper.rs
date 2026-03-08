@@ -1,10 +1,20 @@
-use gpui::*;
+#![cfg_attr(target_family = "wasm", no_main)]
+
+use gpui::{
+    App, Bounds, Context, TextOverflow, Window, WindowBounds, WindowOptions, div, prelude::*, px,
+    size,
+};
+use gpui_platform::application;
 
 struct HelloWorld {}
 
 impl Render for HelloWorld {
-    fn render(&mut self, _cx: &mut ViewContext<Self>) -> impl IntoElement {
-        let text = "The longest word 你好世界这段是中文，こんにちはこの段落は日本語です in any of the major English language dictionaries is pneumonoultramicroscopicsilicovolcanoconiosis, a word that refers to a lung disease contracted from the inhalation of very fine silica particles, specifically from a volcano; medically, it is the same as silicosis.";
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let text = "The longest word 你好世界这段是中文，こんにちはこの段落は日本語です in any of the major \
+            English language dictionaries is pneumonoultramicroscopicsilicovolcanoconiosis, a word that \
+            refers to a lung disease contracted from the inhalation of very fine silica particles, \
+            a url https://github.com/zed-industries/zed/pull/35724?query=foo&bar=2, \
+            specifically from a volcano; medically, it is the same as silicosis.";
         div()
             .id("page")
             .size_full()
@@ -17,6 +27,7 @@ impl Render for HelloWorld {
                 div()
                     .flex()
                     .flex_row()
+                    .flex_shrink_0()
                     .gap_2()
                     .child(
                         div()
@@ -46,45 +57,82 @@ impl Render for HelloWorld {
             )
             .child(
                 div()
+                    .flex_shrink_0()
                     .text_xl()
-                    .overflow_hidden()
-                    .text_ellipsis()
+                    .truncate()
                     .border_1()
-                    .border_color(gpui::red())
+                    .border_color(gpui::blue())
                     .child("ELLIPSIS: ".to_owned() + text),
             )
             .child(
                 div()
+                    .flex_shrink_0()
                     .text_xl()
                     .overflow_hidden()
-                    .truncate()
+                    .text_ellipsis()
+                    .line_clamp(2)
+                    .border_1()
+                    .border_color(gpui::blue())
+                    .child("ELLIPSIS 2 lines: ".to_owned() + text),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_xl()
+                    .overflow_hidden()
+                    .text_overflow(TextOverflow::Truncate("".into()))
                     .border_1()
                     .border_color(gpui::green())
                     .child("TRUNCATE: ".to_owned() + text),
             )
             .child(
                 div()
+                    .flex_shrink_0()
+                    .text_xl()
+                    .overflow_hidden()
+                    .text_overflow(TextOverflow::Truncate("".into()))
+                    .line_clamp(3)
+                    .border_1()
+                    .border_color(gpui::green())
+                    .child("TRUNCATE 3 lines: ".to_owned() + text),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
                     .text_xl()
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .border_1()
-                    .border_color(gpui::blue())
+                    .border_color(gpui::black())
                     .child("NOWRAP: ".to_owned() + text),
             )
             .child(div().text_xl().w_full().child(text))
     }
 }
 
-fn main() {
-    App::new().run(|cx: &mut AppContext| {
-        let bounds = Bounds::centered(None, size(px(600.0), px(480.0)), cx);
+fn run_example() {
+    application().run(|cx: &mut App| {
+        let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |cx| cx.new_view(|_cx| HelloWorld {}),
+            |_, cx| cx.new(|_| HelloWorld {}),
         )
         .unwrap();
+        cx.activate(true);
     });
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn main() {
+    run_example();
+}
+
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    gpui_platform::web_init();
+    run_example();
 }

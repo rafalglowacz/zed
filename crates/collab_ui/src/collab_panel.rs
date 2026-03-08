@@ -2,56 +2,75 @@ mod channel_modal;
 mod contact_finder;
 
 use self::channel_modal::ChannelModal;
-use crate::{channel_view::ChannelView, chat_panel::ChatPanel, CollaborationPanelSettings};
+use crate::{CollaborationPanelSettings, channel_view::ChannelView};
+use anyhow::Context as _;
 use call::ActiveCall;
 use channel::{Channel, ChannelEvent, ChannelStore};
 use client::{ChannelId, Client, Contact, User, UserStore};
+use collections::{HashMap, HashSet};
 use contact_finder::ContactFinder;
 use db::kvp::KEY_VALUE_STORE;
 use editor::{Editor, EditorElement, EditorStyle};
-use fuzzy::{match_strings, StringMatchCandidate};
+use fuzzy::{StringMatch, StringMatchCandidate, match_strings};
 use gpui::{
-    actions, anchored, canvas, deferred, div, fill, list, point, prelude::*, px, AnyElement,
-    AppContext, AsyncWindowContext, Bounds, ClickEvent, ClipboardItem, DismissEvent, Div,
-    EventEmitter, FocusHandle, FocusableView, FontStyle, InteractiveElement, IntoElement,
-    ListOffset, ListState, Model, MouseDownEvent, ParentElement, Pixels, Point, PromptLevel,
-    Render, SharedString, Styled, Subscription, Task, TextStyle, View, ViewContext, VisualContext,
-    WeakView,
+    AnyElement, App, AsyncWindowContext, Bounds, ClickEvent, ClipboardItem, Context, DismissEvent,
+    Div, Entity, EventEmitter, FocusHandle, Focusable, FontStyle, InteractiveElement, IntoElement,
+    KeyContext, ListOffset, ListState, MouseDownEvent, ParentElement, Pixels, Point, PromptLevel,
+    Render, SharedString, Styled, Subscription, Task, TextStyle, WeakEntity, Window, actions,
+    anchored, canvas, deferred, div, fill, list, point, prelude::*, px,
 };
-use menu::{Cancel, Confirm, SecondaryConfirm, SelectNext, SelectPrev};
+use menu::{Cancel, Confirm, SecondaryConfirm, SelectNext, SelectPrevious};
 use project::{Fs, Project};
 use rpc::{
-    proto::{self, ChannelVisibility, PeerId},
     ErrorCode, ErrorExt,
+    proto::{self, ChannelVisibility, PeerId},
 };
-use serde_derive::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use settings::Settings;
 use smallvec::SmallVec;
 use std::{mem, sync::Arc};
 use theme::{ActiveTheme, ThemeSettings};
 use ui::{
-    prelude::*, tooltip_container, Avatar, AvatarAvailabilityIndicator, Button, Color, ContextMenu,
-    Facepile, Icon, IconButton, IconName, IconSize, Indicator, Label, ListHeader, ListItem,
-    Tooltip,
+    Avatar, AvatarAvailabilityIndicator, ContextMenu, CopyButton, Facepile, HighlightedLabel,
+    IconButtonShape, Indicator, ListHeader, ListItem, Tab, Tooltip, prelude::*, tooltip_container,
 };
-use util::{maybe, ResultExt, TryFutureExt};
+use util::{ResultExt, TryFutureExt, maybe};
 use workspace::{
+    CopyRoomId, Deafen, LeaveCall, MultiWorkspace, Mute, OpenChannelNotes, ScreenShare,
+    ShareProject, Workspace,
     dock::{DockPosition, Panel, PanelEvent},
-    notifications::{DetachAndPromptErr, NotifyResultExt, NotifyTaskExt},
-    OpenChannelNotes, Workspace,
+    notifications::{DetachAndPromptErr, NotifyResultExt},
 };
 
 actions!(
     collab_panel,
     [
+        /// Toggles the collab panel.
+        Toggle,
+        /// Toggles focus on the collaboration panel.
         ToggleFocus,
+        /// Removes the selected channel or contact.
         Remove,
+        /// Opens the context menu for the selected item.
         Secondary,
+        /// Collapses the selected channel in the tree view.
         CollapseSelectedChannel,
+        /// Expands the selected channel in the tree view.
         ExpandSelectedChannel,
+        /// Opens the meeting notes for the selected channel in the panel.
+        ///
+        /// Use `collab::OpenChannelNotes` to open the channel notes for the current call.
+        OpenSelectedChannelNotes,
+        /// Starts moving a channel to a new location.
         StartMoveChannel,
+        /// Moves the selected item to the current location.
         MoveSelected,
+        /// Inserts a space character in the filter input.
         InsertSpace,
+        /// Moves the selected channel up in the list.
+        MoveChannelUp,
+        /// Moves the selected channel down in the list.
+        MoveChannelDown,
     ]
 );
 
@@ -62,21 +81,112 @@ struct ChannelMoveClipboard {
 
 const COLLABORATION_PANEL_KEY: &str = "CollaborationPanel";
 
-pub fn init(cx: &mut AppContext) {
-    cx.observe_new_views(|workspace: &mut Workspace, _| {
-        workspace.register_action(|workspace, _: &ToggleFocus, cx| {
-            workspace.toggle_panel_focus::<CollabPanel>(cx);
+pub fn init(cx: &mut App) {
+    cx.observe_new(|workspace: &mut Workspace, _, _| {
+        workspace.register_action(|workspace, _: &ToggleFocus, window, cx| {
+            workspace.toggle_panel_focus::<CollabPanel>(window, cx);
+            if let Some(collab_panel) = workspace.panel::<CollabPanel>(cx) {
+                collab_panel.update(cx, |panel, cx| {
+                    panel.filter_editor.update(cx, |editor, cx| {
+                        if editor.snapshot(window, cx).is_focused() {
+                            editor.select_all(&Default::default(), window, cx);
+                        }
+                    });
+                })
+            }
         });
-        workspace.register_action(|_, _: &OpenChannelNotes, cx| {
+        workspace.register_action(|workspace, _: &Toggle, window, cx| {
+            if !workspace.toggle_panel_focus::<CollabPanel>(window, cx) {
+                workspace.close_panel::<CollabPanel>(window, cx);
+            }
+        });
+        workspace.register_action(|_, _: &OpenChannelNotes, window, cx| {
             let channel_id = ActiveCall::global(cx)
                 .read(cx)
                 .room()
                 .and_then(|room| room.read(cx).channel_id());
 
             if let Some(channel_id) = channel_id {
-                let workspace = cx.view().clone();
-                cx.window_context().defer(move |cx| {
-                    ChannelView::open(channel_id, None, workspace, cx).detach_and_log_err(cx)
+                let workspace = cx.entity();
+                window.defer(cx, move |window, cx| {
+                    ChannelView::open(channel_id, None, workspace, window, cx)
+                        .detach_and_log_err(cx)
+                });
+            }
+        });
+        // TODO: make it possible to bind this one to a held key for push to talk?
+        // how to make "toggle_on_modifiers_press" contextual?
+        workspace.register_action(|_, _: &Mute, _, cx| title_bar::collab::toggle_mute(cx));
+        workspace.register_action(|_, _: &Deafen, _, cx| title_bar::collab::toggle_deafen(cx));
+        workspace.register_action(|_, _: &LeaveCall, window, cx| {
+            CollabPanel::leave_call(window, cx);
+        });
+        workspace.register_action(|workspace, _: &CopyRoomId, window, cx| {
+            use workspace::notifications::{NotificationId, NotifyTaskExt as _};
+
+            struct RoomIdCopiedToast;
+
+            if let Some(room) = ActiveCall::global(cx).read(cx).room() {
+                let romo_id_fut = room.read(cx).room_id();
+                let workspace_handle = cx.weak_entity();
+                cx.spawn(async move |workspace, cx| {
+                    let room_id = romo_id_fut.await.context("Failed to get livekit room")?;
+                    workspace.update(cx, |workspace, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(room_id));
+                        workspace.show_toast(
+                            workspace::Toast::new(
+                                NotificationId::unique::<RoomIdCopiedToast>(),
+                                "Room ID copied to clipboard",
+                            )
+                            .autohide(),
+                            cx,
+                        );
+                    })
+                })
+                .detach_and_notify_err(workspace_handle, window, cx);
+            } else {
+                workspace.show_error(&"There’s no active call; join one first.", cx);
+            }
+        });
+        workspace.register_action(|workspace, _: &ShareProject, window, cx| {
+            let project = workspace.project().clone();
+            println!("{project:?}");
+            window.defer(cx, move |_window, cx| {
+                ActiveCall::global(cx).update(cx, move |call, cx| {
+                    if let Some(room) = call.room() {
+                        println!("{room:?}");
+                        if room.read(cx).is_sharing_project() {
+                            call.unshare_project(project, cx).ok();
+                        } else {
+                            call.share_project(project, cx).detach_and_log_err(cx);
+                        }
+                    }
+                });
+            });
+        });
+        workspace.register_action(|_, _: &ScreenShare, window, cx| {
+            let room = ActiveCall::global(cx).read(cx).room().cloned();
+            if let Some(room) = room {
+                window.defer(cx, move |_window, cx| {
+                    room.update(cx, |room, cx| {
+                        if room.is_sharing_screen() {
+                            room.unshare_screen(true, cx).ok();
+                        } else {
+                            let sources = cx.screen_capture_sources();
+
+                            cx.spawn(async move |room, cx| {
+                                let sources = sources.await??;
+                                let first = sources.into_iter().next();
+                                if let Some(first) = first {
+                                    room.update(cx, |room, cx| room.share_screen(first, cx))?
+                                        .await
+                                } else {
+                                    Ok(())
+                                }
+                            })
+                            .detach_and_log_err(cx);
+                        };
+                    });
                 });
             }
         });
@@ -111,22 +221,23 @@ pub struct CollabPanel {
     focus_handle: FocusHandle,
     channel_clipboard: Option<ChannelMoveClipboard>,
     pending_serialization: Task<Option<()>>,
-    context_menu: Option<(View<ContextMenu>, Point<Pixels>, Subscription)>,
+    context_menu: Option<(Entity<ContextMenu>, Point<Pixels>, Subscription)>,
     list_state: ListState,
-    filter_editor: View<Editor>,
-    channel_name_editor: View<Editor>,
+    filter_editor: Entity<Editor>,
+    channel_name_editor: Entity<Editor>,
     channel_editing_state: Option<ChannelEditingState>,
     entries: Vec<ListEntry>,
     selection: Option<usize>,
-    channel_store: Model<ChannelStore>,
-    user_store: Model<UserStore>,
+    channel_store: Entity<ChannelStore>,
+    user_store: Entity<UserStore>,
     client: Arc<Client>,
-    project: Model<Project>,
+    project: Entity<Project>,
     match_candidates: Vec<StringMatchCandidate>,
     subscriptions: Vec<Subscription>,
     collapsed_sections: Vec<Section>,
     collapsed_channels: Vec<ChannelId>,
-    workspace: WeakView<Workspace>,
+    filter_active_channels: bool,
+    workspace: WeakEntity<Workspace>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -172,11 +283,10 @@ enum ListEntry {
         channel: Arc<Channel>,
         depth: usize,
         has_children: bool,
+        // `None` when the channel is a parent of a matched channel.
+        string_match: Option<StringMatch>,
     },
     ChannelNotes {
-        channel_id: ChannelId,
-    },
-    ChannelChat {
         channel_id: ChannelId,
     },
     ChannelEditor {
@@ -190,11 +300,15 @@ enum ListEntry {
 }
 
 impl CollabPanel {
-    pub fn new(workspace: &mut Workspace, cx: &mut ViewContext<Workspace>) -> View<Self> {
-        cx.new_view(|cx| {
-            let filter_editor = cx.new_view(|cx| {
-                let mut editor = Editor::single_line(cx);
-                editor.set_placeholder_text("Filter...", cx);
+    pub fn new(
+        workspace: &mut Workspace,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Self> {
+        cx.new(|cx| {
+            let filter_editor = cx.new(|cx| {
+                let mut editor = Editor::single_line(window, cx);
+                editor.set_placeholder_text("Search channels…", window, cx);
                 editor
             });
 
@@ -215,31 +329,25 @@ impl CollabPanel {
             })
             .detach();
 
-            let channel_name_editor = cx.new_view(Editor::single_line);
+            let channel_name_editor = cx.new(|cx| Editor::single_line(window, cx));
 
-            cx.subscribe(&channel_name_editor, |this: &mut Self, _, event, cx| {
-                if let editor::EditorEvent::Blurred = event {
-                    if let Some(state) = &this.channel_editing_state {
-                        if state.pending_name().is_some() {
+            cx.subscribe_in(
+                &channel_name_editor,
+                window,
+                |this: &mut Self, _, event, window, cx| {
+                    if let editor::EditorEvent::Blurred = event {
+                        if let Some(state) = &this.channel_editing_state
+                            && state.pending_name().is_some()
+                        {
                             return;
                         }
+                        this.take_editing_state(window, cx);
+                        this.update_entries(false, cx);
+                        cx.notify();
                     }
-                    this.take_editing_state(cx);
-                    this.update_entries(false, cx);
-                    cx.notify();
-                }
-            })
+                },
+            )
             .detach();
-
-            let view = cx.view().downgrade();
-            let list_state =
-                ListState::new(0, gpui::ListAlignment::Top, px(1000.), move |ix, cx| {
-                    if let Some(view) = view.upgrade() {
-                        view.update(cx, |view, cx| view.render_list_entry(ix, cx))
-                    } else {
-                        div().into_any()
-                    }
-                });
 
             let mut this = Self {
                 width: None,
@@ -248,7 +356,7 @@ impl CollabPanel {
                 fs: workspace.app_state().fs.clone(),
                 pending_serialization: Task::ready(None),
                 context_menu: None,
-                list_state,
+                list_state: ListState::new(0, gpui::ListAlignment::Top, px(1000.)),
                 channel_name_editor,
                 filter_editor,
                 entries: Vec::default(),
@@ -261,6 +369,7 @@ impl CollabPanel {
                 match_candidates: Vec::default(),
                 collapsed_sections: vec![Section::Offline],
                 collapsed_channels: Vec::default(),
+                filter_active_channels: false,
                 workspace: workspace.weak_handle(),
                 client: workspace.app_state().client.clone(),
             };
@@ -278,12 +387,13 @@ impl CollabPanel {
                 }));
             this.subscriptions
                 .push(cx.observe(&active_call, |this, _, cx| this.update_entries(true, cx)));
-            this.subscriptions.push(cx.subscribe(
+            this.subscriptions.push(cx.subscribe_in(
                 &this.channel_store,
-                |this, _channel_store, e, cx| match e {
+                window,
+                |this, _channel_store, e, window, cx| match e {
                     ChannelEvent::ChannelCreated(channel_id)
                     | ChannelEvent::ChannelRenamed(channel_id) => {
-                        if this.take_editing_state(cx) {
+                        if this.take_editing_state(window, cx) {
                             this.update_entries(false, cx);
                             this.selection = this.entries.iter().position(|entry| {
                                 if let ListEntry::Channel { channel, .. } = entry {
@@ -302,23 +412,31 @@ impl CollabPanel {
     }
 
     pub async fn load(
-        workspace: WeakView<Workspace>,
+        workspace: WeakEntity<Workspace>,
         mut cx: AsyncWindowContext,
-    ) -> anyhow::Result<View<Self>> {
-        let serialized_panel = cx
-            .background_executor()
-            .spawn(async move { KEY_VALUE_STORE.read_kvp(COLLABORATION_PANEL_KEY) })
-            .await
-            .map_err(|_| anyhow::anyhow!("Failed to read collaboration panel from key value store"))
-            .log_err()
+    ) -> anyhow::Result<Entity<Self>> {
+        let serialized_panel = match workspace
+            .read_with(&cx, |workspace, _| {
+                CollabPanel::serialization_key(workspace)
+            })
+            .ok()
             .flatten()
-            .map(|panel| serde_json::from_str::<SerializedCollabPanel>(&panel))
-            .transpose()
-            .log_err()
-            .flatten();
+        {
+            Some(serialization_key) => cx
+                .background_spawn(async move { KEY_VALUE_STORE.read_kvp(&serialization_key) })
+                .await
+                .context("reading collaboration panel from key value store")
+                .log_err()
+                .flatten()
+                .map(|panel| serde_json::from_str::<SerializedCollabPanel>(&panel))
+                .transpose()
+                .log_err()
+                .flatten(),
+            None => None,
+        };
 
-        workspace.update(&mut cx, |workspace, cx| {
-            let panel = CollabPanel::new(workspace, cx);
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            let panel = CollabPanel::new(workspace, window, cx);
             if let Some(serialized_panel) = serialized_panel {
                 panel.update(cx, |panel, cx| {
                     panel.width = serialized_panel.width.map(|w| w.round());
@@ -335,14 +453,30 @@ impl CollabPanel {
         })
     }
 
-    fn serialize(&mut self, cx: &mut ViewContext<Self>) {
+    fn serialization_key(workspace: &Workspace) -> Option<String> {
+        workspace
+            .database_id()
+            .map(|id| i64::from(id).to_string())
+            .or(workspace.session_id())
+            .map(|id| format!("{}-{:?}", COLLABORATION_PANEL_KEY, id))
+    }
+
+    fn serialize(&mut self, cx: &mut Context<Self>) {
+        let Some(serialization_key) = self
+            .workspace
+            .read_with(cx, |workspace, _| CollabPanel::serialization_key(workspace))
+            .ok()
+            .flatten()
+        else {
+            return;
+        };
         let width = self.width;
         let collapsed_channels = self.collapsed_channels.clone();
-        self.pending_serialization = cx.background_executor().spawn(
+        self.pending_serialization = cx.background_spawn(
             async move {
                 KEY_VALUE_STORE
                     .write_kvp(
-                        COLLABORATION_PANEL_KEY.into(),
+                        serialization_key,
                         serde_json::to_string(&SerializedCollabPanel {
                             width,
                             collapsed_channels: Some(
@@ -361,10 +495,11 @@ impl CollabPanel {
         self.list_state.scroll_to_reveal_item(ix)
     }
 
-    fn update_entries(&mut self, select_same_item: bool, cx: &mut ViewContext<Self>) {
+    fn update_entries(&mut self, select_same_item: bool, cx: &mut Context<Self>) {
         let channel_store = self.channel_store.read(cx);
         let user_store = self.user_store.read(cx);
         let query = self.filter_editor.read(cx).text(cx);
+        let fg_executor = cx.foreground_executor();
         let executor = cx.background_executor().clone();
 
         let prev_selected_entry = self.selection.and_then(|ix| self.entries.get(ix).cloned());
@@ -383,24 +518,21 @@ impl CollabPanel {
             if !self.collapsed_sections.contains(&Section::ActiveCall) {
                 let room = room.read(cx);
 
-                if query.is_empty() {
-                    if let Some(channel_id) = room.channel_id() {
-                        self.entries.push(ListEntry::ChannelNotes { channel_id });
-                        self.entries.push(ListEntry::ChannelChat { channel_id });
-                    }
+                if query.is_empty()
+                    && let Some(channel_id) = room.channel_id()
+                {
+                    self.entries.push(ListEntry::ChannelNotes { channel_id });
                 }
 
                 // Populate the active user.
                 if let Some(user) = user_store.current_user() {
                     self.match_candidates.clear();
-                    self.match_candidates.push(StringMatchCandidate {
-                        id: 0,
-                        string: user.github_login.clone(),
-                        char_bag: user.github_login.chars().collect(),
-                    });
-                    let matches = executor.block(match_strings(
+                    self.match_candidates
+                        .push(StringMatchCandidate::new(0, &user.github_login));
+                    let matches = fg_executor.block_on(match_strings(
                         &self.match_candidates,
                         &query,
+                        true,
                         true,
                         usize::MAX,
                         &Default::default(),
@@ -420,10 +552,10 @@ impl CollabPanel {
                                 project_id: project.id,
                                 worktree_root_names: project.worktree_root_names.clone(),
                                 host_user_id: user_id,
-                                is_last: projects.peek().is_none() && !room.is_screen_sharing(),
+                                is_last: projects.peek().is_none() && !room.is_sharing_screen(),
                             });
                         }
-                        if room.is_screen_sharing() {
+                        if room.is_sharing_screen() {
                             self.entries.push(ListEntry::ParticipantScreen {
                                 peer_id: None,
                                 is_last: true,
@@ -436,15 +568,15 @@ impl CollabPanel {
                 self.match_candidates.clear();
                 self.match_candidates
                     .extend(room.remote_participants().values().map(|participant| {
-                        StringMatchCandidate {
-                            id: participant.user.id as usize,
-                            string: participant.user.github_login.clone(),
-                            char_bag: participant.user.github_login.chars().collect(),
-                        }
+                        StringMatchCandidate::new(
+                            participant.user.id as usize,
+                            &participant.user.github_login,
+                        )
                     }));
-                let mut matches = executor.block(match_strings(
+                let mut matches = fg_executor.block_on(match_strings(
                     &self.match_candidates,
                     &query,
+                    true,
                     true,
                     usize::MAX,
                     &Default::default(),
@@ -474,11 +606,10 @@ impl CollabPanel {
                             project_id: project.id,
                             worktree_root_names: project.worktree_root_names.clone(),
                             host_user_id: participant.user.id,
-                            is_last: projects.peek().is_none()
-                                && participant.video_tracks.is_empty(),
+                            is_last: projects.peek().is_none() && !participant.has_video_tracks(),
                         });
                     }
-                    if !participant.video_tracks.is_empty() {
+                    if participant.has_video_tracks() {
                         self.entries.push(ListEntry::ParticipantScreen {
                             peer_id: Some(participant.peer_id),
                             is_last: true,
@@ -490,15 +621,14 @@ impl CollabPanel {
                 self.match_candidates.clear();
                 self.match_candidates
                     .extend(room.pending_participants().iter().enumerate().map(
-                        |(id, participant)| StringMatchCandidate {
-                            id,
-                            string: participant.github_login.clone(),
-                            char_bag: participant.github_login.chars().collect(),
+                        |(id, participant)| {
+                            StringMatchCandidate::new(id, &participant.github_login)
                         },
                     ));
-                let matches = executor.block(match_strings(
+                let matches = fg_executor.block_on(match_strings(
                     &self.match_candidates,
                     &query,
+                    true,
                     true,
                     usize::MAX,
                     &Default::default(),
@@ -520,53 +650,86 @@ impl CollabPanel {
 
         if channel_store.channel_count() > 0 || self.channel_editing_state.is_some() {
             self.match_candidates.clear();
-            self.match_candidates
-                .extend(
-                    channel_store
-                        .ordered_channels()
-                        .enumerate()
-                        .map(|(ix, (_, channel))| StringMatchCandidate {
-                            id: ix,
-                            string: channel.name.clone().into(),
-                            char_bag: channel.name.chars().collect(),
-                        }),
-                );
-            let matches = executor.block(match_strings(
+            self.match_candidates.extend(
+                channel_store
+                    .ordered_channels()
+                    .enumerate()
+                    .map(|(ix, (_, channel))| StringMatchCandidate::new(ix, &channel.name)),
+            );
+            let mut channels = channel_store
+                .ordered_channels()
+                .map(|(_, chan)| chan)
+                .collect::<Vec<_>>();
+            let matches = fg_executor.block_on(match_strings(
                 &self.match_candidates,
                 &query,
+                true,
                 true,
                 usize::MAX,
                 &Default::default(),
                 executor.clone(),
             ));
-            if let Some(state) = &self.channel_editing_state {
-                if matches!(state, ChannelEditingState::Create { location: None, .. }) {
-                    self.entries.push(ListEntry::ChannelEditor { depth: 0 });
-                }
+
+            let matches_by_id: HashMap<_, _> = matches
+                .iter()
+                .map(|mat| (channels[mat.candidate_id].id, mat.clone()))
+                .collect();
+
+            let channel_ids_of_matches_or_parents: HashSet<_> = matches
+                .iter()
+                .flat_map(|mat| {
+                    let match_channel = channels[mat.candidate_id];
+
+                    match_channel
+                        .parent_path
+                        .iter()
+                        .copied()
+                        .chain(Some(match_channel.id))
+                })
+                .collect();
+
+            channels.retain(|chan| channel_ids_of_matches_or_parents.contains(&chan.id));
+
+            if self.filter_active_channels {
+                let active_channel_ids_or_ancestors: HashSet<_> = channel_store
+                    .ordered_channels()
+                    .map(|(_, channel)| channel)
+                    .filter(|channel| !channel_store.channel_participants(channel.id).is_empty())
+                    .flat_map(|channel| channel.parent_path.iter().copied().chain(Some(channel.id)))
+                    .collect();
+                channels.retain(|channel| active_channel_ids_or_ancestors.contains(&channel.id));
             }
+
+            if let Some(state) = &self.channel_editing_state
+                && matches!(state, ChannelEditingState::Create { location: None, .. })
+            {
+                self.entries.push(ListEntry::ChannelEditor { depth: 0 });
+            }
+
+            let should_respect_collapse = query.is_empty() && !self.filter_active_channels;
             let mut collapse_depth = None;
-            for mat in matches {
-                let channel = channel_store.channel_at_index(mat.candidate_id).unwrap();
+
+            for (idx, channel) in channels.into_iter().enumerate() {
                 let depth = channel.parent_path.len();
 
-                if collapse_depth.is_none() && self.is_channel_collapsed(channel.id) {
-                    collapse_depth = Some(depth);
-                } else if let Some(collapsed_depth) = collapse_depth {
-                    if depth > collapsed_depth {
-                        continue;
-                    }
-                    if self.is_channel_collapsed(channel.id) {
+                if should_respect_collapse {
+                    if collapse_depth.is_none() && self.is_channel_collapsed(channel.id) {
                         collapse_depth = Some(depth);
-                    } else {
-                        collapse_depth = None;
+                    } else if let Some(collapsed_depth) = collapse_depth {
+                        if depth > collapsed_depth {
+                            continue;
+                        }
+                        if self.is_channel_collapsed(channel.id) {
+                            collapse_depth = Some(depth);
+                        } else {
+                            collapse_depth = None;
+                        }
                     }
                 }
 
                 let has_children = channel_store
-                    .channel_at_index(mat.candidate_id + 1)
-                    .map_or(false, |next_channel| {
-                        next_channel.parent_path.ends_with(&[channel.id])
-                    });
+                    .channel_at_index(idx + 1)
+                    .is_some_and(|next_channel| next_channel.parent_path.ends_with(&[channel.id]));
 
                 match &self.channel_editing_state {
                     Some(ChannelEditingState::Create {
@@ -577,6 +740,7 @@ impl CollabPanel {
                             channel: channel.clone(),
                             depth,
                             has_children: false,
+                            string_match: matches_by_id.get(&channel.id).map(|mat| (*mat).clone()),
                         });
                         self.entries
                             .push(ListEntry::ChannelEditor { depth: depth + 1 });
@@ -592,6 +756,7 @@ impl CollabPanel {
                             channel: channel.clone(),
                             depth,
                             has_children,
+                            string_match: matches_by_id.get(&channel.id).map(|mat| (*mat).clone()),
                         });
                     }
                 }
@@ -601,17 +766,16 @@ impl CollabPanel {
         let channel_invites = channel_store.channel_invitations();
         if !channel_invites.is_empty() {
             self.match_candidates.clear();
-            self.match_candidates
-                .extend(channel_invites.iter().enumerate().map(|(ix, channel)| {
-                    StringMatchCandidate {
-                        id: ix,
-                        string: channel.name.clone().into(),
-                        char_bag: channel.name.chars().collect(),
-                    }
-                }));
-            let matches = executor.block(match_strings(
+            self.match_candidates.extend(
+                channel_invites
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, channel)| StringMatchCandidate::new(ix, &channel.name)),
+            );
+            let matches = fg_executor.block_on(match_strings(
                 &self.match_candidates,
                 &query,
+                true,
                 true,
                 usize::MAX,
                 &Default::default(),
@@ -638,20 +802,16 @@ impl CollabPanel {
         let incoming = user_store.incoming_contact_requests();
         if !incoming.is_empty() {
             self.match_candidates.clear();
-            self.match_candidates
-                .extend(
-                    incoming
-                        .iter()
-                        .enumerate()
-                        .map(|(ix, user)| StringMatchCandidate {
-                            id: ix,
-                            string: user.github_login.clone(),
-                            char_bag: user.github_login.chars().collect(),
-                        }),
-                );
-            let matches = executor.block(match_strings(
+            self.match_candidates.extend(
+                incoming
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, user)| StringMatchCandidate::new(ix, &user.github_login)),
+            );
+            let matches = fg_executor.block_on(match_strings(
                 &self.match_candidates,
                 &query,
+                true,
                 true,
                 usize::MAX,
                 &Default::default(),
@@ -667,20 +827,16 @@ impl CollabPanel {
         let outgoing = user_store.outgoing_contact_requests();
         if !outgoing.is_empty() {
             self.match_candidates.clear();
-            self.match_candidates
-                .extend(
-                    outgoing
-                        .iter()
-                        .enumerate()
-                        .map(|(ix, user)| StringMatchCandidate {
-                            id: ix,
-                            string: user.github_login.clone(),
-                            char_bag: user.github_login.chars().collect(),
-                        }),
-                );
-            let matches = executor.block(match_strings(
+            self.match_candidates.extend(
+                outgoing
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, user)| StringMatchCandidate::new(ix, &user.github_login)),
+            );
+            let matches = fg_executor.block_on(match_strings(
                 &self.match_candidates,
                 &query,
+                true,
                 true,
                 usize::MAX,
                 &Default::default(),
@@ -704,25 +860,21 @@ impl CollabPanel {
         let contacts = user_store.contacts();
         if !contacts.is_empty() {
             self.match_candidates.clear();
-            self.match_candidates
-                .extend(
-                    contacts
-                        .iter()
-                        .enumerate()
-                        .map(|(ix, contact)| StringMatchCandidate {
-                            id: ix,
-                            string: contact.user.github_login.clone(),
-                            char_bag: contact.user.github_login.chars().collect(),
-                        }),
-                );
+            self.match_candidates.extend(
+                contacts
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, contact)| StringMatchCandidate::new(ix, &contact.user.github_login)),
+            );
 
-            let matches = executor.block(match_strings(
+            let matches = fg_executor.block_on(match_strings(
                 &self.match_candidates,
                 &query,
                 true,
+                true,
                 usize::MAX,
                 &Default::default(),
-                executor.clone(),
+                executor,
             ));
 
             let (online_contacts, offline_contacts) = matches
@@ -828,7 +980,7 @@ impl CollabPanel {
         is_pending: bool,
         role: proto::ChannelRole,
         is_selected: bool,
-        cx: &mut ViewContext<Self>,
+        cx: &mut Context<Self>,
     ) -> ListItem {
         let user_id = user.id;
         let is_current_user =
@@ -839,17 +991,17 @@ impl CollabPanel {
             room.read(cx).local_participant().role == proto::ChannelRole::Admin
         });
 
-        ListItem::new(SharedString::from(user.github_login.clone()))
+        ListItem::new(user.github_login.clone())
             .start_slot(Avatar::new(user.avatar_uri.clone()))
-            .child(Label::new(user.github_login.clone()))
-            .selected(is_selected)
+            .child(render_participant_name_and_handle(user))
+            .toggle_state(is_selected)
             .end_slot(if is_pending {
                 Label::new("Calling").color(Color::Muted).into_any_element()
             } else if is_current_user {
                 IconButton::new("leave-call", IconName::Exit)
                     .style(ButtonStyle::Subtle)
-                    .on_click(move |_, cx| Self::leave_call(cx))
-                    .tooltip(|cx| Tooltip::text("Leave Call", cx))
+                    .on_click(move |_, window, cx| Self::leave_call(window, cx))
+                    .tooltip(Tooltip::text("Leave Call"))
                     .into_any_element()
             } else if role == proto::ChannelRole::Guest {
                 Label::new("Guest").color(Color::Muted).into_any_element()
@@ -864,17 +1016,25 @@ impl CollabPanel {
                 if role == proto::ChannelRole::Guest {
                     return el;
                 }
-                el.tooltip(move |cx| Tooltip::text(tooltip.clone(), cx))
-                    .on_click(cx.listener(move |this, _, cx| {
+                el.tooltip(Tooltip::text(tooltip.clone()))
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         this.workspace
-                            .update(cx, |workspace, cx| workspace.follow(peer_id, cx))
+                            .update(cx, |workspace, cx| workspace.follow(peer_id, window, cx))
                             .ok();
                     }))
             })
             .when(is_call_admin, |el| {
-                el.on_secondary_mouse_down(cx.listener(move |this, event: &MouseDownEvent, cx| {
-                    this.deploy_participant_context_menu(event.position, user_id, role, cx)
-                }))
+                el.on_secondary_mouse_down(cx.listener(
+                    move |this, event: &MouseDownEvent, window, cx| {
+                        this.deploy_participant_context_menu(
+                            event.position,
+                            user_id,
+                            role,
+                            window,
+                            cx,
+                        )
+                    },
+                ))
             })
     }
 
@@ -885,7 +1045,8 @@ impl CollabPanel {
         host_user_id: u64,
         is_last: bool,
         is_selected: bool,
-        cx: &mut ViewContext<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let project_name: SharedString = if worktree_root_names.is_empty() {
             "untitled".to_string()
@@ -895,24 +1056,29 @@ impl CollabPanel {
         .into();
 
         ListItem::new(project_id as usize)
-            .selected(is_selected)
-            .on_click(cx.listener(move |this, _, cx| {
+            .toggle_state(is_selected)
+            .on_click(cx.listener(move |this, _, window, cx| {
                 this.workspace
                     .update(cx, |workspace, cx| {
                         let app_state = workspace.app_state().clone();
                         workspace::join_in_room_project(project_id, host_user_id, app_state, cx)
-                            .detach_and_prompt_err("Failed to join project", cx, |_, _| None);
+                            .detach_and_prompt_err(
+                                "Failed to join project",
+                                window,
+                                cx,
+                                |_, _, _| None,
+                            );
                     })
                     .ok();
             }))
             .start_slot(
                 h_flex()
                     .gap_1()
-                    .child(render_tree_branch(is_last, false, cx))
+                    .child(render_tree_branch(is_last, false, window, cx))
                     .child(IconButton::new(0, IconName::Folder)),
             )
             .child(Label::new(project_name.clone()))
-            .tooltip(move |cx| Tooltip::text(format!("Open {}", project_name), cx))
+            .tooltip(Tooltip::text(format!("Open {}", project_name)))
     }
 
     fn render_participant_screen(
@@ -920,35 +1086,36 @@ impl CollabPanel {
         peer_id: Option<PeerId>,
         is_last: bool,
         is_selected: bool,
-        cx: &mut ViewContext<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let id = peer_id.map_or(usize::MAX, |id| id.as_u64() as usize);
 
         ListItem::new(("screen", id))
-            .selected(is_selected)
+            .toggle_state(is_selected)
             .start_slot(
                 h_flex()
                     .gap_1()
-                    .child(render_tree_branch(is_last, false, cx))
+                    .child(render_tree_branch(is_last, false, window, cx))
                     .child(IconButton::new(0, IconName::Screen)),
             )
             .child(Label::new("Screen"))
             .when_some(peer_id, |this, _| {
-                this.on_click(cx.listener(move |this, _, cx| {
+                this.on_click(cx.listener(move |this, _, window, cx| {
                     this.workspace
                         .update(cx, |workspace, cx| {
-                            workspace.open_shared_screen(peer_id.unwrap(), cx)
+                            workspace.open_shared_screen(peer_id.unwrap(), window, cx)
                         })
                         .ok();
                 }))
-                .tooltip(move |cx| Tooltip::text("Open shared screen", cx))
+                .tooltip(Tooltip::text("Open shared screen"))
             })
     }
 
-    fn take_editing_state(&mut self, cx: &mut ViewContext<Self>) -> bool {
+    fn take_editing_state(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if self.channel_editing_state.take().is_some() {
             self.channel_name_editor.update(cx, |editor, cx| {
-                editor.set_text("", cx);
+                editor.set_text("", window, cx);
             });
             true
         } else {
@@ -960,20 +1127,21 @@ impl CollabPanel {
         &self,
         channel_id: ChannelId,
         is_selected: bool,
-        cx: &mut ViewContext<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let channel_store = self.channel_store.read(cx);
         let has_channel_buffer_changed = channel_store.has_channel_buffer_changed(channel_id);
         ListItem::new("channel-notes")
-            .selected(is_selected)
-            .on_click(cx.listener(move |this, _, cx| {
-                this.open_channel_notes(channel_id, cx);
+            .toggle_state(is_selected)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_channel_notes(channel_id, window, cx);
             }))
             .start_slot(
                 h_flex()
                     .relative()
                     .gap_1()
-                    .child(render_tree_branch(false, true, cx))
+                    .child(render_tree_branch(false, true, window, cx))
                     .child(IconButton::new(0, IconName::File))
                     .children(has_channel_buffer_changed.then(|| {
                         div()
@@ -985,43 +1153,11 @@ impl CollabPanel {
                     })),
             )
             .child(Label::new("notes"))
-            .tooltip(move |cx| Tooltip::text("Open Channel Notes", cx))
-    }
-
-    fn render_channel_chat(
-        &self,
-        channel_id: ChannelId,
-        is_selected: bool,
-        cx: &mut ViewContext<Self>,
-    ) -> impl IntoElement {
-        let channel_store = self.channel_store.read(cx);
-        let has_messages_notification = channel_store.has_new_messages(channel_id);
-        ListItem::new("channel-chat")
-            .selected(is_selected)
-            .on_click(cx.listener(move |this, _, cx| {
-                this.join_channel_chat(channel_id, cx);
-            }))
-            .start_slot(
-                h_flex()
-                    .relative()
-                    .gap_1()
-                    .child(render_tree_branch(false, false, cx))
-                    .child(IconButton::new(0, IconName::MessageBubbles))
-                    .children(has_messages_notification.then(|| {
-                        div()
-                            .w_1p5()
-                            .absolute()
-                            .right(px(2.))
-                            .top(px(4.))
-                            .child(Indicator::dot().color(Color::Info))
-                    })),
-            )
-            .child(Label::new("chat"))
-            .tooltip(move |cx| Tooltip::text("Open Chat", cx))
+            .tooltip(Tooltip::text("Open Channel Notes"))
     }
 
     fn has_subchannels(&self, ix: usize) -> bool {
-        self.entries.get(ix).map_or(false, |entry| {
+        self.entries.get(ix).is_some_and(|entry| {
             if let ListEntry::Channel { has_children, .. } = entry {
                 *has_children
             } else {
@@ -1035,9 +1171,10 @@ impl CollabPanel {
         position: Point<Pixels>,
         user_id: u64,
         role: proto::ChannelRole,
-        cx: &mut ViewContext<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
-        let this = cx.view().clone();
+        let this = cx.entity();
         if !(role == proto::ChannelRole::Guest
             || role == proto::ChannelRole::Talker
             || role == proto::ChannelRole::Member)
@@ -1045,12 +1182,12 @@ impl CollabPanel {
             return;
         }
 
-        let context_menu = ContextMenu::build(cx, |mut context_menu, cx| {
+        let context_menu = ContextMenu::build(window, cx, |mut context_menu, window, _| {
             if role == proto::ChannelRole::Guest {
                 context_menu = context_menu.entry(
                     "Grant Mic Access",
                     None,
-                    cx.handler_for(&this, move |_, cx| {
+                    window.handler_for(&this, move |_, window, cx| {
                         ActiveCall::global(cx)
                             .update(cx, |call, cx| {
                                 let Some(room) = call.room() else {
@@ -1064,7 +1201,12 @@ impl CollabPanel {
                                     )
                                 })
                             })
-                            .detach_and_prompt_err("Failed to grant mic access", cx, |_, _| None)
+                            .detach_and_prompt_err(
+                                "Failed to grant mic access",
+                                window,
+                                cx,
+                                |_, _, _| None,
+                            )
                     }),
                 );
             }
@@ -1072,7 +1214,7 @@ impl CollabPanel {
                 context_menu = context_menu.entry(
                     "Grant Write Access",
                     None,
-                    cx.handler_for(&this, move |_, cx| {
+                    window.handler_for(&this, move |_, window, cx| {
                         ActiveCall::global(cx)
                             .update(cx, |call, cx| {
                                 let Some(room) = call.room() else {
@@ -1086,7 +1228,7 @@ impl CollabPanel {
                                     )
                                 })
                             })
-                            .detach_and_prompt_err("Failed to grant write access", cx, |e, _| {
+                            .detach_and_prompt_err("Failed to grant write access", window, cx, |e, _, _| {
                                 match e.error_code() {
                                     ErrorCode::NeedsCla => Some("This user has not yet signed the CLA at https://zed.dev/cla.".into()),
                                     _ => None,
@@ -1104,7 +1246,7 @@ impl CollabPanel {
                 context_menu = context_menu.entry(
                     label,
                     None,
-                    cx.handler_for(&this, move |_, cx| {
+                    window.handler_for(&this, move |_, window, cx| {
                         ActiveCall::global(cx)
                             .update(cx, |call, cx| {
                                 let Some(room) = call.room() else {
@@ -1118,7 +1260,12 @@ impl CollabPanel {
                                     )
                                 })
                             })
-                            .detach_and_prompt_err("Failed to revoke access", cx, |_, _| None)
+                            .detach_and_prompt_err(
+                                "Failed to revoke access",
+                                window,
+                                cx,
+                                |_, _, _| None,
+                            )
                     }),
                 );
             }
@@ -1126,17 +1273,20 @@ impl CollabPanel {
             context_menu
         });
 
-        cx.focus_view(&context_menu);
-        let subscription =
-            cx.subscribe(&context_menu, |this, _, _: &DismissEvent, cx| {
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe_in(
+            &context_menu,
+            window,
+            |this, _, _: &DismissEvent, window, cx| {
                 if this.context_menu.as_ref().is_some_and(|context_menu| {
-                    context_menu.0.focus_handle(cx).contains_focused(cx)
+                    context_menu.0.focus_handle(cx).contains_focused(window, cx)
                 }) {
-                    cx.focus_self();
+                    cx.focus_self(window);
                 }
                 this.context_menu.take();
                 cx.notify();
-            });
+            },
+        );
         self.context_menu = Some((context_menu, position, subscription));
     }
 
@@ -1145,7 +1295,8 @@ impl CollabPanel {
         position: Point<Pixels>,
         channel_id: ChannelId,
         ix: usize,
-        cx: &mut ViewContext<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         let clipboard_channel_name = self.channel_clipboard.as_ref().and_then(|clipboard| {
             self.channel_store
@@ -1153,9 +1304,9 @@ impl CollabPanel {
                 .channel_for_id(clipboard.channel_id)
                 .map(|channel| channel.name.clone())
         });
-        let this = cx.view().clone();
+        let this = cx.entity();
 
-        let context_menu = ContextMenu::build(cx, |mut context_menu, cx| {
+        let context_menu = ContextMenu::build(window, cx, |mut context_menu, window, cx| {
             if self.has_subchannels(ix) {
                 let expand_action_name = if self.is_channel_collapsed(channel_id) {
                     "Expand Subchannels"
@@ -1165,8 +1316,8 @@ impl CollabPanel {
                 context_menu = context_menu.entry(
                     expand_action_name,
                     None,
-                    cx.handler_for(&this, move |this, cx| {
-                        this.toggle_channel_collapsed(channel_id, cx)
+                    window.handler_for(&this, move |this, window, cx| {
+                        this.toggle_channel_collapsed(channel_id, window, cx)
                     }),
                 );
             }
@@ -1175,22 +1326,22 @@ impl CollabPanel {
                 .entry(
                     "Open Notes",
                     None,
-                    cx.handler_for(&this, move |this, cx| {
-                        this.open_channel_notes(channel_id, cx)
-                    }),
-                )
-                .entry(
-                    "Open Chat",
-                    None,
-                    cx.handler_for(&this, move |this, cx| {
-                        this.join_channel_chat(channel_id, cx)
+                    window.handler_for(&this, move |this, window, cx| {
+                        this.open_channel_notes(channel_id, window, cx)
                     }),
                 )
                 .entry(
                     "Copy Channel Link",
                     None,
-                    cx.handler_for(&this, move |this, cx| {
+                    window.handler_for(&this, move |this, _, cx| {
                         this.copy_channel_link(channel_id, cx)
+                    }),
+                )
+                .entry(
+                    "Copy Channel Notes Link",
+                    None,
+                    window.handler_for(&this, move |this, _, cx| {
+                        this.copy_channel_notes_link(channel_id, cx)
                     }),
                 );
 
@@ -1202,20 +1353,24 @@ impl CollabPanel {
                     .entry(
                         "New Subchannel",
                         None,
-                        cx.handler_for(&this, move |this, cx| this.new_subchannel(channel_id, cx)),
+                        window.handler_for(&this, move |this, window, cx| {
+                            this.new_subchannel(channel_id, window, cx)
+                        }),
                     )
                     .entry(
                         "Rename",
                         Some(Box::new(SecondaryConfirm)),
-                        cx.handler_for(&this, move |this, cx| this.rename_channel(channel_id, cx)),
+                        window.handler_for(&this, move |this, window, cx| {
+                            this.rename_channel(channel_id, window, cx)
+                        }),
                     );
 
                 if let Some(channel_name) = clipboard_channel_name {
                     context_menu = context_menu.separator().entry(
                         format!("Move '#{}' here", channel_name),
                         None,
-                        cx.handler_for(&this, move |this, cx| {
-                            this.move_channel_on_clipboard(channel_id, cx)
+                        window.handler_for(&this, move |this, window, cx| {
+                            this.move_channel_on_clipboard(channel_id, window, cx)
                         }),
                     );
                 }
@@ -1224,24 +1379,27 @@ impl CollabPanel {
                     context_menu = context_menu.separator().entry(
                         "Manage Members",
                         None,
-                        cx.handler_for(&this, move |this, cx| this.manage_members(channel_id, cx)),
+                        window.handler_for(&this, move |this, window, cx| {
+                            this.manage_members(channel_id, window, cx)
+                        }),
                     )
                 } else {
                     context_menu = context_menu.entry(
                         "Move this channel",
                         None,
-                        cx.handler_for(&this, move |this, cx| {
-                            this.start_move_channel(channel_id, cx)
+                        window.handler_for(&this, move |this, window, cx| {
+                            this.start_move_channel(channel_id, window, cx)
                         }),
                     );
                     if self.channel_store.read(cx).is_public_channel(channel_id) {
                         context_menu = context_menu.separator().entry(
                             "Make Channel Private",
                             None,
-                            cx.handler_for(&this, move |this, cx| {
+                            window.handler_for(&this, move |this, window, cx| {
                                 this.set_channel_visibility(
                                     channel_id,
                                     ChannelVisibility::Members,
+                                    window,
                                     cx,
                                 )
                             }),
@@ -1250,10 +1408,11 @@ impl CollabPanel {
                         context_menu = context_menu.separator().entry(
                             "Make Channel Public",
                             None,
-                            cx.handler_for(&this, move |this, cx| {
+                            window.handler_for(&this, move |this, window, cx| {
                                 this.set_channel_visibility(
                                     channel_id,
                                     ChannelVisibility::Public,
+                                    window,
                                     cx,
                                 )
                             }),
@@ -1264,7 +1423,9 @@ impl CollabPanel {
                 context_menu = context_menu.entry(
                     "Delete",
                     None,
-                    cx.handler_for(&this, move |this, cx| this.remove_channel(channel_id, cx)),
+                    window.handler_for(&this, move |this, window, cx| {
+                        this.remove_channel(channel_id, window, cx)
+                    }),
                 );
             }
 
@@ -1275,24 +1436,29 @@ impl CollabPanel {
                 context_menu = context_menu.entry(
                     "Leave Channel",
                     None,
-                    cx.handler_for(&this, move |this, cx| this.leave_channel(channel_id, cx)),
+                    window.handler_for(&this, move |this, window, cx| {
+                        this.leave_channel(channel_id, window, cx)
+                    }),
                 );
             }
 
             context_menu
         });
 
-        cx.focus_view(&context_menu);
-        let subscription =
-            cx.subscribe(&context_menu, |this, _, _: &DismissEvent, cx| {
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe_in(
+            &context_menu,
+            window,
+            |this, _, _: &DismissEvent, window, cx| {
                 if this.context_menu.as_ref().is_some_and(|context_menu| {
-                    context_menu.0.focus_handle(cx).contains_focused(cx)
+                    context_menu.0.focus_handle(cx).contains_focused(window, cx)
                 }) {
-                    cx.focus_self();
+                    cx.focus_self(window);
                 }
                 this.context_menu.take();
                 cx.notify();
-            });
+            },
+        );
         self.context_menu = Some((context_menu, position, subscription));
 
         cx.notify();
@@ -1302,12 +1468,13 @@ impl CollabPanel {
         &mut self,
         position: Point<Pixels>,
         contact: Arc<Contact>,
-        cx: &mut ViewContext<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
-        let this = cx.view().clone();
+        let this = cx.entity();
         let in_room = ActiveCall::global(cx).read(cx).room().is_some();
 
-        let context_menu = ContextMenu::build(cx, |mut context_menu, _| {
+        let context_menu = ContextMenu::build(window, cx, |mut context_menu, _, _| {
             let user_id = contact.user.id;
 
             if contact.online && !contact.busy {
@@ -1318,9 +1485,9 @@ impl CollabPanel {
                 };
                 context_menu = context_menu.entry(label, None, {
                     let this = this.clone();
-                    move |cx| {
+                    move |window, cx| {
                         this.update(cx, |this, cx| {
-                            this.call(user_id, cx);
+                            this.call(user_id, window, cx);
                         });
                     }
                 });
@@ -1328,34 +1495,42 @@ impl CollabPanel {
 
             context_menu.entry("Remove Contact", None, {
                 let this = this.clone();
-                move |cx| {
+                move |window, cx| {
                     this.update(cx, |this, cx| {
-                        this.remove_contact(contact.user.id, &contact.user.github_login, cx);
+                        this.remove_contact(
+                            contact.user.id,
+                            &contact.user.github_login,
+                            window,
+                            cx,
+                        );
                     });
                 }
             })
         });
 
-        cx.focus_view(&context_menu);
-        let subscription =
-            cx.subscribe(&context_menu, |this, _, _: &DismissEvent, cx| {
+        window.focus(&context_menu.focus_handle(cx), cx);
+        let subscription = cx.subscribe_in(
+            &context_menu,
+            window,
+            |this, _, _: &DismissEvent, window, cx| {
                 if this.context_menu.as_ref().is_some_and(|context_menu| {
-                    context_menu.0.focus_handle(cx).contains_focused(cx)
+                    context_menu.0.focus_handle(cx).contains_focused(window, cx)
                 }) {
-                    cx.focus_self();
+                    cx.focus_self(window);
                 }
                 this.context_menu.take();
                 cx.notify();
-            });
+            },
+        );
         self.context_menu = Some((context_menu, position, subscription));
 
         cx.notify();
     }
 
-    fn reset_filter_editor_text(&mut self, cx: &mut ViewContext<Self>) -> bool {
+    fn reset_filter_editor_text(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         self.filter_editor.update(cx, |editor, cx| {
-            if editor.buffer().read(cx).len(cx) > 0 {
-                editor.set_text("", cx);
+            if editor.buffer().read(cx).len(cx).0 > 0 {
+                editor.set_text("", window, cx);
                 true
             } else {
                 false
@@ -1363,11 +1538,13 @@ impl CollabPanel {
         })
     }
 
-    fn cancel(&mut self, _: &Cancel, cx: &mut ViewContext<Self>) {
-        if self.take_editing_state(cx) {
-            cx.focus_view(&self.filter_editor);
-        } else if !self.reset_filter_editor_text(cx) {
-            self.focus_handle.focus(cx);
+    fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if cx.stop_active_drag(window) {
+            return;
+        } else if self.take_editing_state(window, cx) {
+            window.focus(&self.filter_editor.focus_handle(cx), cx);
+        } else if !self.reset_filter_editor_text(window, cx) {
+            self.focus_handle.focus(window, cx);
         }
 
         if self.context_menu.is_some() {
@@ -1378,7 +1555,7 @@ impl CollabPanel {
         self.update_entries(false, cx);
     }
 
-    fn select_next(&mut self, _: &SelectNext, cx: &mut ViewContext<Self>) {
+    fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
         let ix = self.selection.map_or(0, |ix| ix + 1);
         if ix < self.entries.len() {
             self.selection = Some(ix);
@@ -1390,7 +1567,7 @@ impl CollabPanel {
         cx.notify();
     }
 
-    fn select_prev(&mut self, _: &SelectPrev, cx: &mut ViewContext<Self>) {
+    fn select_previous(&mut self, _: &SelectPrevious, _: &mut Window, cx: &mut Context<Self>) {
         let ix = self.selection.take().unwrap_or(0);
         if ix > 0 {
             self.selection = Some(ix - 1);
@@ -1402,115 +1579,112 @@ impl CollabPanel {
         cx.notify();
     }
 
-    fn confirm(&mut self, _: &Confirm, cx: &mut ViewContext<Self>) {
-        if self.confirm_channel_edit(cx) {
+    fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.confirm_channel_edit(window, cx) {
             return;
         }
 
-        if let Some(selection) = self.selection {
-            if let Some(entry) = self.entries.get(selection) {
-                match entry {
-                    ListEntry::Header(section) => match section {
-                        Section::ActiveCall => Self::leave_call(cx),
-                        Section::Channels => self.new_root_channel(cx),
-                        Section::Contacts => self.toggle_contact_finder(cx),
-                        Section::ContactRequests
-                        | Section::Online
-                        | Section::Offline
-                        | Section::ChannelInvites => {
-                            self.toggle_section_expanded(*section, cx);
-                        }
-                    },
-                    ListEntry::Contact { contact, calling } => {
-                        if contact.online && !contact.busy && !calling {
-                            self.call(contact.user.id, cx);
-                        }
+        if let Some(selection) = self.selection
+            && let Some(entry) = self.entries.get(selection)
+        {
+            match entry {
+                ListEntry::Header(section) => match section {
+                    Section::ActiveCall => Self::leave_call(window, cx),
+                    Section::Channels => self.new_root_channel(window, cx),
+                    Section::Contacts => self.toggle_contact_finder(window, cx),
+                    Section::ContactRequests
+                    | Section::Online
+                    | Section::Offline
+                    | Section::ChannelInvites => {
+                        self.toggle_section_expanded(*section, cx);
                     }
-                    ListEntry::ParticipantProject {
-                        project_id,
-                        host_user_id,
-                        ..
-                    } => {
-                        if let Some(workspace) = self.workspace.upgrade() {
-                            let app_state = workspace.read(cx).app_state().clone();
-                            workspace::join_in_room_project(
-                                *project_id,
-                                *host_user_id,
-                                app_state,
-                                cx,
-                            )
+                },
+                ListEntry::Contact { contact, calling } => {
+                    if contact.online && !contact.busy && !calling {
+                        self.call(contact.user.id, window, cx);
+                    }
+                }
+                ListEntry::ParticipantProject {
+                    project_id,
+                    host_user_id,
+                    ..
+                } => {
+                    if let Some(workspace) = self.workspace.upgrade() {
+                        let app_state = workspace.read(cx).app_state().clone();
+                        workspace::join_in_room_project(*project_id, *host_user_id, app_state, cx)
                             .detach_and_prompt_err(
                                 "Failed to join project",
+                                window,
                                 cx,
-                                |_, _| None,
+                                |_, _, _| None,
                             );
-                        }
                     }
-                    ListEntry::ParticipantScreen { peer_id, .. } => {
-                        let Some(peer_id) = peer_id else {
-                            return;
-                        };
-                        if let Some(workspace) = self.workspace.upgrade() {
-                            workspace.update(cx, |workspace, cx| {
-                                workspace.open_shared_screen(*peer_id, cx)
-                            });
-                        }
-                    }
-                    ListEntry::Channel { channel, .. } => {
-                        let is_active = maybe!({
-                            let call_channel = ActiveCall::global(cx)
-                                .read(cx)
-                                .room()?
-                                .read(cx)
-                                .channel_id()?;
-
-                            Some(call_channel == channel.id)
-                        })
-                        .unwrap_or(false);
-                        if is_active {
-                            self.open_channel_notes(channel.id, cx)
-                        } else {
-                            self.join_channel(channel.id, cx)
-                        }
-                    }
-                    ListEntry::ContactPlaceholder => self.toggle_contact_finder(cx),
-                    ListEntry::CallParticipant { user, peer_id, .. } => {
-                        if Some(user) == self.user_store.read(cx).current_user().as_ref() {
-                            Self::leave_call(cx);
-                        } else if let Some(peer_id) = peer_id {
-                            self.workspace
-                                .update(cx, |workspace, cx| workspace.follow(*peer_id, cx))
-                                .ok();
-                        }
-                    }
-                    ListEntry::IncomingRequest(user) => {
-                        self.respond_to_contact_request(user.id, true, cx)
-                    }
-                    ListEntry::ChannelInvite(channel) => {
-                        self.respond_to_channel_invite(channel.id, true, cx)
-                    }
-                    ListEntry::ChannelNotes { channel_id } => {
-                        self.open_channel_notes(*channel_id, cx)
-                    }
-                    ListEntry::ChannelChat { channel_id } => {
-                        self.join_channel_chat(*channel_id, cx)
-                    }
-                    ListEntry::OutgoingRequest(_) => {}
-                    ListEntry::ChannelEditor { .. } => {}
                 }
+                ListEntry::ParticipantScreen { peer_id, .. } => {
+                    let Some(peer_id) = peer_id else {
+                        return;
+                    };
+                    if let Some(workspace) = self.workspace.upgrade() {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.open_shared_screen(*peer_id, window, cx)
+                        });
+                    }
+                }
+                ListEntry::Channel { channel, .. } => {
+                    let is_active = maybe!({
+                        let call_channel = ActiveCall::global(cx)
+                            .read(cx)
+                            .room()?
+                            .read(cx)
+                            .channel_id()?;
+
+                        Some(call_channel == channel.id)
+                    })
+                    .unwrap_or(false);
+                    if is_active {
+                        self.open_channel_notes(channel.id, window, cx)
+                    } else {
+                        self.join_channel(channel.id, window, cx)
+                    }
+                }
+                ListEntry::ContactPlaceholder => self.toggle_contact_finder(window, cx),
+                ListEntry::CallParticipant { user, peer_id, .. } => {
+                    if Some(user) == self.user_store.read(cx).current_user().as_ref() {
+                        Self::leave_call(window, cx);
+                    } else if let Some(peer_id) = peer_id {
+                        self.workspace
+                            .update(cx, |workspace, cx| workspace.follow(*peer_id, window, cx))
+                            .ok();
+                    }
+                }
+                ListEntry::IncomingRequest(user) => {
+                    self.respond_to_contact_request(user.id, true, window, cx)
+                }
+                ListEntry::ChannelInvite(channel) => {
+                    self.respond_to_channel_invite(channel.id, true, cx)
+                }
+                ListEntry::ChannelNotes { channel_id } => {
+                    self.open_channel_notes(*channel_id, window, cx)
+                }
+                ListEntry::OutgoingRequest(_) => {}
+                ListEntry::ChannelEditor { .. } => {}
             }
         }
     }
 
-    fn insert_space(&mut self, _: &InsertSpace, cx: &mut ViewContext<Self>) {
+    fn insert_space(&mut self, _: &InsertSpace, window: &mut Window, cx: &mut Context<Self>) {
         if self.channel_editing_state.is_some() {
             self.channel_name_editor.update(cx, |editor, cx| {
-                editor.insert(" ", cx);
+                editor.insert(" ", window, cx);
+            });
+        } else if self.filter_editor.focus_handle(cx).is_focused(window) {
+            self.filter_editor.update(cx, |editor, cx| {
+                editor.insert(" ", window, cx);
             });
         }
     }
 
-    fn confirm_channel_edit(&mut self, cx: &mut ViewContext<CollabPanel>) -> bool {
+    fn confirm_channel_edit(&mut self, window: &mut Window, cx: &mut Context<CollabPanel>) -> bool {
         if let Some(editing_state) = &mut self.channel_editing_state {
             match editing_state {
                 ChannelEditingState::Create {
@@ -1529,23 +1703,30 @@ impl CollabPanel {
                         channel_store.create_channel(&channel_name, *location, cx)
                     });
                     if location.is_none() {
-                        cx.spawn(|this, mut cx| async move {
+                        cx.spawn_in(window, async move |this, cx| {
                             let channel_id = create.await?;
-                            this.update(&mut cx, |this, cx| {
+                            this.update_in(cx, |this, window, cx| {
                                 this.show_channel_modal(
                                     channel_id,
                                     channel_modal::Mode::InviteMembers,
+                                    window,
                                     cx,
                                 )
                             })
                         })
                         .detach_and_prompt_err(
                             "Failed to create channel",
+                            window,
                             cx,
-                            |_, _| None,
+                            |_, _, _| None,
                         );
                     } else {
-                        create.detach_and_prompt_err("Failed to create channel", cx, |_, _| None);
+                        create.detach_and_prompt_err(
+                            "Failed to create channel",
+                            window,
+                            cx,
+                            |_, _, _| None,
+                        );
                     }
                     cx.notify();
                 }
@@ -1567,14 +1748,14 @@ impl CollabPanel {
                     cx.notify();
                 }
             }
-            cx.focus_self();
+            cx.focus_self(window);
             true
         } else {
             false
         }
     }
 
-    fn toggle_section_expanded(&mut self, section: Section, cx: &mut ViewContext<Self>) {
+    fn toggle_section_expanded(&mut self, section: Section, cx: &mut Context<Self>) {
         if let Some(ix) = self.collapsed_sections.iter().position(|s| *s == section) {
             self.collapsed_sections.remove(ix);
         } else {
@@ -1586,7 +1767,8 @@ impl CollabPanel {
     fn collapse_selected_channel(
         &mut self,
         _: &CollapseSelectedChannel,
-        cx: &mut ViewContext<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         let Some(channel_id) = self.selected_channel().map(|channel| channel.id) else {
             return;
@@ -1596,10 +1778,15 @@ impl CollabPanel {
             return;
         }
 
-        self.toggle_channel_collapsed(channel_id, cx);
+        self.toggle_channel_collapsed(channel_id, window, cx);
     }
 
-    fn expand_selected_channel(&mut self, _: &ExpandSelectedChannel, cx: &mut ViewContext<Self>) {
+    fn expand_selected_channel(
+        &mut self,
+        _: &ExpandSelectedChannel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(id) = self.selected_channel().map(|channel| channel.id) else {
             return;
         };
@@ -1608,10 +1795,15 @@ impl CollabPanel {
             return;
         }
 
-        self.toggle_channel_collapsed(id, cx)
+        self.toggle_channel_collapsed(id, window, cx)
     }
 
-    fn toggle_channel_collapsed(&mut self, channel_id: ChannelId, cx: &mut ViewContext<Self>) {
+    fn toggle_channel_collapsed(
+        &mut self,
+        channel_id: ChannelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match self.collapsed_channels.binary_search(&channel_id) {
             Ok(ix) => {
                 self.collapsed_channels.remove(ix);
@@ -1623,50 +1815,55 @@ impl CollabPanel {
         self.serialize(cx);
         self.update_entries(true, cx);
         cx.notify();
-        cx.focus_self();
+        cx.focus_self(window);
     }
 
     fn is_channel_collapsed(&self, channel_id: ChannelId) -> bool {
         self.collapsed_channels.binary_search(&channel_id).is_ok()
     }
 
-    fn leave_call(cx: &mut WindowContext) {
+    fn leave_call(window: &mut Window, cx: &mut App) {
         ActiveCall::global(cx)
             .update(cx, |call, cx| call.hang_up(cx))
-            .detach_and_prompt_err("Failed to hang up", cx, |_, _| None);
+            .detach_and_prompt_err("Failed to hang up", window, cx, |_, _, _| None);
     }
 
-    fn toggle_contact_finder(&mut self, cx: &mut ViewContext<Self>) {
+    fn toggle_contact_finder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(workspace) = self.workspace.upgrade() {
             workspace.update(cx, |workspace, cx| {
-                workspace.toggle_modal(cx, |cx| {
-                    let mut finder = ContactFinder::new(self.user_store.clone(), cx);
-                    finder.set_query(self.filter_editor.read(cx).text(cx), cx);
+                workspace.toggle_modal(window, cx, |window, cx| {
+                    let mut finder = ContactFinder::new(self.user_store.clone(), window, cx);
+                    finder.set_query(self.filter_editor.read(cx).text(cx), window, cx);
                     finder
                 });
             });
         }
     }
 
-    fn new_root_channel(&mut self, cx: &mut ViewContext<Self>) {
+    fn new_root_channel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.channel_editing_state = Some(ChannelEditingState::Create {
             location: None,
             pending_name: None,
         });
         self.update_entries(false, cx);
         self.select_channel_editor();
-        cx.focus_view(&self.channel_name_editor);
+        window.focus(&self.channel_name_editor.focus_handle(cx), cx);
         cx.notify();
     }
 
     fn select_channel_editor(&mut self) {
-        self.selection = self.entries.iter().position(|entry| match entry {
-            ListEntry::ChannelEditor { .. } => true,
-            _ => false,
-        });
+        self.selection = self
+            .entries
+            .iter()
+            .position(|entry| matches!(entry, ListEntry::ChannelEditor { .. }));
     }
 
-    fn new_subchannel(&mut self, channel_id: ChannelId, cx: &mut ViewContext<Self>) {
+    fn new_subchannel(
+        &mut self,
+        channel_id: ChannelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.collapsed_channels
             .retain(|channel| *channel != channel_id);
         self.channel_editing_state = Some(ChannelEditingState::Create {
@@ -1675,27 +1872,42 @@ impl CollabPanel {
         });
         self.update_entries(false, cx);
         self.select_channel_editor();
-        cx.focus_view(&self.channel_name_editor);
+        window.focus(&self.channel_name_editor.focus_handle(cx), cx);
         cx.notify();
     }
 
-    fn manage_members(&mut self, channel_id: ChannelId, cx: &mut ViewContext<Self>) {
-        self.show_channel_modal(channel_id, channel_modal::Mode::ManageMembers, cx);
+    fn manage_members(
+        &mut self,
+        channel_id: ChannelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_channel_modal(channel_id, channel_modal::Mode::ManageMembers, window, cx);
     }
 
-    fn remove_selected_channel(&mut self, _: &Remove, cx: &mut ViewContext<Self>) {
+    fn remove_selected_channel(&mut self, _: &Remove, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(channel) = self.selected_channel() {
-            self.remove_channel(channel.id, cx)
+            self.remove_channel(channel.id, window, cx)
         }
     }
 
-    fn rename_selected_channel(&mut self, _: &SecondaryConfirm, cx: &mut ViewContext<Self>) {
+    fn rename_selected_channel(
+        &mut self,
+        _: &SecondaryConfirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(channel) = self.selected_channel() {
-            self.rename_channel(channel.id, cx);
+            self.rename_channel(channel.id, window, cx);
         }
     }
 
-    fn rename_channel(&mut self, channel_id: ChannelId, cx: &mut ViewContext<Self>) {
+    fn rename_channel(
+        &mut self,
+        channel_id: ChannelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let channel_store = self.channel_store.read(cx);
         if !channel_store.is_channel_admin(channel_id) {
             return;
@@ -1706,12 +1918,23 @@ impl CollabPanel {
                 pending_name: None,
             });
             self.channel_name_editor.update(cx, |editor, cx| {
-                editor.set_text(channel.name.clone(), cx);
-                editor.select_all(&Default::default(), cx);
+                editor.set_text(channel.name.clone(), window, cx);
+                editor.select_all(&Default::default(), window, cx);
             });
-            cx.focus_view(&self.channel_name_editor);
+            window.focus(&self.channel_name_editor.focus_handle(cx), cx);
             self.update_entries(false, cx);
             self.select_channel_editor();
+        }
+    }
+
+    fn open_selected_channel_notes(
+        &mut self,
+        _: &OpenSelectedChannelNotes,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(channel) = self.selected_channel() {
+            self.open_channel_notes(channel.id, window, cx);
         }
     }
 
@@ -1719,13 +1942,14 @@ impl CollabPanel {
         &mut self,
         channel_id: ChannelId,
         visibility: ChannelVisibility,
-        cx: &mut ViewContext<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         self.channel_store
             .update(cx, |channel_store, cx| {
                 channel_store.set_channel_visibility(channel_id, visibility, cx)
             })
-            .detach_and_prompt_err("Failed to set channel visibility", cx, |e, _| match e.error_code() {
+            .detach_and_prompt_err("Failed to set channel visibility", window, cx, |e, _, _| match e.error_code() {
                 ErrorCode::BadPublicNesting =>
                     if e.error_tag("direction") == Some("parent") {
                         Some("To make a channel public, its parent channel must be public.".to_string())
@@ -1736,50 +1960,108 @@ impl CollabPanel {
             });
     }
 
-    fn start_move_channel(&mut self, channel_id: ChannelId, _cx: &mut ViewContext<Self>) {
+    fn start_move_channel(
+        &mut self,
+        channel_id: ChannelId,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
         self.channel_clipboard = Some(ChannelMoveClipboard { channel_id });
     }
 
-    fn start_move_selected_channel(&mut self, _: &StartMoveChannel, cx: &mut ViewContext<Self>) {
+    fn start_move_selected_channel(
+        &mut self,
+        _: &StartMoveChannel,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(channel) = self.selected_channel() {
-            self.start_move_channel(channel.id, cx);
+            self.start_move_channel(channel.id, window, cx);
         }
     }
 
     fn move_channel_on_clipboard(
         &mut self,
         to_channel_id: ChannelId,
-        cx: &mut ViewContext<CollabPanel>,
+        window: &mut Window,
+        cx: &mut Context<CollabPanel>,
     ) {
         if let Some(clipboard) = self.channel_clipboard.take() {
-            self.move_channel(clipboard.channel_id, to_channel_id, cx)
+            self.move_channel(clipboard.channel_id, to_channel_id, window, cx)
         }
     }
 
-    fn move_channel(&self, channel_id: ChannelId, to: ChannelId, cx: &mut ViewContext<Self>) {
+    fn move_channel(
+        &self,
+        channel_id: ChannelId,
+        to: ChannelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.channel_store
             .update(cx, |channel_store, cx| {
                 channel_store.move_channel(channel_id, to, cx)
             })
-            .detach_and_prompt_err("Failed to move channel", cx, |e, _| match e.error_code() {
-                ErrorCode::BadPublicNesting => {
-                    Some("Public channels must have public parents".into())
+            .detach_and_prompt_err("Failed to move channel", window, cx, |e, _, _| {
+                match e.error_code() {
+                    ErrorCode::BadPublicNesting => {
+                        Some("Public channels must have public parents".into())
+                    }
+                    ErrorCode::CircularNesting => {
+                        Some("You cannot move a channel into itself".into())
+                    }
+                    ErrorCode::WrongMoveTarget => {
+                        Some("You cannot move a channel into a different root channel".into())
+                    }
+                    _ => None,
                 }
-                ErrorCode::CircularNesting => Some("You cannot move a channel into itself".into()),
-                ErrorCode::WrongMoveTarget => {
-                    Some("You cannot move a channel into a different root channel".into())
-                }
-                _ => None,
             })
     }
 
-    fn open_channel_notes(&mut self, channel_id: ChannelId, cx: &mut ViewContext<Self>) {
-        if let Some(workspace) = self.workspace.upgrade() {
-            ChannelView::open(channel_id, None, workspace, cx).detach();
+    fn move_channel_up(&mut self, _: &MoveChannelUp, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(channel) = self.selected_channel() {
+            self.channel_store.update(cx, |store, cx| {
+                store
+                    .reorder_channel(channel.id, proto::reorder_channel::Direction::Up, cx)
+                    .detach_and_prompt_err("Failed to move channel up", window, cx, |_, _, _| None)
+            });
         }
     }
 
-    fn show_inline_context_menu(&mut self, _: &menu::SecondaryConfirm, cx: &mut ViewContext<Self>) {
+    fn move_channel_down(
+        &mut self,
+        _: &MoveChannelDown,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(channel) = self.selected_channel() {
+            self.channel_store.update(cx, |store, cx| {
+                store
+                    .reorder_channel(channel.id, proto::reorder_channel::Direction::Down, cx)
+                    .detach_and_prompt_err("Failed to move channel down", window, cx, |_, _, _| {
+                        None
+                    })
+            });
+        }
+    }
+
+    fn open_channel_notes(
+        &mut self,
+        channel_id: ChannelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(workspace) = self.workspace.upgrade() {
+            ChannelView::open(channel_id, None, workspace, window, cx).detach();
+        }
+    }
+
+    fn show_inline_context_menu(
+        &mut self,
+        _: &Secondary,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(bounds) = self
             .selection
             .and_then(|ix| self.list_state.bounds_for_item(ix))
@@ -1792,6 +2074,7 @@ impl CollabPanel {
                 bounds.center(),
                 channel.id,
                 self.selection.unwrap(),
+                window,
                 cx,
             );
             cx.stop_propagation();
@@ -1799,9 +2082,26 @@ impl CollabPanel {
         };
 
         if let Some(contact) = self.selected_contact() {
-            self.deploy_contact_context_menu(bounds.center(), contact, cx);
+            self.deploy_contact_context_menu(bounds.center(), contact, window, cx);
             cx.stop_propagation();
         }
+    }
+
+    fn dispatch_context(&self, window: &Window, cx: &Context<Self>) -> KeyContext {
+        let mut dispatch_context = KeyContext::new_with_defaults();
+        dispatch_context.add("CollabPanel");
+        dispatch_context.add("menu");
+
+        let identifier = if self.channel_name_editor.focus_handle(cx).is_focused(window)
+            || self.filter_editor.focus_handle(cx).is_focused(window)
+        {
+            "editing"
+        } else {
+            "not_editing"
+        };
+
+        dispatch_context.add(identifier);
+        dispatch_context
     }
 
     fn selected_channel(&self) -> Option<&Arc<Channel>> {
@@ -1826,20 +2126,22 @@ impl CollabPanel {
         &mut self,
         channel_id: ChannelId,
         mode: channel_modal::Mode,
-        cx: &mut ViewContext<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         let workspace = self.workspace.clone();
         let user_store = self.user_store.clone();
         let channel_store = self.channel_store.clone();
 
-        cx.spawn(|_, mut cx| async move {
-            workspace.update(&mut cx, |workspace, cx| {
-                workspace.toggle_modal(cx, |cx| {
+        cx.spawn_in(window, async move |_, cx| {
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.toggle_modal(window, cx, |window, cx| {
                     ChannelModal::new(
                         user_store.clone(),
                         channel_store.clone(),
                         channel_id,
                         mode,
+                        window,
                         cx,
                     )
                 });
@@ -1848,7 +2150,7 @@ impl CollabPanel {
         .detach();
     }
 
-    fn leave_channel(&self, channel_id: ChannelId, cx: &mut ViewContext<Self>) {
+    fn leave_channel(&self, channel_id: ChannelId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(user_id) = self.user_store.read(cx).current_user().map(|u| u.id) else {
             return;
         };
@@ -1856,46 +2158,55 @@ impl CollabPanel {
             return;
         };
         let prompt_message = format!("Are you sure you want to leave \"#{}\"?", channel.name);
-        let answer = cx.prompt(
+        let answer = window.prompt(
             PromptLevel::Warning,
             &prompt_message,
             None,
             &["Leave", "Cancel"],
+            cx,
         );
-        cx.spawn(|this, mut cx| async move {
+        cx.spawn_in(window, async move |this, cx| {
             if answer.await? != 0 {
                 return Ok(());
             }
-            this.update(&mut cx, |this, cx| {
+            this.update(cx, |this, cx| {
                 this.channel_store.update(cx, |channel_store, cx| {
                     channel_store.remove_member(channel_id, user_id, cx)
                 })
             })?
             .await
         })
-        .detach_and_prompt_err("Failed to leave channel", cx, |_, _| None)
+        .detach_and_prompt_err("Failed to leave channel", window, cx, |_, _, _| None)
     }
 
-    fn remove_channel(&mut self, channel_id: ChannelId, cx: &mut ViewContext<Self>) {
+    fn remove_channel(
+        &mut self,
+        channel_id: ChannelId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let channel_store = self.channel_store.clone();
         if let Some(channel) = channel_store.read(cx).channel_for_id(channel_id) {
             let prompt_message = format!(
                 "Are you sure you want to remove the channel \"{}\"?",
                 channel.name
             );
-            let answer = cx.prompt(
+            let answer = window.prompt(
                 PromptLevel::Warning,
                 &prompt_message,
                 None,
                 &["Remove", "Cancel"],
+                cx,
             );
-            cx.spawn(|this, mut cx| async move {
+            let workspace = self.workspace.clone();
+            cx.spawn_in(window, async move |this, mut cx| {
                 if answer.await? == 0 {
                     channel_store
-                        .update(&mut cx, |channels, _| channels.remove_channel(channel_id))?
+                        .update(cx, |channels, _| channels.remove_channel(channel_id))
                         .await
-                        .notify_async_err(&mut cx);
-                    this.update(&mut cx, |_, cx| cx.focus_self()).ok();
+                        .notify_workspace_async_err(workspace, &mut cx);
+                    this.update_in(cx, |_, window, cx| cx.focus_self(window))
+                        .ok();
                 }
                 anyhow::Ok(())
             })
@@ -1903,48 +2214,62 @@ impl CollabPanel {
         }
     }
 
-    fn remove_contact(&mut self, user_id: u64, github_login: &str, cx: &mut ViewContext<Self>) {
+    fn remove_contact(
+        &mut self,
+        user_id: u64,
+        github_login: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let user_store = self.user_store.clone();
         let prompt_message = format!(
             "Are you sure you want to remove \"{}\" from your contacts?",
             github_login
         );
-        let answer = cx.prompt(
+        let answer = window.prompt(
             PromptLevel::Warning,
             &prompt_message,
             None,
             &["Remove", "Cancel"],
+            cx,
         );
-        cx.spawn(|_, mut cx| async move {
+        let workspace = self.workspace.clone();
+        cx.spawn_in(window, async move |_, mut cx| {
             if answer.await? == 0 {
                 user_store
-                    .update(&mut cx, |store, cx| store.remove_contact(user_id, cx))?
+                    .update(cx, |store, cx| store.remove_contact(user_id, cx))
                     .await
-                    .notify_async_err(&mut cx);
+                    .notify_workspace_async_err(workspace, &mut cx);
             }
             anyhow::Ok(())
         })
-        .detach_and_prompt_err("Failed to remove contact", cx, |_, _| None);
+        .detach_and_prompt_err("Failed to remove contact", window, cx, |_, _, _| None);
     }
 
     fn respond_to_contact_request(
         &mut self,
         user_id: u64,
         accept: bool,
-        cx: &mut ViewContext<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         self.user_store
             .update(cx, |store, cx| {
                 store.respond_to_contact_request(user_id, accept, cx)
             })
-            .detach_and_prompt_err("Failed to respond to contact request", cx, |_, _| None);
+            .detach_and_prompt_err(
+                "Failed to respond to contact request",
+                window,
+                cx,
+                |_, _, _| None,
+            );
     }
 
     fn respond_to_channel_invite(
         &mut self,
         channel_id: ChannelId,
         accept: bool,
-        cx: &mut ViewContext<Self>,
+        cx: &mut Context<Self>,
     ) {
         self.channel_store
             .update(cx, |store, cx| {
@@ -1953,48 +2278,33 @@ impl CollabPanel {
             .detach();
     }
 
-    fn call(&mut self, recipient_user_id: u64, cx: &mut ViewContext<Self>) {
+    fn call(&mut self, recipient_user_id: u64, window: &mut Window, cx: &mut Context<Self>) {
         ActiveCall::global(cx)
             .update(cx, |call, cx| {
                 call.invite(recipient_user_id, Some(self.project.clone()), cx)
             })
-            .detach_and_prompt_err("Call failed", cx, |_, _| None);
+            .detach_and_prompt_err("Call failed", window, cx, |_, _, _| None);
     }
 
-    fn join_channel(&self, channel_id: ChannelId, cx: &mut ViewContext<Self>) {
+    fn join_channel(&self, channel_id: ChannelId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
-        let Some(handle) = cx.window_handle().downcast::<Workspace>() else {
+
+        let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() else {
             return;
         };
         workspace::join_channel(
             channel_id,
             workspace.read(cx).app_state().clone(),
             Some(handle),
+            Some(self.workspace.clone()),
             cx,
         )
-        .detach_and_prompt_err("Failed to join channel", cx, |_, _| None)
+        .detach_and_prompt_err("Failed to join channel", window, cx, |_, _, _| None)
     }
 
-    fn join_channel_chat(&mut self, channel_id: ChannelId, cx: &mut ViewContext<Self>) {
-        let Some(workspace) = self.workspace.upgrade() else {
-            return;
-        };
-        cx.window_context().defer(move |cx| {
-            workspace.update(cx, |workspace, cx| {
-                if let Some(panel) = workspace.focus_panel::<ChatPanel>(cx) {
-                    panel.update(cx, |panel, cx| {
-                        panel
-                            .select_channel(channel_id, None, cx)
-                            .detach_and_notify_err(cx);
-                    });
-                }
-            });
-        });
-    }
-
-    fn copy_channel_link(&mut self, channel_id: ChannelId, cx: &mut ViewContext<Self>) {
+    fn copy_channel_link(&mut self, channel_id: ChannelId, cx: &mut Context<Self>) {
         let channel_store = self.channel_store.read(cx);
         let Some(channel) = channel_store.channel_for_id(channel_id) else {
             return;
@@ -2003,8 +2313,23 @@ impl CollabPanel {
         cx.write_to_clipboard(item)
     }
 
-    fn render_signed_out(&mut self, cx: &mut ViewContext<Self>) -> Div {
+    fn copy_channel_notes_link(&mut self, channel_id: ChannelId, cx: &mut Context<Self>) {
+        let channel_store = self.channel_store.read(cx);
+        let Some(channel) = channel_store.channel_for_id(channel_id) else {
+            return;
+        };
+        let item = ClipboardItem::new_string(channel.notes_link(None, cx));
+        cx.write_to_clipboard(item)
+    }
+
+    fn render_signed_out(&mut self, cx: &mut Context<Self>) -> Div {
         let collab_blurb = "Work with your team in realtime with collaborative editing, voice, shared notes and more.";
+        let is_signing_in = self.client.status().borrow().is_signing_in();
+        let button_label = if is_signing_in {
+            "Signing in…"
+        } else {
+            "Sign in"
+        };
 
         v_flex()
             .gap_6()
@@ -2014,25 +2339,28 @@ impl CollabPanel {
                 v_flex()
                     .gap_2()
                     .child(
-                        Button::new("sign_in", "Sign in")
+                        Button::new("sign_in", button_label)
                             .icon_color(Color::Muted)
                             .icon(IconName::Github)
                             .icon_position(IconPosition::Start)
                             .style(ButtonStyle::Filled)
                             .full_width()
-                            .on_click(cx.listener(|this, _, cx| {
+                            .disabled(is_signing_in)
+                            .on_click(cx.listener(|this, _, window, cx| {
                                 let client = this.client.clone();
-                                cx.spawn(|_, mut cx| async move {
+                                let workspace = this.workspace.clone();
+                                cx.spawn_in(window, async move |_, mut cx| {
                                     client
-                                        .authenticate_and_connect(true, &cx)
+                                        .connect(true, &mut cx)
                                         .await
-                                        .notify_async_err(&mut cx);
+                                        .into_response()
+                                        .notify_workspace_async_err(workspace, &mut cx);
                                 })
                                 .detach()
                             })),
                     )
                     .child(
-                        div().flex().w_full().items_center().child(
+                        v_flex().w_full().items_center().child(
                             Label::new("Sign in to enable collaboration.")
                                 .color(Color::Muted)
                                 .size(LabelSize::Small),
@@ -2041,7 +2369,12 @@ impl CollabPanel {
             )
     }
 
-    fn render_list_entry(&mut self, ix: usize, cx: &mut ViewContext<Self>) -> AnyElement {
+    fn render_list_entry(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let entry = &self.entries[ix];
 
         let is_selected = self.selection == Some(ix);
@@ -2067,12 +2400,21 @@ impl CollabPanel {
                 channel,
                 depth,
                 has_children,
+                string_match,
             } => self
-                .render_channel(channel, *depth, *has_children, is_selected, ix, cx)
+                .render_channel(
+                    channel,
+                    *depth,
+                    *has_children,
+                    is_selected,
+                    ix,
+                    string_match.as_ref(),
+                    cx,
+                )
                 .into_any_element(),
-            ListEntry::ChannelEditor { depth } => {
-                self.render_channel_editor(*depth, cx).into_any_element()
-            }
+            ListEntry::ChannelEditor { depth } => self
+                .render_channel_editor(*depth, window, cx)
+                .into_any_element(),
             ListEntry::ChannelInvite(channel) => self
                 .render_channel_invite(channel, is_selected, cx)
                 .into_any_element(),
@@ -2096,43 +2438,67 @@ impl CollabPanel {
                     *host_user_id,
                     *is_last,
                     is_selected,
+                    window,
                     cx,
                 )
                 .into_any_element(),
             ListEntry::ParticipantScreen { peer_id, is_last } => self
-                .render_participant_screen(*peer_id, *is_last, is_selected, cx)
+                .render_participant_screen(*peer_id, *is_last, is_selected, window, cx)
                 .into_any_element(),
             ListEntry::ChannelNotes { channel_id } => self
-                .render_channel_notes(*channel_id, is_selected, cx)
-                .into_any_element(),
-            ListEntry::ChannelChat { channel_id } => self
-                .render_channel_chat(*channel_id, is_selected, cx)
+                .render_channel_notes(*channel_id, is_selected, window, cx)
                 .into_any_element(),
         }
     }
 
-    fn render_signed_in(&mut self, cx: &mut ViewContext<Self>) -> Div {
+    fn render_signed_in(&mut self, _: &mut Window, cx: &mut Context<Self>) -> Div {
         self.channel_store.update(cx, |channel_store, _| {
             channel_store.initialize();
         });
+
+        let has_query = !self.filter_editor.read(cx).text(cx).is_empty();
+
         v_flex()
             .size_full()
-            .child(list(self.list_state.clone()).size_full())
+            .gap_1()
             .child(
-                v_flex()
-                    .child(div().mx_2().border_primary(cx).border_t_1())
+                h_flex()
+                    .p_2()
+                    .h(Tab::container_height(cx))
+                    .gap_1p5()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border)
                     .child(
-                        v_flex()
-                            .p_2()
-                            .child(self.render_filter_input(&self.filter_editor, cx)),
-                    ),
+                        Icon::new(IconName::MagnifyingGlass)
+                            .size(IconSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(self.render_filter_input(&self.filter_editor, cx))
+                    .when(has_query, |this| {
+                        this.pr_2p5().child(
+                            IconButton::new("clear_filter", IconName::Close)
+                                .shape(IconButtonShape::Square)
+                                .tooltip(Tooltip::text("Clear Filter"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.reset_filter_editor_text(window, cx);
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .child(
+                list(
+                    self.list_state.clone(),
+                    cx.processor(Self::render_list_entry),
+                )
+                .size_full(),
             )
     }
 
     fn render_filter_input(
         &self,
-        editor: &View<Editor>,
-        cx: &mut ViewContext<Self>,
+        editor: &Entity<Editor>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let settings = ThemeSettings::get_global(cx);
         let text_style = TextStyle {
@@ -2166,7 +2532,7 @@ impl CollabPanel {
         section: Section,
         is_selected: bool,
         is_collapsed: bool,
-        cx: &ViewContext<Self>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let mut channel_link = None;
         let mut channel_tooltip_text = None;
@@ -2208,30 +2574,49 @@ impl CollabPanel {
 
         let button = match section {
             Section::ActiveCall => channel_link.map(|channel_link| {
-                let channel_link_copy = channel_link.clone();
-                IconButton::new("channel-link", IconName::Copy)
-                    .icon_size(IconSize::Small)
-                    .size(ButtonSize::None)
+                CopyButton::new("copy-channel-link", channel_link)
                     .visible_on_hover("section-header")
-                    .on_click(move |_, cx| {
-                        let item = ClipboardItem::new_string(channel_link_copy.clone());
-                        cx.write_to_clipboard(item)
-                    })
-                    .tooltip(|cx| Tooltip::text("Copy channel link", cx))
+                    .tooltip_label("Copy Channel Link")
                     .into_any_element()
             }),
             Section::Contacts => Some(
                 IconButton::new("add-contact", IconName::Plus)
-                    .on_click(cx.listener(|this, _, cx| this.toggle_contact_finder(cx)))
-                    .tooltip(|cx| Tooltip::text("Search for new contact", cx))
+                    .on_click(
+                        cx.listener(|this, _, window, cx| this.toggle_contact_finder(window, cx)),
+                    )
+                    .tooltip(Tooltip::text("Search for new contact"))
                     .into_any_element(),
             ),
-            Section::Channels => Some(
-                IconButton::new("add-channel", IconName::Plus)
-                    .on_click(cx.listener(|this, _, cx| this.new_root_channel(cx)))
-                    .tooltip(|cx| Tooltip::text("Create a channel", cx))
-                    .into_any_element(),
-            ),
+            Section::Channels => {
+                Some(
+                    h_flex()
+                        .gap_1()
+                        .child(
+                            IconButton::new("filter-active-channels", IconName::ListFilter)
+                                .toggle_state(self.filter_active_channels)
+                                .when(!self.filter_active_channels, |button| {
+                                    button.visible_on_hover("section-header")
+                                })
+                                .on_click(cx.listener(|this, _, _window, cx| {
+                                    this.filter_active_channels = !this.filter_active_channels;
+                                    this.update_entries(true, cx);
+                                }))
+                                .tooltip(Tooltip::text(if self.filter_active_channels {
+                                    "Show All Channels"
+                                } else {
+                                    "Show Active Channels"
+                                })),
+                        )
+                        .child(
+                            IconButton::new("add-channel", IconName::Plus)
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.new_root_channel(window, cx)
+                                }))
+                                .tooltip(Tooltip::text("Create a channel")),
+                        )
+                        .into_any_element(),
+                )
+            }
             _ => None,
         };
 
@@ -2246,15 +2631,15 @@ impl CollabPanel {
         h_flex().w_full().group("section-header").child(
             ListHeader::new(text)
                 .when(can_collapse, |header| {
-                    header
-                        .toggle(Some(!is_collapsed))
-                        .on_toggle(cx.listener(move |this, _, cx| {
+                    header.toggle(Some(!is_collapsed)).on_toggle(cx.listener(
+                        move |this, _, _, cx| {
                             this.toggle_section_expanded(section, cx);
-                        }))
+                        },
+                    ))
                 })
                 .inset(true)
                 .end_slot::<AnyElement>(button)
-                .selected(is_selected),
+                .toggle_state(is_selected),
         )
     }
 
@@ -2263,20 +2648,20 @@ impl CollabPanel {
         contact: &Arc<Contact>,
         calling: bool,
         is_selected: bool,
-        cx: &mut ViewContext<Self>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let online = contact.online;
         let busy = contact.busy || calling;
-        let github_login = SharedString::from(contact.user.github_login.clone());
+        let github_login = contact.user.github_login.clone();
         let item = ListItem::new(github_login.clone())
             .indent_level(1)
             .indent_step_size(px(20.))
-            .selected(is_selected)
+            .toggle_state(is_selected)
             .child(
                 h_flex()
                     .w_full()
                     .justify_between()
-                    .child(Label::new(github_login.clone()))
+                    .child(render_participant_name_and_handle(&contact.user))
                     .when(calling, |el| {
                         el.child(Label::new("Calling").color(Color::Muted))
                     })
@@ -2287,10 +2672,11 @@ impl CollabPanel {
                                 .visible_on_hover("")
                                 .on_click(cx.listener({
                                     let contact = contact.clone();
-                                    move |this, event: &ClickEvent, cx| {
+                                    move |this, event: &ClickEvent, window, cx| {
                                         this.deploy_contact_context_menu(
-                                            event.down.position,
+                                            event.position(),
                                             contact.clone(),
+                                            window,
                                             cx,
                                         );
                                     }
@@ -2300,8 +2686,8 @@ impl CollabPanel {
             )
             .on_secondary_mouse_down(cx.listener({
                 let contact = contact.clone();
-                move |this, event: &MouseDownEvent, cx| {
-                    this.deploy_contact_context_menu(event.position, contact.clone(), cx);
+                move |this, event: &MouseDownEvent, window, cx| {
+                    this.deploy_contact_context_menu(event.position, contact.clone(), window, cx);
                 }
             }))
             .start_slot(
@@ -2309,8 +2695,8 @@ impl CollabPanel {
                 Avatar::new(contact.user.avatar_uri.clone())
                     .indicator::<AvatarAvailabilityIndicator>(if online {
                         Some(AvatarAvailabilityIndicator::new(match busy {
-                            true => ui::Availability::Busy,
-                            false => ui::Availability::Free,
+                            true => ui::CollaboratorAvailability::Busy,
+                            false => ui::CollaboratorAvailability::Free,
                         }))
                     } else {
                         None
@@ -2321,7 +2707,7 @@ impl CollabPanel {
             .id(github_login.clone())
             .group("")
             .child(item)
-            .tooltip(move |cx| {
+            .tooltip(move |_, cx| {
                 let text = if !online {
                     format!(" {} is offline", &github_login)
                 } else if busy {
@@ -2334,7 +2720,7 @@ impl CollabPanel {
                         format!("Call {}", &github_login)
                     }
                 };
-                Tooltip::text(text, cx)
+                Tooltip::simple(text, cx)
             })
     }
 
@@ -2343,9 +2729,9 @@ impl CollabPanel {
         user: &Arc<User>,
         is_incoming: bool,
         is_selected: bool,
-        cx: &mut ViewContext<Self>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let github_login = SharedString::from(user.github_login.clone());
+        let github_login = user.github_login.clone();
         let user_id = user.id;
         let is_response_pending = self.user_store.read(cx).is_contact_request_pending(user);
         let color = if is_response_pending {
@@ -2357,37 +2743,39 @@ impl CollabPanel {
         let controls = if is_incoming {
             vec![
                 IconButton::new("decline-contact", IconName::Close)
-                    .on_click(cx.listener(move |this, _, cx| {
-                        this.respond_to_contact_request(user_id, false, cx);
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.respond_to_contact_request(user_id, false, window, cx);
                     }))
                     .icon_color(color)
-                    .tooltip(|cx| Tooltip::text("Decline invite", cx)),
+                    .tooltip(Tooltip::text("Decline invite")),
                 IconButton::new("accept-contact", IconName::Check)
-                    .on_click(cx.listener(move |this, _, cx| {
-                        this.respond_to_contact_request(user_id, true, cx);
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.respond_to_contact_request(user_id, true, window, cx);
                     }))
                     .icon_color(color)
-                    .tooltip(|cx| Tooltip::text("Accept invite", cx)),
+                    .tooltip(Tooltip::text("Accept invite")),
             ]
         } else {
             let github_login = github_login.clone();
-            vec![IconButton::new("remove_contact", IconName::Close)
-                .on_click(cx.listener(move |this, _, cx| {
-                    this.remove_contact(user_id, &github_login, cx);
-                }))
-                .icon_color(color)
-                .tooltip(|cx| Tooltip::text("Cancel invite", cx))]
+            vec![
+                IconButton::new("remove_contact", IconName::Close)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.remove_contact(user_id, &github_login, window, cx);
+                    }))
+                    .icon_color(color)
+                    .tooltip(Tooltip::text("Cancel invite")),
+            ]
         };
 
         ListItem::new(github_login.clone())
             .indent_level(1)
             .indent_step_size(px(20.))
-            .selected(is_selected)
+            .toggle_state(is_selected)
             .child(
                 h_flex()
                     .w_full()
                     .justify_between()
-                    .child(Label::new(github_login.clone()))
+                    .child(Label::new(github_login))
                     .child(h_flex().children(controls)),
             )
             .start_slot(Avatar::new(user.avatar_uri.clone()))
@@ -2397,7 +2785,7 @@ impl CollabPanel {
         &self,
         channel: &Arc<Channel>,
         is_selected: bool,
-        cx: &mut ViewContext<Self>,
+        cx: &mut Context<Self>,
     ) -> ListItem {
         let channel_id = channel.id;
         let response_is_pending = self
@@ -2412,21 +2800,21 @@ impl CollabPanel {
 
         let controls = [
             IconButton::new("reject-invite", IconName::Close)
-                .on_click(cx.listener(move |this, _, cx| {
+                .on_click(cx.listener(move |this, _, _, cx| {
                     this.respond_to_channel_invite(channel_id, false, cx);
                 }))
                 .icon_color(color)
-                .tooltip(|cx| Tooltip::text("Decline invite", cx)),
+                .tooltip(Tooltip::text("Decline invite")),
             IconButton::new("accept-invite", IconName::Check)
-                .on_click(cx.listener(move |this, _, cx| {
+                .on_click(cx.listener(move |this, _, _, cx| {
                     this.respond_to_channel_invite(channel_id, true, cx);
                 }))
                 .icon_color(color)
-                .tooltip(|cx| Tooltip::text("Accept invite", cx)),
+                .tooltip(Tooltip::text("Accept invite")),
         ];
 
         ListItem::new(("channel-invite", channel.id.0 as usize))
-            .selected(is_selected)
+            .toggle_state(is_selected)
             .child(
                 h_flex()
                     .w_full()
@@ -2441,16 +2829,12 @@ impl CollabPanel {
             )
     }
 
-    fn render_contact_placeholder(
-        &self,
-        is_selected: bool,
-        cx: &mut ViewContext<Self>,
-    ) -> ListItem {
+    fn render_contact_placeholder(&self, is_selected: bool, cx: &mut Context<Self>) -> ListItem {
         ListItem::new("contact-placeholder")
             .child(Icon::new(IconName::Plus))
             .child(Label::new("Add a Contact"))
-            .selected(is_selected)
-            .on_click(cx.listener(|this, _, cx| this.toggle_contact_finder(cx)))
+            .toggle_state(is_selected)
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_contact_finder(window, cx)))
     }
 
     fn render_channel(
@@ -2460,7 +2844,8 @@ impl CollabPanel {
         has_children: bool,
         is_selected: bool,
         ix: usize,
-        cx: &mut ViewContext<Self>,
+        string_match: Option<&StringMatch>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let channel_id = channel.id;
 
@@ -2481,7 +2866,6 @@ impl CollabPanel {
         let disclosed =
             has_children.then(|| self.collapsed_channels.binary_search(&channel.id).is_err());
 
-        let has_messages_notification = channel_store.has_new_messages(channel_id);
         let has_notes_notification = channel_store.has_channel_buffer_changed(channel_id);
 
         const FACEPILE_LIMIT: usize = 3;
@@ -2521,15 +2905,15 @@ impl CollabPanel {
             .flex()
             .w_full()
             .when(!channel.is_root_channel(), |el| {
-                el.on_drag(channel.clone(), move |channel, cx| {
-                    cx.new_view(|_| DraggedChannelView {
+                el.on_drag(channel.clone(), move |channel, _, _, cx| {
+                    cx.new(|_| DraggedChannelView {
                         channel: channel.clone(),
                         width,
                     })
                 })
             })
             .drag_over::<Channel>({
-                move |style, dragged_channel: &Channel, cx| {
+                move |style, dragged_channel: &Channel, _window, cx| {
                     if dragged_channel.root_id() == root_id {
                         style.bg(cx.theme().colors().ghost_element_hover)
                     } else {
@@ -2537,34 +2921,40 @@ impl CollabPanel {
                     }
                 }
             })
-            .on_drop(cx.listener(move |this, dragged_channel: &Channel, cx| {
-                if dragged_channel.root_id() != root_id {
-                    return;
-                }
-                this.move_channel(dragged_channel.id, channel_id, cx);
-            }))
+            .on_drop(
+                cx.listener(move |this, dragged_channel: &Channel, window, cx| {
+                    if dragged_channel.root_id() != root_id {
+                        return;
+                    }
+                    this.move_channel(dragged_channel.id, channel_id, window, cx);
+                }),
+            )
             .child(
                 ListItem::new(channel_id.0 as usize)
                     // Add one level of depth for the disclosure arrow.
                     .indent_level(depth + 1)
                     .indent_step_size(px(20.))
-                    .selected(is_selected || is_active)
+                    .toggle_state(is_selected || is_active)
                     .toggle(disclosed)
-                    .on_toggle(
-                        cx.listener(move |this, _, cx| {
-                            this.toggle_channel_collapsed(channel_id, cx)
-                        }),
-                    )
-                    .on_click(cx.listener(move |this, _, cx| {
+                    .on_toggle(cx.listener(move |this, _, window, cx| {
+                        this.toggle_channel_collapsed(channel_id, window, cx)
+                    }))
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         if is_active {
-                            this.open_channel_notes(channel_id, cx)
+                            this.open_channel_notes(channel_id, window, cx)
                         } else {
-                            this.join_channel(channel_id, cx)
+                            this.join_channel(channel_id, window, cx)
                         }
                     }))
                     .on_secondary_mouse_down(cx.listener(
-                        move |this, event: &MouseDownEvent, cx| {
-                            this.deploy_channel_context_menu(event.position, channel_id, ix, cx)
+                        move |this, event: &MouseDownEvent, window, cx| {
+                            this.deploy_channel_context_menu(
+                                event.position,
+                                channel_id,
+                                ix,
+                                window,
+                                cx,
+                            )
                         },
                     ))
                     .start_slot(
@@ -2591,7 +2981,14 @@ impl CollabPanel {
                     .child(
                         h_flex()
                             .id(channel_id.0 as usize)
-                            .child(Label::new(channel.name.clone()))
+                            .child(match string_match {
+                                None => Label::new(channel.name.clone()).into_any_element(),
+                                Some(string_match) => HighlightedLabel::new(
+                                    channel.name.clone(),
+                                    string_match.positions.clone(),
+                                )
+                                .into_any_element(),
+                            })
                             .children(face_pile.map(|face_pile| face_pile.p_1())),
                     ),
             )
@@ -2599,26 +2996,12 @@ impl CollabPanel {
                 h_flex().absolute().right(rems(0.)).h_full().child(
                     h_flex()
                         .h_full()
+                        .bg(cx.theme().colors().background)
+                        .rounded_l_sm()
                         .gap_1()
                         .px_1()
                         .child(
-                            IconButton::new("channel_chat", IconName::MessageBubbles)
-                                .style(ButtonStyle::Filled)
-                                .shape(ui::IconButtonShape::Square)
-                                .icon_size(IconSize::Small)
-                                .icon_color(if has_messages_notification {
-                                    Color::Default
-                                } else {
-                                    Color::Muted
-                                })
-                                .on_click(cx.listener(move |this, _, cx| {
-                                    this.join_channel_chat(channel_id, cx)
-                                }))
-                                .tooltip(|cx| Tooltip::text("Open channel chat", cx))
-                                .visible_on_hover(""),
-                        )
-                        .child(
-                            IconButton::new("channel_notes", IconName::File)
+                            IconButton::new("channel_notes", IconName::Reader)
                                 .style(ButtonStyle::Filled)
                                 .shape(ui::IconButtonShape::Square)
                                 .icon_size(IconSize::Small)
@@ -2627,18 +3010,18 @@ impl CollabPanel {
                                 } else {
                                     Color::Muted
                                 })
-                                .on_click(cx.listener(move |this, _, cx| {
-                                    this.open_channel_notes(channel_id, cx)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_channel_notes(channel_id, window, cx)
                                 }))
-                                .tooltip(|cx| Tooltip::text("Open channel notes", cx))
-                                .visible_on_hover(""),
-                        ),
+                                .tooltip(Tooltip::text("Open channel notes")),
+                        )
+                        .visible_on_hover(""),
                 ),
             )
             .tooltip({
                 let channel_store = self.channel_store.clone();
-                move |cx| {
-                    cx.new_view(|_| JoinChannelTooltip {
+                move |_window, cx| {
+                    cx.new(|_| JoinChannelTooltip {
                         channel_store: channel_store.clone(),
                         channel_id,
                         has_notes_notification,
@@ -2648,7 +3031,12 @@ impl CollabPanel {
             })
     }
 
-    fn render_channel_editor(&self, depth: usize, _cx: &mut ViewContext<Self>) -> impl IntoElement {
+    fn render_channel_editor(
+        &self,
+        depth: usize,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let item = ListItem::new("channel-editor")
             .inset(false)
             // Add one level of depth for the disclosure arrow.
@@ -2672,22 +3060,27 @@ impl CollabPanel {
     }
 }
 
-fn render_tree_branch(is_last: bool, overdraw: bool, cx: &mut WindowContext) -> impl IntoElement {
-    let rem_size = cx.rem_size();
-    let line_height = cx.text_style().line_height_in_pixels(rem_size);
+fn render_tree_branch(
+    is_last: bool,
+    overdraw: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> impl IntoElement {
+    let rem_size = window.rem_size();
+    let line_height = window.text_style().line_height_in_pixels(rem_size);
     let width = rem_size * 1.5;
     let thickness = px(1.);
     let color = cx.theme().colors().text;
 
     canvas(
-        |_, _| {},
-        move |bounds, _, cx| {
+        |_, _, _| {},
+        move |bounds, _, window, _| {
             let start_x = (bounds.left() + bounds.right() - thickness) / 2.;
             let start_y = (bounds.top() + bounds.bottom() - thickness) / 2.;
             let right = bounds.right();
             let top = bounds.top();
 
-            cx.paint_quad(fill(
+            window.paint_quad(fill(
                 Bounds::from_corners(
                     point(start_x, top),
                     point(
@@ -2701,7 +3094,7 @@ fn render_tree_branch(is_last: bool, overdraw: bool, cx: &mut WindowContext) -> 
                 ),
                 color,
             ));
-            cx.paint_quad(fill(
+            window.paint_quad(fill(
                 Bounds::from_corners(point(start_x, start_y), point(right, start_y + thickness)),
                 color,
             ));
@@ -2711,33 +3104,46 @@ fn render_tree_branch(is_last: bool, overdraw: bool, cx: &mut WindowContext) -> 
     .h(line_height)
 }
 
+fn render_participant_name_and_handle(user: &User) -> impl IntoElement {
+    Label::new(if let Some(ref display_name) = user.name {
+        format!("{display_name} ({})", user.github_login)
+    } else {
+        user.github_login.to_string()
+    })
+}
+
 impl Render for CollabPanel {
-    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let status = *self.client.status().borrow();
+
         v_flex()
-            .key_context("CollabPanel")
+            .key_context(self.dispatch_context(window, cx))
             .on_action(cx.listener(CollabPanel::cancel))
             .on_action(cx.listener(CollabPanel::select_next))
-            .on_action(cx.listener(CollabPanel::select_prev))
+            .on_action(cx.listener(CollabPanel::select_previous))
             .on_action(cx.listener(CollabPanel::confirm))
             .on_action(cx.listener(CollabPanel::insert_space))
             .on_action(cx.listener(CollabPanel::remove_selected_channel))
             .on_action(cx.listener(CollabPanel::show_inline_context_menu))
             .on_action(cx.listener(CollabPanel::rename_selected_channel))
+            .on_action(cx.listener(CollabPanel::open_selected_channel_notes))
             .on_action(cx.listener(CollabPanel::collapse_selected_channel))
             .on_action(cx.listener(CollabPanel::expand_selected_channel))
             .on_action(cx.listener(CollabPanel::start_move_selected_channel))
-            .track_focus(&self.focus_handle(cx))
+            .on_action(cx.listener(CollabPanel::move_channel_up))
+            .on_action(cx.listener(CollabPanel::move_channel_down))
+            .track_focus(&self.focus_handle)
             .size_full()
-            .child(if self.user_store.read(cx).current_user().is_none() {
+            .child(if !status.is_or_was_connected() || status.is_signing_in() {
                 self.render_signed_out(cx)
             } else {
-                self.render_signed_in(cx)
+                self.render_signed_in(window, cx)
             })
             .children(self.context_menu.as_ref().map(|(menu, position, _)| {
                 deferred(
                     anchored()
                         .position(*position)
-                        .anchor(gpui::AnchorCorner::TopLeft)
+                        .anchor(gpui::Corner::TopLeft)
                         .child(menu.clone()),
                 )
                 .with_priority(1)
@@ -2748,7 +3154,7 @@ impl Render for CollabPanel {
 impl EventEmitter<PanelEvent> for CollabPanel {}
 
 impl Panel for CollabPanel {
-    fn position(&self, cx: &gpui::WindowContext) -> DockPosition {
+    fn position(&self, _window: &Window, cx: &App) -> DockPosition {
         CollaborationPanelSettings::get_global(cx).dock
     }
 
@@ -2756,32 +3162,37 @@ impl Panel for CollabPanel {
         matches!(position, DockPosition::Left | DockPosition::Right)
     }
 
-    fn set_position(&mut self, position: DockPosition, cx: &mut ViewContext<Self>) {
-        settings::update_settings_file::<CollaborationPanelSettings>(
-            self.fs.clone(),
-            cx,
-            move |settings, _| settings.dock = Some(position),
-        );
+    fn set_position(
+        &mut self,
+        position: DockPosition,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        settings::update_settings_file(self.fs.clone(), cx, move |settings, _| {
+            settings.collaboration_panel.get_or_insert_default().dock = Some(position.into())
+        });
     }
 
-    fn size(&self, cx: &gpui::WindowContext) -> Pixels {
+    fn size(&self, _window: &Window, cx: &App) -> Pixels {
         self.width
             .unwrap_or_else(|| CollaborationPanelSettings::get_global(cx).default_width)
     }
 
-    fn set_size(&mut self, size: Option<Pixels>, cx: &mut ViewContext<Self>) {
+    fn set_size(&mut self, size: Option<Pixels>, window: &mut Window, cx: &mut Context<Self>) {
         self.width = size;
-        self.serialize(cx);
         cx.notify();
+        cx.defer_in(window, |this, _, cx| {
+            this.serialize(cx);
+        });
     }
 
-    fn icon(&self, cx: &gpui::WindowContext) -> Option<ui::IconName> {
+    fn icon(&self, _window: &Window, cx: &App) -> Option<ui::IconName> {
         CollaborationPanelSettings::get_global(cx)
             .button
             .then_some(ui::IconName::UserGroup)
     }
 
-    fn icon_tooltip(&self, _cx: &WindowContext) -> Option<&'static str> {
+    fn icon_tooltip(&self, _window: &Window, _cx: &App) -> Option<&'static str> {
         Some("Collab Panel")
     }
 
@@ -2792,11 +3203,19 @@ impl Panel for CollabPanel {
     fn persistent_name() -> &'static str {
         "CollabPanel"
     }
+
+    fn panel_key() -> &'static str {
+        COLLABORATION_PANEL_KEY
+    }
+
+    fn activation_priority(&self) -> u32 {
+        6
+    }
 }
 
-impl FocusableView for CollabPanel {
-    fn focus_handle(&self, cx: &AppContext) -> gpui::FocusHandle {
-        self.filter_editor.focus_handle(cx).clone()
+impl Focusable for CollabPanel {
+    fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
+        self.filter_editor.focus_handle(cx)
     }
 }
 
@@ -2853,14 +3272,6 @@ impl PartialEq for ListEntry {
                     return channel_id == other_id;
                 }
             }
-            ListEntry::ChannelChat { channel_id } => {
-                if let ListEntry::ChannelChat {
-                    channel_id: other_id,
-                } = other
-                {
-                    return channel_id == other_id;
-                }
-            }
             ListEntry::ChannelInvite(channel_1) => {
                 if let ListEntry::ChannelInvite(channel_2) = other {
                     return channel_1.id == channel_2.id;
@@ -2907,7 +3318,7 @@ struct DraggedChannelView {
 }
 
 impl Render for DraggedChannelView {
-    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let ui_font = ThemeSettings::get_global(cx).ui_font.family.clone();
         h_flex()
             .font_family(ui_font)
@@ -2931,14 +3342,14 @@ impl Render for DraggedChannelView {
 }
 
 struct JoinChannelTooltip {
-    channel_store: Model<ChannelStore>,
+    channel_store: Entity<ChannelStore>,
     channel_id: ChannelId,
     #[allow(unused)]
     has_notes_notification: bool,
 }
 
 impl Render for JoinChannelTooltip {
-    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         tooltip_container(cx, |container, cx| {
             let participants = self
                 .channel_store
@@ -2951,7 +3362,7 @@ impl Render for JoinChannelTooltip {
                     h_flex()
                         .gap_2()
                         .child(Avatar::new(participant.avatar_uri.clone()))
-                        .child(Label::new(participant.github_login.clone()))
+                        .child(render_participant_name_and_handle(participant))
                 }))
         })
     }

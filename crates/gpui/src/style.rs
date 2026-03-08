@@ -5,18 +5,16 @@ use std::{
 };
 
 use crate::{
-    black, phi, point, quad, rems, size, AbsoluteLength, Bounds, ContentMask, Corners,
+    AbsoluteLength, App, Background, BackgroundTag, BorderStyle, Bounds, ContentMask, Corners,
     CornersRefinement, CursorStyle, DefiniteLength, DevicePixels, Edges, EdgesRefinement, Font,
-    FontFallbacks, FontFeatures, FontStyle, FontWeight, Hsla, Length, Pixels, Point,
-    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, WindowContext,
+    FontFallbacks, FontFeatures, FontStyle, FontWeight, GridLocation, Hsla, Length, Pixels, Point,
+    PointRefinement, Rgba, SharedString, Size, SizeRefinement, Styled, TextRun, Window, black, phi,
+    point, quad, rems, size,
 };
 use collections::HashSet;
 use refineable::Refineable;
-use smallvec::SmallVec;
-pub use taffy::style::{
-    AlignContent, AlignItems, AlignSelf, Display, FlexDirection, FlexWrap, JustifyContent,
-    Overflow, Position,
-};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 
 /// Use this struct for interfacing with the 'debug_below' styling from your own elements.
 /// If a parent element has this style set on it, then this struct will be set as a global in
@@ -142,7 +140,7 @@ impl ObjectFit {
 
 /// The CSS styling that can be applied to an element via the `Styled` trait
 #[derive(Clone, Refineable, Debug)]
-#[refineable(Debug)]
+#[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Style {
     /// What layout strategy should be used?
     pub display: Display,
@@ -155,9 +153,31 @@ pub struct Style {
     #[refineable]
     pub overflow: Point<Overflow>,
     /// How much space (in points) should be reserved for the scrollbars of `Overflow::Scroll` and `Overflow::Auto` nodes.
-    pub scrollbar_width: f32,
+    pub scrollbar_width: AbsoluteLength,
     /// Whether both x and y axis should be scrollable at the same time.
     pub allow_concurrent_scroll: bool,
+    /// Whether scrolling should be restricted to the axis indicated by the mouse wheel.
+    ///
+    /// This means that:
+    /// - The mouse wheel alone will only ever scroll the Y axis.
+    /// - Holding `Shift` and using the mouse wheel will scroll the X axis.
+    ///
+    /// ## Motivation
+    ///
+    /// On the web when scrolling with the mouse wheel, scrolling up and down will always scroll the Y axis, even when
+    /// the mouse is over a horizontally-scrollable element.
+    ///
+    /// The only way to scroll horizontally is to hold down `Shift` while scrolling, which then changes the scroll axis
+    /// to the X axis.
+    ///
+    /// Currently, GPUI operates differently from the web in that it will scroll an element in either the X or Y axis
+    /// when scrolling with just the mouse wheel. This causes problems when scrolling in a vertical list that contains
+    /// horizontally-scrollable elements, as when you get to the horizontally-scrollable elements the scroll will be
+    /// hijacked.
+    ///
+    /// Ideally we would match the web's behavior and not have a need for this, but right now we're adding this opt-in
+    /// style property to limit the potential blast radius.
+    pub restrict_scroll_to_axis: bool,
 
     // Position properties
     /// What should the `position` value of this struct use as a base offset?
@@ -221,14 +241,18 @@ pub struct Style {
     /// The border color of this element
     pub border_color: Option<Hsla>,
 
+    /// The border style of this element
+    pub border_style: BorderStyle,
+
     /// The radius of the corners of this element
     #[refineable]
     pub corner_radii: Corners<AbsoluteLength>,
 
-    /// Box Shadow of the element
-    pub box_shadow: SmallVec<[BoxShadow; 2]>,
+    /// Box shadow of the element
+    pub box_shadow: Vec<BoxShadow>,
 
     /// The text style of this element
+    #[refineable]
     pub text: TextStyleRefinement,
 
     /// The mouse cursor style shown when the mouse pointer is over an element.
@@ -236,6 +260,21 @@ pub struct Style {
 
     /// The opacity of this element
     pub opacity: Option<f32>,
+
+    /// The grid columns of this element
+    /// Equivalent to the Tailwind `grid-cols-<number>`
+    pub grid_cols: Option<u16>,
+
+    /// The grid columns with min-content minimum sizing.
+    /// Unlike grid_cols, it won't shrink to width 0 in AvailableSpace::MinContent constraints.
+    pub grid_cols_min_content: Option<u16>,
+
+    /// The row span of this element
+    /// Equivalent to the Tailwind `grid-rows-<number>`
+    pub grid_rows: Option<u16>,
+
+    /// The grid location of this element
+    pub grid_location: Option<GridLocation>,
 
     /// Whether to draw a red debugging outline around this element
     #[cfg(debug_assertions)]
@@ -252,8 +291,15 @@ impl Styled for StyleRefinement {
     }
 }
 
+impl StyleRefinement {
+    /// The grid location of this element
+    pub fn grid_location_mut(&mut self) -> &mut GridLocation {
+        self.grid_location.get_or_insert_default()
+    }
+}
+
 /// The value of the visibility property, similar to the CSS property `visibility`
-#[derive(Default, Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Default, Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub enum Visibility {
     /// The element should be drawn as normal.
     #[default]
@@ -263,7 +309,7 @@ pub enum Visibility {
 }
 
 /// The possible values of the box-shadow property
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct BoxShadow {
     /// What color should the shadow have?
     pub color: Hsla,
@@ -276,7 +322,7 @@ pub struct BoxShadow {
 }
 
 /// How to handle whitespace in text
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub enum WhiteSpace {
     /// Normal line wrapping when text overflows the width of the element
     #[default]
@@ -286,18 +332,34 @@ pub enum WhiteSpace {
 }
 
 /// How to truncate text that overflows the width of the element
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub enum Truncate {
-    /// Truncate the text without an ellipsis
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum TextOverflow {
+    /// Truncate the text at the end when it doesn't fit, and represent this truncation by
+    /// displaying the provided string (e.g., "very long te…").
+    Truncate(SharedString),
+    /// Truncate the text at the start when it doesn't fit, and represent this truncation by
+    /// displaying the provided string at the beginning (e.g., "…ong text here").
+    /// Typically more adequate for file paths where the end is more important than the beginning.
+    TruncateStart(SharedString),
+}
+
+/// How to align text within the element
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum TextAlign {
+    /// Align the text to the left of the element
     #[default]
-    Truncate,
-    /// Truncate the text with an ellipsis
-    Ellipsis,
+    Left,
+
+    /// Center the text within the element
+    Center,
+
+    /// Align the text to the right of the element
+    Right,
 }
 
 /// The properties that can be used to style text in GPUI
 #[derive(Refineable, Clone, Debug, PartialEq)]
-#[refineable(Debug)]
+#[refineable(Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct TextStyle {
     /// The color of the text
     pub color: Hsla,
@@ -336,7 +398,13 @@ pub struct TextStyle {
     pub white_space: WhiteSpace,
 
     /// The text should be truncated if it overflows the width of the element
-    pub truncate: Option<Truncate>,
+    pub text_overflow: Option<TextOverflow>,
+
+    /// How the text should be aligned within the element
+    pub text_align: TextAlign,
+
+    /// The number of lines to display before truncating the text
+    pub line_clamp: Option<usize>,
 }
 
 impl Default for TextStyle {
@@ -344,13 +412,7 @@ impl Default for TextStyle {
         TextStyle {
             color: black(),
             // todo(linux) make this configurable or choose better default
-            font_family: if cfg!(any(target_os = "linux", target_os = "freebsd")) {
-                "FreeMono".into()
-            } else if cfg!(target_os = "windows") {
-                "Segoe UI".into()
-            } else {
-                "Helvetica".into()
-            },
+            font_family: ".SystemUIFont".into(),
             font_features: FontFeatures::default(),
             font_fallbacks: None,
             font_size: rems(1.).into(),
@@ -361,7 +423,9 @@ impl Default for TextStyle {
             underline: None,
             strikethrough: None,
             white_space: WhiteSpace::Normal,
-            truncate: None,
+            text_overflow: None,
+            text_align: TextAlign::default(),
+            line_clamp: None,
         }
     }
 }
@@ -422,7 +486,7 @@ impl TextStyle {
             len,
             font: Font {
                 family: self.font_family.clone(),
-                features: Default::default(),
+                features: self.font_features.clone(),
                 fallbacks: self.font_fallbacks.clone(),
                 weight: self.font_weight,
                 style: self.font_style,
@@ -508,11 +572,11 @@ impl Style {
             } => None,
             _ => {
                 let mut min = bounds.origin;
-                let mut max = bounds.lower_right();
+                let mut max = bounds.bottom_right();
 
                 if self
                     .border_color
-                    .map_or(false, |color| !color.is_transparent())
+                    .is_some_and(|color| !color.is_transparent())
                 {
                     min.x += self.border_widths.left.to_pixels(rem_size);
                     max.x -= self.border_widths.right.to_pixels(rem_size);
@@ -529,12 +593,12 @@ impl Style {
                     // x visible, y hidden
                     (true, false) => Bounds::from_corners(
                         point(min.x, bounds.origin.y),
-                        point(max.x, bounds.lower_right().y),
+                        point(max.x, bounds.bottom_right().y),
                     ),
                     // x hidden, y visible
                     (false, true) => Bounds::from_corners(
                         point(bounds.origin.x, min.y),
-                        point(bounds.lower_right().x, max.y),
+                        point(bounds.bottom_right().x, max.y),
                     ),
                     // both hidden
                     (false, false) => Bounds::from_corners(min, max),
@@ -549,8 +613,9 @@ impl Style {
     pub fn paint(
         &self,
         bounds: Bounds<Pixels>,
-        cx: &mut WindowContext,
-        continuation: impl FnOnce(&mut WindowContext),
+        window: &mut Window,
+        cx: &mut App,
+        continuation: impl FnOnce(&mut Window, &mut App),
     ) {
         #[cfg(debug_assertions)]
         if self.debug_below {
@@ -559,54 +624,75 @@ impl Style {
 
         #[cfg(debug_assertions)]
         if self.debug || cx.has_global::<DebugBelow>() {
-            cx.paint_quad(crate::outline(bounds, crate::red()));
+            window.paint_quad(crate::outline(bounds, crate::red(), BorderStyle::default()));
         }
 
-        let rem_size = cx.rem_size();
+        let rem_size = window.rem_size();
+        let corner_radii = self
+            .corner_radii
+            .to_pixels(rem_size)
+            .clamp_radii_for_quad_size(bounds.size);
 
-        cx.paint_shadows(
-            bounds,
-            self.corner_radii.to_pixels(bounds.size, rem_size),
-            &self.box_shadow,
-        );
+        window.paint_shadows(bounds, corner_radii, &self.box_shadow);
 
         let background_color = self.background.as_ref().and_then(Fill::color);
-        if background_color.map_or(false, |color| !color.is_transparent()) {
-            let mut border_color = background_color.unwrap_or_default();
+        if background_color.is_some_and(|color| !color.is_transparent()) {
+            let mut border_color = match background_color {
+                Some(color) => match color.tag {
+                    BackgroundTag::Solid
+                    | BackgroundTag::PatternSlash
+                    | BackgroundTag::Checkerboard => color.solid,
+
+                    BackgroundTag::LinearGradient => color
+                        .colors
+                        .first()
+                        .map(|stop| stop.color)
+                        .unwrap_or_default(),
+                },
+                None => Hsla::default(),
+            };
             border_color.a = 0.;
-            cx.paint_quad(quad(
+            window.paint_quad(quad(
                 bounds,
-                self.corner_radii.to_pixels(bounds.size, rem_size),
+                corner_radii,
                 background_color.unwrap_or_default(),
                 Edges::default(),
                 border_color,
+                self.border_style,
             ));
         }
 
-        continuation(cx);
+        continuation(window, cx);
 
         if self.is_border_visible() {
-            let corner_radii = self.corner_radii.to_pixels(bounds.size, rem_size);
             let border_widths = self.border_widths.to_pixels(rem_size);
             let max_border_width = border_widths.max();
             let max_corner_radius = corner_radii.max();
+            let zero_size = Size {
+                width: Pixels::ZERO,
+                height: Pixels::ZERO,
+            };
 
-            let top_bounds = Bounds::from_corners(
+            let mut top_bounds = Bounds::from_corners(
                 bounds.origin,
-                bounds.upper_right() + point(Pixels::ZERO, max_border_width.max(max_corner_radius)),
+                bounds.top_right() + point(Pixels::ZERO, max_border_width.max(max_corner_radius)),
             );
-            let bottom_bounds = Bounds::from_corners(
-                bounds.lower_left() - point(Pixels::ZERO, max_border_width.max(max_corner_radius)),
-                bounds.lower_right(),
+            top_bounds.size = top_bounds.size.max(&zero_size);
+            let mut bottom_bounds = Bounds::from_corners(
+                bounds.bottom_left() - point(Pixels::ZERO, max_border_width.max(max_corner_radius)),
+                bounds.bottom_right(),
             );
-            let left_bounds = Bounds::from_corners(
-                top_bounds.lower_left(),
+            bottom_bounds.size = bottom_bounds.size.max(&zero_size);
+            let mut left_bounds = Bounds::from_corners(
+                top_bounds.bottom_left(),
                 bottom_bounds.origin + point(max_border_width, Pixels::ZERO),
             );
-            let right_bounds = Bounds::from_corners(
-                top_bounds.lower_right() - point(max_border_width, Pixels::ZERO),
-                bottom_bounds.upper_right(),
+            left_bounds.size = left_bounds.size.max(&zero_size);
+            let mut right_bounds = Bounds::from_corners(
+                top_bounds.bottom_right() - point(max_border_width, Pixels::ZERO),
+                bottom_bounds.top_right(),
             );
+            right_bounds.size = right_bounds.size.max(&zero_size);
 
             let mut background = self.border_color.unwrap_or_default();
             background.a = 0.;
@@ -616,33 +702,34 @@ impl Style {
                 background,
                 border_widths,
                 self.border_color.unwrap_or_default(),
+                self.border_style,
             );
 
-            cx.with_content_mask(Some(ContentMask { bounds: top_bounds }), |cx| {
-                cx.paint_quad(quad.clone());
+            window.with_content_mask(Some(ContentMask { bounds: top_bounds }), |window| {
+                window.paint_quad(quad.clone());
             });
-            cx.with_content_mask(
+            window.with_content_mask(
                 Some(ContentMask {
                     bounds: right_bounds,
                 }),
-                |cx| {
-                    cx.paint_quad(quad.clone());
+                |window| {
+                    window.paint_quad(quad.clone());
                 },
             );
-            cx.with_content_mask(
+            window.with_content_mask(
                 Some(ContentMask {
                     bounds: bottom_bounds,
                 }),
-                |cx| {
-                    cx.paint_quad(quad.clone());
+                |window| {
+                    window.paint_quad(quad.clone());
                 },
             );
-            cx.with_content_mask(
+            window.with_content_mask(
                 Some(ContentMask {
                     bounds: left_bounds,
                 }),
-                |cx| {
-                    cx.paint_quad(quad);
+                |window| {
+                    window.paint_quad(quad);
                 },
             );
         }
@@ -655,7 +742,7 @@ impl Style {
 
     fn is_border_visible(&self) -> bool {
         self.border_color
-            .map_or(false, |color| !color.is_transparent())
+            .is_some_and(|color| !color.is_transparent())
             && self.border_widths.any(|length| !length.is_zero())
     }
 }
@@ -670,7 +757,8 @@ impl Default for Style {
                 y: Overflow::Visible,
             },
             allow_concurrent_scroll: false,
-            scrollbar_width: 0.0,
+            restrict_scroll_to_axis: false,
+            scrollbar_width: AbsoluteLength::default(),
             position: Position::Relative,
             inset: Edges::auto(),
             margin: Edges::<Length>::zero(),
@@ -694,11 +782,16 @@ impl Default for Style {
             flex_basis: Length::Auto,
             background: None,
             border_color: None,
+            border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,
+            grid_rows: None,
+            grid_cols: None,
+            grid_cols_min_content: None,
+            grid_location: None,
 
             #[cfg(debug_assertions)]
             debug: false,
@@ -709,8 +802,9 @@ impl Default for Style {
 }
 
 /// The properties that can be applied to an underline.
-#[derive(Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash)]
-#[refineable(Debug)]
+#[derive(
+    Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub struct UnderlineStyle {
     /// The thickness of the underline.
     pub thickness: Pixels,
@@ -723,8 +817,9 @@ pub struct UnderlineStyle {
 }
 
 /// The properties that can be applied to a strikethrough.
-#[derive(Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash)]
-#[refineable(Debug)]
+#[derive(
+    Refineable, Copy, Clone, Default, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
+)]
 pub struct StrikethroughStyle {
     /// The thickness of the strikethrough.
     pub thickness: Pixels,
@@ -734,15 +829,17 @@ pub struct StrikethroughStyle {
 }
 
 /// The kinds of fill that can be applied to a shape.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub enum Fill {
     /// A solid color fill.
-    Color(Hsla),
+    Color(Background),
 }
 
 impl Fill {
     /// Unwrap this fill into a solid color, if it is one.
-    pub fn color(&self) -> Option<Hsla> {
+    ///
+    /// If the fill is not a solid color, this method returns `None`.
+    pub fn color(&self) -> Option<Background> {
         match self {
             Fill::Color(color) => Some(*color),
         }
@@ -751,19 +848,25 @@ impl Fill {
 
 impl Default for Fill {
     fn default() -> Self {
-        Self::Color(Hsla::default())
+        Self::Color(Background::default())
     }
 }
 
 impl From<Hsla> for Fill {
     fn from(color: Hsla) -> Self {
-        Self::Color(color)
+        Self::Color(color.into())
     }
 }
 
 impl From<Rgba> for Fill {
     fn from(color: Rgba) -> Self {
         Self::Color(color.into())
+    }
+}
+
+impl From<Background> for Fill {
+    fn from(background: Background) -> Self {
+        Self::Color(background)
     }
 }
 
@@ -797,43 +900,32 @@ impl HighlightStyle {
     }
     /// Blend this highlight style with another.
     /// Non-continuous properties, like font_weight and font_style, are overwritten.
-    pub fn highlight(&mut self, other: HighlightStyle) {
-        match (self.color, other.color) {
-            (Some(self_color), Some(other_color)) => {
-                self.color = Some(Hsla::blend(other_color, self_color));
-            }
-            (None, Some(other_color)) => {
-                self.color = Some(other_color);
-            }
-            _ => {}
-        }
-
-        if other.font_weight.is_some() {
-            self.font_weight = other.font_weight;
-        }
-
-        if other.font_style.is_some() {
-            self.font_style = other.font_style;
-        }
-
-        if other.background_color.is_some() {
-            self.background_color = other.background_color;
-        }
-
-        if other.underline.is_some() {
-            self.underline = other.underline;
-        }
-
-        if other.strikethrough.is_some() {
-            self.strikethrough = other.strikethrough;
-        }
-
-        match (other.fade_out, self.fade_out) {
-            (Some(source_fade), None) => self.fade_out = Some(source_fade),
-            (Some(source_fade), Some(dest_fade)) => {
-                self.fade_out = Some((dest_fade * (1. + source_fade)).clamp(0., 1.));
-            }
-            _ => {}
+    #[must_use]
+    pub fn highlight(self, other: HighlightStyle) -> Self {
+        Self {
+            color: other
+                .color
+                .map(|other_color| {
+                    if let Some(color) = self.color {
+                        color.blend(other_color)
+                    } else {
+                        other_color
+                    }
+                })
+                .or(self.color),
+            font_weight: other.font_weight.or(self.font_weight),
+            font_style: other.font_style.or(self.font_style),
+            background_color: other.background_color.or(self.background_color),
+            underline: other.underline.or(self.underline),
+            strikethrough: other.strikethrough.or(self.strikethrough),
+            fade_out: other
+                .fade_out
+                .map(|source_fade| {
+                    self.fade_out
+                        .map(|dest_fade| (dest_fade * (1. + source_fade)).clamp(0., 1.))
+                        .unwrap_or(source_fade)
+                })
+                .or(self.fade_out),
         }
     }
 }
@@ -898,10 +990,11 @@ pub fn combine_highlights(
         while let Some((endpoint_ix, highlight_id, is_start)) = endpoints.peek() {
             let prev_index = mem::replace(&mut ix, *endpoint_ix);
             if ix > prev_index && !active_styles.is_empty() {
-                let mut current_style = HighlightStyle::default();
-                for highlight_id in &active_styles {
-                    current_style.highlight(highlights[*highlight_id]);
-                }
+                let current_style = active_styles
+                    .iter()
+                    .fold(HighlightStyle::default(), |acc, highlight_id| {
+                        acc.highlight(highlights[*highlight_id])
+                    });
                 return Some((prev_index..ix, current_style));
             }
 
@@ -916,13 +1009,399 @@ pub fn combine_highlights(
     })
 }
 
+/// Used to control how child nodes are aligned.
+/// For Flexbox it controls alignment in the cross axis
+/// For Grid it controls alignment in the block axis
+///
+/// [MDN](https://developer.mozilla.org/en-US/docs/Web/CSS/align-items)
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+// Copy of taffy::style type of the same name, to derive JsonSchema.
+pub enum AlignItems {
+    /// Items are packed toward the start of the axis
+    Start,
+    /// Items are packed toward the end of the axis
+    End,
+    /// Items are packed towards the flex-relative start of the axis.
+    ///
+    /// For flex containers with flex_direction RowReverse or ColumnReverse this is equivalent
+    /// to End. In all other cases it is equivalent to Start.
+    FlexStart,
+    /// Items are packed towards the flex-relative end of the axis.
+    ///
+    /// For flex containers with flex_direction RowReverse or ColumnReverse this is equivalent
+    /// to Start. In all other cases it is equivalent to End.
+    FlexEnd,
+    /// Items are packed along the center of the cross axis
+    Center,
+    /// Items are aligned such as their baselines align
+    Baseline,
+    /// Stretch to fill the container
+    Stretch,
+}
+/// Used to control how child nodes are aligned.
+/// Does not apply to Flexbox, and will be ignored if specified on a flex container
+/// For Grid it controls alignment in the inline axis
+///
+/// [MDN](https://developer.mozilla.org/en-US/docs/Web/CSS/justify-items)
+pub type JustifyItems = AlignItems;
+/// Used to control how the specified nodes is aligned.
+/// Overrides the parent Node's `AlignItems` property.
+/// For Flexbox it controls alignment in the cross axis
+/// For Grid it controls alignment in the block axis
+///
+/// [MDN](https://developer.mozilla.org/en-US/docs/Web/CSS/align-self)
+pub type AlignSelf = AlignItems;
+/// Used to control how the specified nodes is aligned.
+/// Overrides the parent Node's `JustifyItems` property.
+/// Does not apply to Flexbox, and will be ignored if specified on a flex child
+/// For Grid it controls alignment in the inline axis
+///
+/// [MDN](https://developer.mozilla.org/en-US/docs/Web/CSS/justify-self)
+pub type JustifySelf = AlignItems;
+
+/// Sets the distribution of space between and around content items
+/// For Flexbox it controls alignment in the cross axis
+/// For Grid it controls alignment in the block axis
+///
+/// [MDN](https://developer.mozilla.org/en-US/docs/Web/CSS/align-content)
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize, JsonSchema)]
+// Copy of taffy::style type of the same name, to derive JsonSchema.
+pub enum AlignContent {
+    /// Items are packed toward the start of the axis
+    Start,
+    /// Items are packed toward the end of the axis
+    End,
+    /// Items are packed towards the flex-relative start of the axis.
+    ///
+    /// For flex containers with flex_direction RowReverse or ColumnReverse this is equivalent
+    /// to End. In all other cases it is equivalent to Start.
+    FlexStart,
+    /// Items are packed towards the flex-relative end of the axis.
+    ///
+    /// For flex containers with flex_direction RowReverse or ColumnReverse this is equivalent
+    /// to Start. In all other cases it is equivalent to End.
+    FlexEnd,
+    /// Items are centered around the middle of the axis
+    Center,
+    /// Items are stretched to fill the container
+    Stretch,
+    /// The first and last items are aligned flush with the edges of the container (no gap)
+    /// The gap between items is distributed evenly.
+    SpaceBetween,
+    /// The gap between the first and last items is exactly THE SAME as the gap between items.
+    /// The gaps are distributed evenly
+    SpaceEvenly,
+    /// The gap between the first and last items is exactly HALF the gap between items.
+    /// The gaps are distributed evenly in proportion to these ratios.
+    SpaceAround,
+}
+
+/// Sets the distribution of space between and around content items
+/// For Flexbox it controls alignment in the main axis
+/// For Grid it controls alignment in the inline axis
+///
+/// [MDN](https://developer.mozilla.org/en-US/docs/Web/CSS/justify-content)
+pub type JustifyContent = AlignContent;
+
+/// Sets the layout used for the children of this node
+///
+/// The default values depends on on which feature flags are enabled. The order of precedence is: Flex, Grid, Block, None.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+// Copy of taffy::style type of the same name, to derive JsonSchema.
+pub enum Display {
+    /// The children will follow the block layout algorithm
+    Block,
+    /// The children will follow the flexbox layout algorithm
+    #[default]
+    Flex,
+    /// The children will follow the CSS Grid layout algorithm
+    Grid,
+    /// The children will not be laid out, and will follow absolute positioning
+    None,
+}
+
+/// Controls whether flex items are forced onto one line or can wrap onto multiple lines.
+///
+/// Defaults to [`FlexWrap::NoWrap`]
+///
+/// [Specification](https://www.w3.org/TR/css-flexbox-1/#flex-wrap-property)
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+// Copy of taffy::style type of the same name, to derive JsonSchema.
+pub enum FlexWrap {
+    /// Items will not wrap and stay on a single line
+    #[default]
+    NoWrap,
+    /// Items will wrap according to this item's [`FlexDirection`]
+    Wrap,
+    /// Items will wrap in the opposite direction to this item's [`FlexDirection`]
+    WrapReverse,
+}
+
+/// The direction of the flexbox layout main axis.
+///
+/// There are always two perpendicular layout axes: main (or primary) and cross (or secondary).
+/// Adding items will cause them to be positioned adjacent to each other along the main axis.
+/// By varying this value throughout your tree, you can create complex axis-aligned layouts.
+///
+/// Items are always aligned relative to the cross axis, and justified relative to the main axis.
+///
+/// The default behavior is [`FlexDirection::Row`].
+///
+/// [Specification](https://www.w3.org/TR/css-flexbox-1/#flex-direction-property)
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+// Copy of taffy::style type of the same name, to derive JsonSchema.
+pub enum FlexDirection {
+    /// Defines +x as the main axis
+    ///
+    /// Items will be added from left to right in a row.
+    #[default]
+    Row,
+    /// Defines +y as the main axis
+    ///
+    /// Items will be added from top to bottom in a column.
+    Column,
+    /// Defines -x as the main axis
+    ///
+    /// Items will be added from right to left in a row.
+    RowReverse,
+    /// Defines -y as the main axis
+    ///
+    /// Items will be added from bottom to top in a column.
+    ColumnReverse,
+}
+
+/// How children overflowing their container should affect layout
+///
+/// In CSS the primary effect of this property is to control whether contents of a parent container that overflow that container should
+/// be displayed anyway, be clipped, or trigger the container to become a scroll container. However it also has secondary effects on layout,
+/// the main ones being:
+///
+///   - The automatic minimum size Flexbox/CSS Grid items with non-`Visible` overflow is `0` rather than being content based
+///   - `Overflow::Scroll` nodes have space in the layout reserved for a scrollbar (width controlled by the `scrollbar_width` property)
+///
+/// In Taffy, we only implement the layout related secondary effects as we are not concerned with drawing/painting. The amount of space reserved for
+/// a scrollbar is controlled by the `scrollbar_width` property. If this is `0` then `Scroll` behaves identically to `Hidden`.
+///
+/// <https://developer.mozilla.org/en-US/docs/Web/CSS/overflow>
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+// Copy of taffy::style type of the same name, to derive JsonSchema.
+pub enum Overflow {
+    /// The automatic minimum size of this node as a flexbox/grid item should be based on the size of its content.
+    /// Content that overflows this node *should* contribute to the scroll region of its parent.
+    #[default]
+    Visible,
+    /// The automatic minimum size of this node as a flexbox/grid item should be based on the size of its content.
+    /// Content that overflows this node should *not* contribute to the scroll region of its parent.
+    Clip,
+    /// The automatic minimum size of this node as a flexbox/grid item should be `0`.
+    /// Content that overflows this node should *not* contribute to the scroll region of its parent.
+    Hidden,
+    /// The automatic minimum size of this node as a flexbox/grid item should be `0`. Additionally, space should be reserved
+    /// for a scrollbar. The amount of space reserved is controlled by the `scrollbar_width` property.
+    /// Content that overflows this node should *not* contribute to the scroll region of its parent.
+    Scroll,
+}
+
+/// The positioning strategy for this item.
+///
+/// This controls both how the origin is determined for the [`Style::position`] field,
+/// and whether or not the item will be controlled by flexbox's layout algorithm.
+///
+/// WARNING: this enum follows the behavior of [CSS's `position` property](https://developer.mozilla.org/en-US/docs/Web/CSS/position),
+/// which can be unintuitive.
+///
+/// [`Position::Relative`] is the default value, in contrast to the default behavior in CSS.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize, JsonSchema)]
+// Copy of taffy::style type of the same name, to derive JsonSchema.
+pub enum Position {
+    /// The offset is computed relative to the final position given by the layout algorithm.
+    /// Offsets do not affect the position of any other items; they are effectively a correction factor applied at the end.
+    #[default]
+    Relative,
+    /// The offset is computed relative to this item's closest positioned ancestor, if any.
+    /// Otherwise, it is placed relative to the origin.
+    /// No space is created for the item in the page layout, and its size will not be altered.
+    ///
+    /// WARNING: to opt-out of layouting entirely, you must use [`Display::None`] instead on your [`Style`] object.
+    Absolute,
+}
+
+impl From<AlignItems> for taffy::style::AlignItems {
+    fn from(value: AlignItems) -> Self {
+        match value {
+            AlignItems::Start => Self::Start,
+            AlignItems::End => Self::End,
+            AlignItems::FlexStart => Self::FlexStart,
+            AlignItems::FlexEnd => Self::FlexEnd,
+            AlignItems::Center => Self::Center,
+            AlignItems::Baseline => Self::Baseline,
+            AlignItems::Stretch => Self::Stretch,
+        }
+    }
+}
+
+impl From<AlignContent> for taffy::style::AlignContent {
+    fn from(value: AlignContent) -> Self {
+        match value {
+            AlignContent::Start => Self::Start,
+            AlignContent::End => Self::End,
+            AlignContent::FlexStart => Self::FlexStart,
+            AlignContent::FlexEnd => Self::FlexEnd,
+            AlignContent::Center => Self::Center,
+            AlignContent::Stretch => Self::Stretch,
+            AlignContent::SpaceBetween => Self::SpaceBetween,
+            AlignContent::SpaceEvenly => Self::SpaceEvenly,
+            AlignContent::SpaceAround => Self::SpaceAround,
+        }
+    }
+}
+
+impl From<Display> for taffy::style::Display {
+    fn from(value: Display) -> Self {
+        match value {
+            Display::Block => Self::Block,
+            Display::Flex => Self::Flex,
+            Display::Grid => Self::Grid,
+            Display::None => Self::None,
+        }
+    }
+}
+
+impl From<FlexWrap> for taffy::style::FlexWrap {
+    fn from(value: FlexWrap) -> Self {
+        match value {
+            FlexWrap::NoWrap => Self::NoWrap,
+            FlexWrap::Wrap => Self::Wrap,
+            FlexWrap::WrapReverse => Self::WrapReverse,
+        }
+    }
+}
+
+impl From<FlexDirection> for taffy::style::FlexDirection {
+    fn from(value: FlexDirection) -> Self {
+        match value {
+            FlexDirection::Row => Self::Row,
+            FlexDirection::Column => Self::Column,
+            FlexDirection::RowReverse => Self::RowReverse,
+            FlexDirection::ColumnReverse => Self::ColumnReverse,
+        }
+    }
+}
+
+impl From<Overflow> for taffy::style::Overflow {
+    fn from(value: Overflow) -> Self {
+        match value {
+            Overflow::Visible => Self::Visible,
+            Overflow::Clip => Self::Clip,
+            Overflow::Hidden => Self::Hidden,
+            Overflow::Scroll => Self::Scroll,
+        }
+    }
+}
+
+impl From<Position> for taffy::style::Position {
+    fn from(value: Position) -> Self {
+        match value {
+            Position::Relative => Self::Relative,
+            Position::Absolute => Self::Absolute,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use crate::{blue, green, red, yellow};
+    use crate::{blue, green, px, red, yellow};
 
     use super::*;
 
-    #[test]
+    use util_macros::perf;
+
+    #[perf]
+    fn test_basic_highlight_style_combination() {
+        let style_a = HighlightStyle::default();
+        let style_b = HighlightStyle::default();
+        let style_a = style_a.highlight(style_b);
+        assert_eq!(
+            style_a,
+            HighlightStyle::default(),
+            "Combining empty styles should not produce a non-empty style."
+        );
+
+        let mut style_b = HighlightStyle {
+            color: Some(red()),
+            strikethrough: Some(StrikethroughStyle {
+                thickness: px(2.),
+                color: Some(blue()),
+            }),
+            fade_out: Some(0.),
+            font_style: Some(FontStyle::Italic),
+            font_weight: Some(FontWeight(300.)),
+            background_color: Some(yellow()),
+            underline: Some(UnderlineStyle {
+                thickness: px(2.),
+                color: Some(red()),
+                wavy: true,
+            }),
+        };
+        let expected_style = style_b;
+
+        let style_a = style_a.highlight(style_b);
+        assert_eq!(
+            style_a, expected_style,
+            "Blending an empty style with another style should return the other style"
+        );
+
+        let style_b = style_b.highlight(Default::default());
+        assert_eq!(
+            style_b, expected_style,
+            "Blending a style with an empty style should not change the style."
+        );
+
+        let mut style_c = expected_style;
+
+        let style_d = HighlightStyle {
+            color: Some(blue().alpha(0.7)),
+            strikethrough: Some(StrikethroughStyle {
+                thickness: px(4.),
+                color: Some(crate::red()),
+            }),
+            fade_out: Some(0.),
+            font_style: Some(FontStyle::Oblique),
+            font_weight: Some(FontWeight(800.)),
+            background_color: Some(green()),
+            underline: Some(UnderlineStyle {
+                thickness: px(4.),
+                color: None,
+                wavy: false,
+            }),
+        };
+
+        let expected_style = HighlightStyle {
+            color: Some(red().blend(blue().alpha(0.7))),
+            strikethrough: Some(StrikethroughStyle {
+                thickness: px(4.),
+                color: Some(red()),
+            }),
+            // TODO this does not seem right
+            fade_out: Some(0.),
+            font_style: Some(FontStyle::Oblique),
+            font_weight: Some(FontWeight(800.)),
+            background_color: Some(green()),
+            underline: Some(UnderlineStyle {
+                thickness: px(4.),
+                color: None,
+                wavy: false,
+            }),
+        };
+
+        let style_c = style_c.highlight(style_d);
+        assert_eq!(
+            style_c, expected_style,
+            "Blending styles should blend properties where possible and override all others"
+        );
+    }
+
+    #[perf]
     fn test_combine_highlights() {
         assert_eq!(
             combine_highlights(
@@ -949,14 +1428,14 @@ mod tests {
                 (
                     1..2,
                     HighlightStyle {
-                        color: Some(green()),
+                        color: Some(blue()),
                         ..Default::default()
                     }
                 ),
                 (
                     2..3,
                     HighlightStyle {
-                        color: Some(green()),
+                        color: Some(blue()),
                         font_style: Some(FontStyle::Italic),
                         ..Default::default()
                     }
@@ -1008,6 +1487,23 @@ mod tests {
                     }
                 )
             ]
+        );
+    }
+
+    #[perf]
+    fn test_text_style_refinement() {
+        let mut style = Style::default();
+        style.refine(&StyleRefinement::default().text_size(px(20.0)));
+        style.refine(&StyleRefinement::default().font_weight(FontWeight::SEMIBOLD));
+
+        assert_eq!(
+            Some(AbsoluteLength::from(px(20.0))),
+            style.text_style().unwrap().font_size
+        );
+
+        assert_eq!(
+            Some(FontWeight::SEMIBOLD),
+            style.text_style().unwrap().font_weight
         );
     }
 }

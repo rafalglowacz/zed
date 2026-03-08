@@ -3,22 +3,26 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use editor::Editor;
-use gpui::{prelude::*, Entity, View, WeakView, WindowContext};
+use anyhow::{Context as _, Result};
+use editor::{Editor, MultiBufferOffset};
+use gpui::{App, Entity, WeakEntity, Window, prelude::*};
 use language::{BufferSnapshot, Language, LanguageName, Point};
-use project::{Item as _, WorktreeId};
+use project::{ProjectItem as _, WorktreeId};
+use workspace::{Workspace, notifications::NotificationId};
 
+use crate::kernels::PythonEnvKernelSpecification;
 use crate::repl_store::ReplStore;
 use crate::session::SessionEvent;
 use crate::{
-    ClearOutputs, Interrupt, JupyterSettings, KernelSpecification, Restart, Session, Shutdown,
+    ClearCurrentOutput, ClearOutputs, Interrupt, JupyterSettings, KernelSpecification, Restart,
+    Session, Shutdown,
 };
 
 pub fn assign_kernelspec(
     kernel_specification: KernelSpecification,
-    weak_editor: WeakView<Editor>,
-    cx: &mut WindowContext,
+    weak_editor: WeakEntity<Editor>,
+    window: &mut Window,
+    cx: &mut App,
 ) -> Result<()> {
     let store = ReplStore::global(cx);
     if !store.read(cx).is_enabled() {
@@ -33,19 +37,18 @@ pub fn assign_kernelspec(
     });
 
     let fs = store.read(cx).fs().clone();
-    let telemetry = store.read(cx).telemetry().clone();
 
     if let Some(session) = store.read(cx).get_session(weak_editor.entity_id()).cloned() {
         // Drop previous session, start new one
         session.update(cx, |session, cx| {
             session.clear_outputs(cx);
-            session.shutdown(cx);
+            session.shutdown(window, cx);
             cx.notify();
         });
     }
 
-    let session = cx
-        .new_view(|cx| Session::new(weak_editor.clone(), fs, telemetry, kernel_specification, cx));
+    let session =
+        cx.new(|cx| Session::new(weak_editor.clone(), fs, kernel_specification, window, cx));
 
     weak_editor
         .update(cx, |_editor, cx| {
@@ -72,15 +75,131 @@ pub fn assign_kernelspec(
     Ok(())
 }
 
-pub fn run(editor: WeakView<Editor>, move_down: bool, cx: &mut WindowContext) -> Result<()> {
+pub fn install_ipykernel_and_assign(
+    kernel_specification: KernelSpecification,
+    weak_editor: WeakEntity<Editor>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Result<()> {
+    let KernelSpecification::PythonEnv(ref env_spec) = kernel_specification else {
+        return assign_kernelspec(kernel_specification, weak_editor, window, cx);
+    };
+
+    let python_path = env_spec.path.clone();
+    let env_name = env_spec.name.clone();
+    let env_spec = env_spec.clone();
+
+    struct IpykernelInstall;
+    let notification_id = NotificationId::unique::<IpykernelInstall>();
+
+    let workspace = Workspace::for_window(window, cx);
+    if let Some(workspace) = &workspace {
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_toast(
+                workspace::Toast::new(
+                    notification_id.clone(),
+                    format!("Installing ipykernel in {}...", env_name),
+                ),
+                cx,
+            );
+        });
+    }
+
+    let weak_workspace = workspace.map(|w| w.downgrade());
+    let window_handle = window.window_handle();
+
+    let install_task = cx.background_spawn(async move {
+        let output = util::command::new_command(python_path.to_string_lossy().as_ref())
+            .args(&["-m", "pip", "install", "ipykernel"])
+            .output()
+            .await
+            .context("failed to run pip install ipykernel")?;
+
+        if output.status.success() {
+            anyhow::Ok(())
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("{}", stderr.lines().last().unwrap_or("unknown error"))
+        }
+    });
+
+    cx.spawn(async move |cx| {
+        let result = install_task.await;
+
+        match result {
+            Ok(()) => {
+                if let Some(weak_workspace) = &weak_workspace {
+                    weak_workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.dismiss_toast(&notification_id, cx);
+                            workspace.show_toast(
+                                workspace::Toast::new(
+                                    notification_id.clone(),
+                                    format!("ipykernel installed in {}", env_name),
+                                )
+                                .autohide(),
+                                cx,
+                            );
+                        })
+                        .ok();
+                }
+
+                window_handle
+                    .update(cx, |_, window, cx| {
+                        let updated_spec =
+                            KernelSpecification::PythonEnv(PythonEnvKernelSpecification {
+                                has_ipykernel: true,
+                                ..env_spec
+                            });
+                        assign_kernelspec(updated_spec, weak_editor, window, cx).ok();
+                    })
+                    .ok();
+            }
+            Err(error) => {
+                if let Some(weak_workspace) = &weak_workspace {
+                    weak_workspace
+                        .update(cx, |workspace, cx| {
+                            workspace.dismiss_toast(&notification_id, cx);
+                            workspace.show_toast(
+                                workspace::Toast::new(
+                                    notification_id.clone(),
+                                    format!(
+                                        "Failed to install ipykernel in {}: {}",
+                                        env_name, error
+                                    ),
+                                ),
+                                cx,
+                            );
+                        })
+                        .ok();
+                }
+            }
+        }
+    })
+    .detach();
+
+    Ok(())
+}
+
+pub fn run(
+    editor: WeakEntity<Editor>,
+    move_down: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> Result<()> {
     let store = ReplStore::global(cx);
     if !store.read(cx).is_enabled() {
         return Ok(());
     }
+    store.update(cx, |store, cx| store.ensure_kernelspecs(cx));
 
     let editor = editor.upgrade().context("editor was dropped")?;
     let selected_range = editor
-        .update(cx, |editor, cx| editor.selections.newest_adjusted(cx))
+        .update(cx, |editor, cx| {
+            editor
+                .selections
+                .newest_adjusted(&editor.display_snapshot(cx))
+        })
         .range();
     let multibuffer = editor.read(cx).buffer().clone();
     let Some(buffer) = multibuffer.read(cx).as_singleton() else {
@@ -92,7 +211,7 @@ pub fn run(editor: WeakView<Editor>, move_down: bool, cx: &mut WindowContext) ->
     };
 
     let (runnable_ranges, next_cell_point) =
-        runnable_ranges(&buffer.read(cx).snapshot(), selected_range);
+        runnable_ranges(&buffer.read(cx).snapshot(), selected_range, cx);
 
     for runnable_range in runnable_ranges {
         let Some(language) = multibuffer.read(cx).language_at(runnable_range.start, cx) else {
@@ -102,18 +221,17 @@ pub fn run(editor: WeakView<Editor>, move_down: bool, cx: &mut WindowContext) ->
         let kernel_specification = store
             .read(cx)
             .active_kernelspec(project_path.worktree_id, Some(language.clone()), cx)
-            .ok_or_else(|| anyhow::anyhow!("No kernel found for language: {}", language.name()))?;
+            .with_context(|| format!("No kernel found for language: {}", language.name()))?;
 
         let fs = store.read(cx).fs().clone();
-        let telemetry = store.read(cx).telemetry().clone();
 
         let session = if let Some(session) = store.read(cx).get_session(editor.entity_id()).cloned()
         {
             session
         } else {
             let weak_editor = editor.downgrade();
-            let session = cx
-                .new_view(|cx| Session::new(weak_editor, fs, telemetry, kernel_specification, cx));
+            let session =
+                cx.new(|cx| Session::new(weak_editor, fs, kernel_specification, window, cx));
 
             editor.update(cx, |_editor, cx| {
                 cx.notify();
@@ -152,25 +270,28 @@ pub fn run(editor: WeakView<Editor>, move_down: bool, cx: &mut WindowContext) ->
         }
 
         session.update(cx, |session, cx| {
-            session.execute(selected_text, anchor_range, next_cursor, move_down, cx);
+            session.execute(
+                selected_text,
+                anchor_range,
+                next_cursor,
+                move_down,
+                window,
+                cx,
+            );
         });
     }
 
     anyhow::Ok(())
 }
 
-#[allow(clippy::large_enum_variant)]
 pub enum SessionSupport {
-    ActiveSession(View<Session>),
+    ActiveSession(Entity<Session>),
     Inactive(KernelSpecification),
     RequiresSetup(LanguageName),
     Unsupported,
 }
 
-pub fn worktree_id_for_editor(
-    editor: WeakView<Editor>,
-    cx: &mut WindowContext,
-) -> Option<WorktreeId> {
+pub fn worktree_id_for_editor(editor: WeakEntity<Editor>, cx: &mut App) -> Option<WorktreeId> {
     editor.upgrade().and_then(|editor| {
         editor
             .read(cx)
@@ -183,7 +304,7 @@ pub fn worktree_id_for_editor(
     })
 }
 
-pub fn session(editor: WeakView<Editor>, cx: &mut WindowContext) -> SessionSupport {
+pub fn session(editor: WeakEntity<Editor>, cx: &mut App) -> SessionSupport {
     let store = ReplStore::global(cx);
     let entity_id = editor.entity_id();
 
@@ -195,7 +316,7 @@ pub fn session(editor: WeakView<Editor>, cx: &mut WindowContext) -> SessionSuppo
         return SessionSupport::Unsupported;
     };
 
-    let worktree_id = worktree_id_for_editor(editor.clone(), cx);
+    let worktree_id = worktree_id_for_editor(editor, cx);
 
     let Some(worktree_id) = worktree_id else {
         return SessionSupport::Unsupported;
@@ -208,7 +329,8 @@ pub fn session(editor: WeakView<Editor>, cx: &mut WindowContext) -> SessionSuppo
     match kernelspec {
         Some(kernelspec) => SessionSupport::Inactive(kernelspec),
         None => {
-            if language_supported(&language.clone()) {
+            // For language_supported, need to check available kernels for language
+            if language_supported(&language, cx) {
                 SessionSupport::RequiresSetup(language.name())
             } else {
                 SessionSupport::Unsupported
@@ -217,7 +339,7 @@ pub fn session(editor: WeakView<Editor>, cx: &mut WindowContext) -> SessionSuppo
     }
 }
 
-pub fn clear_outputs(editor: WeakView<Editor>, cx: &mut WindowContext) {
+pub fn clear_outputs(editor: WeakEntity<Editor>, cx: &mut App) {
     let store = ReplStore::global(cx);
     let entity_id = editor.entity_id();
     let Some(session) = store.read(cx).get_session(entity_id).cloned() else {
@@ -229,7 +351,25 @@ pub fn clear_outputs(editor: WeakView<Editor>, cx: &mut WindowContext) {
     });
 }
 
-pub fn interrupt(editor: WeakView<Editor>, cx: &mut WindowContext) {
+pub fn clear_current_output(editor: WeakEntity<Editor>, cx: &mut App) {
+    let Some(editor_entity) = editor.upgrade() else {
+        return;
+    };
+
+    let store = ReplStore::global(cx);
+    let entity_id = editor.entity_id();
+    let Some(session) = store.read(cx).get_session(entity_id).cloned() else {
+        return;
+    };
+
+    let position = editor_entity.read(cx).selections.newest_anchor().head();
+
+    session.update(cx, |session, cx| {
+        session.clear_output_at_position(position, cx);
+    });
+}
+
+pub fn interrupt(editor: WeakEntity<Editor>, cx: &mut App) {
     let store = ReplStore::global(cx);
     let entity_id = editor.entity_id();
     let Some(session) = store.read(cx).get_session(entity_id).cloned() else {
@@ -242,7 +382,7 @@ pub fn interrupt(editor: WeakView<Editor>, cx: &mut WindowContext) {
     });
 }
 
-pub fn shutdown(editor: WeakView<Editor>, cx: &mut WindowContext) {
+pub fn shutdown(editor: WeakEntity<Editor>, window: &mut Window, cx: &mut App) {
     let store = ReplStore::global(cx);
     let entity_id = editor.entity_id();
     let Some(session) = store.read(cx).get_session(entity_id).cloned() else {
@@ -250,12 +390,12 @@ pub fn shutdown(editor: WeakView<Editor>, cx: &mut WindowContext) {
     };
 
     session.update(cx, |session, cx| {
-        session.shutdown(cx);
+        session.shutdown(window, cx);
         cx.notify();
     });
 }
 
-pub fn restart(editor: WeakView<Editor>, cx: &mut WindowContext) {
+pub fn restart(editor: WeakEntity<Editor>, window: &mut Window, cx: &mut App) {
     let Some(editor) = editor.upgrade() else {
         return;
     };
@@ -271,16 +411,16 @@ pub fn restart(editor: WeakView<Editor>, cx: &mut WindowContext) {
     };
 
     session.update(cx, |session, cx| {
-        session.restart(cx);
+        session.restart(window, cx);
         cx.notify();
     });
 }
 
-pub fn setup_editor_session_actions(editor: &mut Editor, editor_handle: WeakView<Editor>) {
+pub fn setup_editor_session_actions(editor: &mut Editor, editor_handle: WeakEntity<Editor>) {
     editor
         .register_action({
             let editor_handle = editor_handle.clone();
-            move |_: &ClearOutputs, cx| {
+            move |_: &ClearOutputs, _, cx| {
                 if !JupyterSettings::enabled(cx) {
                     return;
                 }
@@ -293,7 +433,20 @@ pub fn setup_editor_session_actions(editor: &mut Editor, editor_handle: WeakView
     editor
         .register_action({
             let editor_handle = editor_handle.clone();
-            move |_: &Interrupt, cx| {
+            move |_: &ClearCurrentOutput, _, cx| {
+                if !JupyterSettings::enabled(cx) {
+                    return;
+                }
+
+                crate::clear_current_output(editor_handle.clone(), cx);
+            }
+        })
+        .detach();
+
+    editor
+        .register_action({
+            let editor_handle = editor_handle.clone();
+            move |_: &Interrupt, _, cx| {
                 if !JupyterSettings::enabled(cx) {
                     return;
                 }
@@ -306,25 +459,25 @@ pub fn setup_editor_session_actions(editor: &mut Editor, editor_handle: WeakView
     editor
         .register_action({
             let editor_handle = editor_handle.clone();
-            move |_: &Shutdown, cx| {
+            move |_: &Shutdown, window, cx| {
                 if !JupyterSettings::enabled(cx) {
                     return;
                 }
 
-                crate::shutdown(editor_handle.clone(), cx);
+                crate::shutdown(editor_handle.clone(), window, cx);
             }
         })
         .detach();
 
     editor
         .register_action({
-            let editor_handle = editor_handle.clone();
-            move |_: &Restart, cx| {
+            let editor_handle = editor_handle;
+            move |_: &Restart, window, cx| {
                 if !JupyterSettings::enabled(cx) {
                     return;
                 }
 
-                crate::restart(editor_handle.clone(), cx);
+                crate::restart(editor_handle.clone(), window, cx);
             }
         })
         .detach();
@@ -407,11 +560,12 @@ fn jupytext_cells(
 fn runnable_ranges(
     buffer: &BufferSnapshot,
     range: Range<Point>,
+    cx: &mut App,
 ) -> (Vec<Range<Point>>, Option<Point>) {
-    if let Some(language) = buffer.language() {
-        if language.name() == "Markdown".into() {
-            return (markdown_code_blocks(buffer, range.clone()), None);
-        }
+    if let Some(language) = buffer.language()
+        && language.name() == "Markdown"
+    {
+        return (markdown_code_blocks(buffer, range, cx), None);
     }
 
     let (jupytext_snippets, next_cursor) = jupytext_cells(buffer, range.clone());
@@ -420,12 +574,42 @@ fn runnable_ranges(
     }
 
     let snippet_range = cell_range(buffer, range.start.row, range.end.row);
+
+    // Check if the snippet range is entirely blank, if so, skip forward to find code
+    let is_blank =
+        (snippet_range.start.row..=snippet_range.end.row).all(|row| buffer.is_line_blank(row));
+
+    if is_blank {
+        // Search forward for the next non-blank line
+        let max_row = buffer.max_point().row;
+        let mut next_row = snippet_range.end.row + 1;
+        while next_row <= max_row && buffer.is_line_blank(next_row) {
+            next_row += 1;
+        }
+
+        if next_row <= max_row {
+            // Found a non-blank line, find the extent of this cell
+            let next_snippet_range = cell_range(buffer, next_row, next_row);
+            let start_language = buffer.language_at(next_snippet_range.start);
+            let end_language = buffer.language_at(next_snippet_range.end);
+
+            if start_language
+                .zip(end_language)
+                .is_some_and(|(start, end)| start == end)
+            {
+                return (vec![next_snippet_range], None);
+            }
+        }
+
+        return (Vec::new(), None);
+    }
+
     let start_language = buffer.language_at(snippet_range.start);
     let end_language = buffer.language_at(snippet_range.end);
 
     if start_language
         .zip(end_language)
-        .map_or(false, |(start, end)| start == end)
+        .is_some_and(|(start, end)| start == end)
     {
         (vec![snippet_range], None)
     } else {
@@ -435,29 +619,40 @@ fn runnable_ranges(
 
 // We allow markdown code blocks to end in a trailing newline in order to render the output
 // below the final code fence. This is different than our behavior for selections and Jupytext cells.
-fn markdown_code_blocks(buffer: &BufferSnapshot, range: Range<Point>) -> Vec<Range<Point>> {
+fn markdown_code_blocks(
+    buffer: &BufferSnapshot,
+    range: Range<Point>,
+    cx: &mut App,
+) -> Vec<Range<Point>> {
     buffer
         .injections_intersecting_range(range)
-        .filter(|(_, language)| language_supported(language))
+        .filter(|(_, language)| language_supported(language, cx))
         .map(|(content_range, _)| {
             buffer.offset_to_point(content_range.start)..buffer.offset_to_point(content_range.end)
         })
         .collect()
 }
 
-fn language_supported(language: &Arc<Language>) -> bool {
-    match language.name().0.as_ref() {
-        "TypeScript" | "Python" => true,
-        _ => false,
-    }
+fn language_supported(language: &Arc<Language>, cx: &mut App) -> bool {
+    let store = ReplStore::global(cx);
+    let store_read = store.read(cx);
+
+    store_read
+        .pure_jupyter_kernel_specifications()
+        .any(|spec| language.matches_kernel_language(spec.language().as_ref()))
 }
 
-fn get_language(editor: WeakView<Editor>, cx: &mut WindowContext) -> Option<Arc<Language>> {
+fn get_language(editor: WeakEntity<Editor>, cx: &mut App) -> Option<Arc<Language>> {
     editor
         .update(cx, |editor, cx| {
-            let selection = editor.selections.newest::<usize>(cx);
-            let buffer = editor.buffer().read(cx).snapshot(cx);
-            buffer.language_at(selection.head()).cloned()
+            let display_snapshot = editor.display_snapshot(cx);
+            let selection = editor
+                .selections
+                .newest::<MultiBufferOffset>(&display_snapshot);
+            display_snapshot
+                .buffer_snapshot()
+                .language_at(selection.head())
+                .cloned()
         })
         .ok()
         .flatten()
@@ -466,12 +661,12 @@ fn get_language(editor: WeakView<Editor>, cx: &mut WindowContext) -> Option<Arc<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui::{AppContext, Context};
+    use gpui::App;
     use indoc::indoc;
     use language::{Buffer, Language, LanguageConfig, LanguageRegistry};
 
     #[gpui::test]
-    fn test_snippet_ranges(cx: &mut AppContext) {
+    fn test_snippet_ranges(cx: &mut App) {
         // Create a test language
         let test_language = Arc::new(Language::new(
             LanguageConfig {
@@ -482,7 +677,7 @@ mod tests {
             None,
         ));
 
-        let buffer = cx.new_model(|cx| {
+        let buffer = cx.new(|cx| {
             Buffer::local(
                 indoc! { r#"
                     print(1 + 1)
@@ -499,7 +694,7 @@ mod tests {
         let snapshot = buffer.read(cx).snapshot();
 
         // Single-point selection
-        let (snippets, _) = runnable_ranges(&snapshot, Point::new(0, 4)..Point::new(0, 4));
+        let (snippets, _) = runnable_ranges(&snapshot, Point::new(0, 4)..Point::new(0, 4), cx);
         let snippets = snippets
             .into_iter()
             .map(|range| snapshot.text_for_range(range).collect::<String>())
@@ -507,7 +702,7 @@ mod tests {
         assert_eq!(snippets, vec!["print(1 + 1)"]);
 
         // Multi-line selection
-        let (snippets, _) = runnable_ranges(&snapshot, Point::new(0, 5)..Point::new(2, 0));
+        let (snippets, _) = runnable_ranges(&snapshot, Point::new(0, 5)..Point::new(2, 0), cx);
         let snippets = snippets
             .into_iter()
             .map(|range| snapshot.text_for_range(range).collect::<String>())
@@ -520,7 +715,7 @@ mod tests {
         );
 
         // Trimming multiple trailing blank lines
-        let (snippets, _) = runnable_ranges(&snapshot, Point::new(0, 5)..Point::new(5, 0));
+        let (snippets, _) = runnable_ranges(&snapshot, Point::new(0, 5)..Point::new(5, 0), cx);
 
         let snippets = snippets
             .into_iter()
@@ -537,7 +732,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_jupytext_snippet_ranges(cx: &mut AppContext) {
+    fn test_jupytext_snippet_ranges(cx: &mut App) {
         // Create a test language
         let test_language = Arc::new(Language::new(
             LanguageConfig {
@@ -548,7 +743,7 @@ mod tests {
             None,
         ));
 
-        let buffer = cx.new_model(|cx| {
+        let buffer = cx.new(|cx| {
             Buffer::local(
                 indoc! { r#"
                     # Hello!
@@ -573,7 +768,7 @@ mod tests {
         let snapshot = buffer.read(cx).snapshot();
 
         // Jupytext snippet surrounding an empty selection
-        let (snippets, _) = runnable_ranges(&snapshot, Point::new(2, 5)..Point::new(2, 5));
+        let (snippets, _) = runnable_ranges(&snapshot, Point::new(2, 5)..Point::new(2, 5), cx);
 
         let snippets = snippets
             .into_iter()
@@ -589,7 +784,7 @@ mod tests {
         );
 
         // Jupytext snippets intersecting a non-empty selection
-        let (snippets, _) = runnable_ranges(&snapshot, Point::new(2, 5)..Point::new(6, 2));
+        let (snippets, _) = runnable_ranges(&snapshot, Point::new(2, 5)..Point::new(6, 2), cx);
         let snippets = snippets
             .into_iter()
             .map(|range| snapshot.text_for_range(range).collect::<String>())
@@ -615,7 +810,50 @@ mod tests {
     }
 
     #[gpui::test]
-    fn test_markdown_code_blocks(cx: &mut AppContext) {
+    fn test_markdown_code_blocks(cx: &mut App) {
+        use crate::kernels::LocalKernelSpecification;
+        use jupyter_protocol::JupyterKernelspec;
+
+        // Initialize settings
+        settings::init(cx);
+        editor::init(cx);
+
+        // Initialize the ReplStore with a fake filesystem
+        let fs = Arc::new(project::RealFs::new(None, cx.background_executor().clone()));
+        ReplStore::init(fs, cx);
+
+        // Add mock kernel specifications for TypeScript and Python
+        let store = ReplStore::global(cx);
+        store.update(cx, |store, cx| {
+            let typescript_spec = KernelSpecification::Jupyter(LocalKernelSpecification {
+                name: "typescript".into(),
+                kernelspec: JupyterKernelspec {
+                    argv: vec![],
+                    display_name: "TypeScript".into(),
+                    language: "typescript".into(),
+                    interrupt_mode: None,
+                    metadata: None,
+                    env: None,
+                },
+                path: std::path::PathBuf::new(),
+            });
+
+            let python_spec = KernelSpecification::Jupyter(LocalKernelSpecification {
+                name: "python".into(),
+                kernelspec: JupyterKernelspec {
+                    argv: vec![],
+                    display_name: "Python".into(),
+                    language: "python".into(),
+                    interrupt_mode: None,
+                    metadata: None,
+                    env: None,
+                },
+                path: std::path::PathBuf::new(),
+            });
+
+            store.set_kernel_specs_for_testing(vec![typescript_spec, python_spec], cx);
+        });
+
         let markdown = languages::language("markdown", tree_sitter_md::LANGUAGE.into());
         let typescript = languages::language(
             "typescript",
@@ -624,11 +862,11 @@ mod tests {
         let python = languages::language("python", tree_sitter_python::LANGUAGE.into());
         let language_registry = Arc::new(LanguageRegistry::new(cx.background_executor().clone()));
         language_registry.add(markdown.clone());
-        language_registry.add(typescript.clone());
-        language_registry.add(python.clone());
+        language_registry.add(typescript);
+        language_registry.add(python);
 
         // Two code blocks intersecting with selection
-        let buffer = cx.new_model(|cx| {
+        let buffer = cx.new(|cx| {
             let mut buffer = Buffer::local(
                 indoc! { r#"
                     Hey this is Markdown!
@@ -651,7 +889,7 @@ mod tests {
         });
         let snapshot = buffer.read(cx).snapshot();
 
-        let (snippets, _) = runnable_ranges(&snapshot, Point::new(3, 5)..Point::new(8, 5));
+        let (snippets, _) = runnable_ranges(&snapshot, Point::new(3, 5)..Point::new(8, 5), cx);
         let snippets = snippets
             .into_iter()
             .map(|range| snapshot.text_for_range(range).collect::<String>())
@@ -670,7 +908,7 @@ mod tests {
         );
 
         // Three code blocks intersecting with selection
-        let buffer = cx.new_model(|cx| {
+        let buffer = cx.new(|cx| {
             let mut buffer = Buffer::local(
                 indoc! { r#"
                     Hey this is Markdown!
@@ -696,7 +934,7 @@ mod tests {
         });
         let snapshot = buffer.read(cx).snapshot();
 
-        let (snippets, _) = runnable_ranges(&snapshot, Point::new(3, 5)..Point::new(12, 5));
+        let (snippets, _) = runnable_ranges(&snapshot, Point::new(3, 5)..Point::new(12, 5), cx);
         let snippets = snippets
             .into_iter()
             .map(|range| snapshot.text_for_range(range).collect::<String>())
@@ -716,7 +954,7 @@ mod tests {
         );
 
         // Python code block
-        let buffer = cx.new_model(|cx| {
+        let buffer = cx.new(|cx| {
             let mut buffer = Buffer::local(
                 indoc! { r#"
                     Hey this is Markdown!
@@ -735,7 +973,7 @@ mod tests {
         });
         let snapshot = buffer.read(cx).snapshot();
 
-        let (snippets, _) = runnable_ranges(&snapshot, Point::new(4, 5)..Point::new(5, 5));
+        let (snippets, _) = runnable_ranges(&snapshot, Point::new(4, 5)..Point::new(5, 5), cx);
         let snippets = snippets
             .into_iter()
             .map(|range| snapshot.text_for_range(range).collect::<String>())
@@ -750,5 +988,77 @@ mod tests {
                 "#
             },]
         );
+    }
+
+    #[gpui::test]
+    fn test_skip_blank_lines_to_next_cell(cx: &mut App) {
+        let test_language = Arc::new(Language::new(
+            LanguageConfig {
+                name: "TestLang".into(),
+                line_comments: vec!["# ".into()],
+                ..Default::default()
+            },
+            None,
+        ));
+
+        let buffer = cx.new(|cx| {
+            Buffer::local(
+                indoc! { r#"
+                    print(1 + 1)
+
+                    print(2 + 2)
+                "# },
+                cx,
+            )
+            .with_language(test_language.clone(), cx)
+        });
+        let snapshot = buffer.read(cx).snapshot();
+
+        // Selection on blank line should skip to next non-blank cell
+        let (snippets, _) = runnable_ranges(&snapshot, Point::new(1, 0)..Point::new(1, 0), cx);
+        let snippets = snippets
+            .into_iter()
+            .map(|range| snapshot.text_for_range(range).collect::<String>())
+            .collect::<Vec<_>>();
+        assert_eq!(snippets, vec!["print(2 + 2)"]);
+
+        // Multiple blank lines should also skip forward
+        let buffer = cx.new(|cx| {
+            Buffer::local(
+                indoc! { r#"
+                    print(1 + 1)
+
+
+
+                    print(2 + 2)
+                "# },
+                cx,
+            )
+            .with_language(test_language.clone(), cx)
+        });
+        let snapshot = buffer.read(cx).snapshot();
+
+        let (snippets, _) = runnable_ranges(&snapshot, Point::new(2, 0)..Point::new(2, 0), cx);
+        let snippets = snippets
+            .into_iter()
+            .map(|range| snapshot.text_for_range(range).collect::<String>())
+            .collect::<Vec<_>>();
+        assert_eq!(snippets, vec!["print(2 + 2)"]);
+
+        // Blank lines at end of file should return nothing
+        let buffer = cx.new(|cx| {
+            Buffer::local(
+                indoc! { r#"
+                    print(1 + 1)
+
+                "# },
+                cx,
+            )
+            .with_language(test_language, cx)
+        });
+        let snapshot = buffer.read(cx).snapshot();
+
+        let (snippets, _) = runnable_ranges(&snapshot, Point::new(1, 0)..Point::new(1, 0), cx);
+        assert!(snippets.is_empty());
     }
 }

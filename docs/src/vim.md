@@ -1,20 +1,15 @@
+---
+title: Vim Mode - Zed
+description: Full Vim emulation in Zed with motions, text objects, visual mode, macros, and Zed-specific extensions.
+---
+
 # Vim Mode
 
-Zed includes a Vim emulation layer known as "vim mode". On this page, you will learn how to turn Zed's vim mode on or off, what tools and commands Zed provides to help you navigate and edit your code, and generally how to make the most of vim mode in Zed.
-
-You'll learn how to:
-
-- Understand the core differences between Zed's vim mode and traditional Vim
-- Enable or disable vim mode
-- Make the most of Zed-specific features within vim mode
-- Customize vim mode key bindings
-- Configure vim mode settings
-
-Whether you're new to vim mode or an experienced Vim user looking to optimize your Zed experience, this guide will help you harness the full power of modal editing in Zed.
+Zed includes a Vim emulation layer. This page covers enabling and disabling vim mode, key bindings, Zed-specific features, and configuration options.
 
 ## Zed's vim mode design
 
-Vim mode tries to offer a familiar experience to Vim users: it replicates the behavior of motions and commands precisely when it makes sense and uses Zed-specific functionality to provide an editing experience that "just works" without requiring configuration on your part.
+Vim mode replicates the behavior of motions and commands where it makes sense and uses Zed-specific functionality where Zed's approach is better. The goal is a familiar experience that works out of the box without requiring configuration.
 
 This includes support for semantic navigation, multiple cursors, or other features usually provided by plugins like surrounding text.
 
@@ -39,7 +34,7 @@ If you missed this, you can toggle vim mode on or off anytime by opening the com
 
 > **Note**: This command toggles the following property in your user settings:
 >
-> ```json
+> ```json [settings]
 > {
 >   "vim_mode": true
 > }
@@ -47,7 +42,7 @@ If you missed this, you can toggle vim mode on or off anytime by opening the com
 
 ## Zed-specific features
 
-Zed is built on a modern foundation that (among other things) uses tree-sitter and language servers to understand the content of the file you're editing and supports multiple cursors out of the box.
+Zed is built on a modern foundation that (among other things) uses Tree-sitter and language servers to understand the content of the file you're editing and supports multiple cursors out of the box.
 
 Vim mode has several "core Zed" key bindings that will help you make the most of Zed's specific feature set.
 
@@ -72,31 +67,67 @@ The following commands use the language server to help you navigate and refactor
 
 ### Git
 
-| Command                   | Default Shortcut |
-| ------------------------- | ---------------- |
-| Go to next git change     | `] c`            |
-| Go to previous git change | `[ c`            |
+| Command                         | Default Shortcut |
+| ------------------------------- | ---------------- |
+| Go to next git change           | `] c`            |
+| Go to previous git change       | `[ c`            |
+| Expand diff hunk                | `d o`            |
+| Toggle staged                   | `d O`            |
+| Stage and next (in diff view)   | `d u`            |
+| Unstage and next (in diff view) | `d U`            |
+| Restore change                  | `d p`            |
 
-### Treesitter
+### Tree-sitter
 
-Treesitter is a powerful tool that Zed uses to understand the structure of your code. These commands help you navigate your code semantically.
+Tree-sitter is the parser Zed uses to understand the structure of your code. Zed provides motions that change the current cursor position, and text objects that can be used as the target of actions.
 
-| Command                      | Default Shortcut |
-| ---------------------------- | ---------------- |
-| Select a smaller syntax node | `] x`            |
-| Select a larger syntax node  | `[ x`            |
+| Command                         | Default Shortcut            |
+| ------------------------------- | --------------------------- |
+| Go to next/previous method      | `] m` / `[ m`               |
+| Go to next/previous method end  | `] M` / `[ M`               |
+| Go to next/previous section     | `] ]` / `[ [`               |
+| Go to next/previous section end | `] [` / `[ ]`               |
+| Go to next/previous comment     | `] /`, `] *` / `[ /`, `[ *` |
+| Select a larger syntax node     | `[ x`                       |
+| Select a smaller syntax node    | `] x`                       |
+
+| Text Objects                                               | Default Shortcut |
+| ---------------------------------------------------------- | ---------------- |
+| Around a class, definition, etc.                           | `a c`            |
+| Inside a class, definition, etc.                           | `i c`            |
+| Around a function, method etc.                             | `a f`            |
+| Inside a function, method, etc.                            | `i f`            |
+| A comment                                                  | `g c`            |
+| An argument, or list item, etc.                            | `i a`            |
+| An argument, or list item, etc. (including trailing comma) | `a a`            |
+| Around an HTML-like tag                                    | `a t`            |
+| Inside an HTML-like tag                                    | `i t`            |
+| The current indent level, and one line before and after    | `a I`            |
+| The current indent level, and one line before              | `a i`            |
+| The current indent level                                   | `i i`            |
+
+Note that the definitions for the targets of the `[m` family of motions are the same as the
+boundaries defined by `af`. The targets of the `[[` are the same as those defined by `ac`, though
+if there are no classes, then functions are also used. Similarly `gc` is used to find `[ /`. `g c`
+
+The definition of functions, classes and comments is language dependent, and support can be added
+to extensions by adding a [`textobjects.scm`]. The definition of arguments and tags operates at
+the Tree-sitter level, but looks for certain patterns in the parse tree and is not currently configurable
+per language.
 
 ### Multi cursor
 
 These commands help you manage multiple cursors in Zed.
 
-| Command                                                      | Default Shortcut |
-| ------------------------------------------------------------ | ---------------- |
-| Add a cursor selecting the next copy of the current word     | `g l`            |
-| Add a cursor selecting the previous copy of the current word | `g L`            |
-| Skip latest word selection, and add next                     | `g >`            |
-| Skip latest word selection, and add previous                 | `g <`            |
-| Add a visual selection for every copy of the current word    | `g a`            |
+| Command                                                                           | Default Shortcut |
+| --------------------------------------------------------------------------------- | ---------------- |
+| Add a cursor selecting the next copy of the current word                          | `g l`            |
+| Add a cursor selecting the previous copy of the current word                      | `g L`            |
+| Add a cursor at the end of every line in the current visual selection             | `g A`            |
+| Add a cursor at the first character of every line in the current visual selection | `g I`            |
+| Add a visual selection for every copy of the current word                         | `g a`            |
+| Skip latest word selection, and add next                                          | `g >`            |
+| Skip latest word selection, and add previous                                      | `g <`            |
 
 ### Pane management
 
@@ -124,12 +155,88 @@ The following commands help you bring up Zed's completion menu, request a sugges
 
 ### Supported plugins
 
-Zed's vim mode includes some features that are usually provided by very popular plugins in the Vim ecosystem:
+Zed's vim mode includes features commonly provided by plugins in the Vim ecosystem:
 
 - You can surround text objects with `ys` (yank surround), change surrounding with `cs`, and delete surrounding with `ds`.
 - You can comment and uncomment selections with `gc` in visual mode and `gcc` in normal mode.
 - The project panel supports many shortcuts modeled after the Vim plugin `netrw`: navigation with `hjkl`, open file with `o`, open file in a new tab with `t`, etc.
 - You can add key bindings to your keymap to navigate "camelCase" names. [Head down to the Optional key bindings](#optional-key-bindings) section to learn how.
+- You can use `gR` to do [ReplaceWithRegister](https://github.com/vim-scripts/ReplaceWithRegister).
+- You can use `cx` for [vim-exchange](https://github.com/tommcdo/vim-exchange) functionality. Note that it does not have a default binding in visual mode, but you can add one to your keymap (refer to the [optional key bindings](#optional-key-bindings) section).
+- You can navigate to indent depths relative to your cursor with the [indent wise](https://github.com/jeetsukumaran/vim-indentwise) plugin `[-`, `]-`, `[+`, `]+`, `[=`, `]=`.
+- You can select quoted text with AnyQuotes and bracketed text with AnyBrackets text objects. Zed also provides MiniQuotes and MiniBrackets which offer alternative selection behavior based on the [mini.ai](https://github.com/echasnovski/mini.nvim/blob/main/readmes/mini-ai.md) Neovim plugin. See the [Quote and Bracket text objects](#quote-and-bracket-text-objects) section below for details.
+- You can configure AnyQuotes, AnyBrackets, MiniQuotes, and MiniBrackets text objects for selecting quoted and bracketed text using different selection strategies. See the [Any Bracket Functionality](#any-bracket-functionality) section below for details.
+
+### Any Bracket Functionality
+
+Zed offers two different strategies for selecting text surrounded by any quote, or any bracket. These text objects are **not enabled by default** and must be configured in your keymap to be used.
+
+#### Included Characters
+
+Each text object type works with specific characters:
+
+| Text Object              | Characters                                                                             |
+| ------------------------ | -------------------------------------------------------------------------------------- |
+| AnyQuotes/MiniQuotes     | Single quote (`'`), Double quote (`"`), Backtick (`` ` ``)                             |
+| AnyBrackets/MiniBrackets | Parentheses (`()`), Square brackets (`[]`), Curly braces (`{}`), Angle brackets (`<>`) |
+
+Both "Any" and "Mini" variants work with the same character sets, but differ in their selection strategy.
+
+#### AnyQuotes and AnyBrackets (Traditional Vim behavior)
+
+These text objects implement traditional Vim behavior:
+
+- **Selection priority**: Finds the innermost (closest) quotes or brackets first
+- **Fallback mechanism**: If none are found, falls back to the current line
+- **Character-based matching**: Focuses solely on open and close characters without considering syntax
+- **Vanilla Vim similarity**: AnyBrackets matches the behavior of commands like `ci<`, `ci(`, etc., in vanilla Vim, including potential edge cases (like considering `>` in `=>` as a closing delimiter)
+
+#### MiniQuotes and MiniBrackets (mini.ai behavior)
+
+These text objects implement the behavior of the [mini.ai](https://github.com/echasnovski/mini.nvim/blob/main/readmes/mini-ai.md) Neovim plugin:
+
+- **Selection priority**: Searches the current line first before expanding outward
+- **Tree-sitter integration**: Uses Tree-sitter queries for more context-aware selections
+- **Syntax-aware matching**: Can distinguish between actual brackets and similar characters in other contexts (like `>` in `=>`)
+
+#### Choosing Between Approaches
+
+- Use **AnyQuotes/AnyBrackets** if you:
+
+  - Prefer traditional Vim behavior
+  - Want consistent character-based selection prioritizing innermost delimiters
+  - Need behavior that closely matches vanilla Vim's text objects
+
+- Use **MiniQuotes/MiniBrackets** if you:
+  - Prefer the mini.ai plugin behavior
+  - Want more context-aware selections using Tree-sitter
+  - Prefer current-line priority when searching
+
+#### Example Configuration
+
+To use these text objects, you need to add bindings to your keymap. Here's an example configuration that makes them available when using text object operators (`i` and `a`) or change-surrounds (`cs`):
+
+```json [keymap]
+{
+  "context": "vim_operator == a || vim_operator == i || vim_operator == cs",
+  "bindings": {
+    // Traditional Vim behavior
+    "q": "vim::AnyQuotes",
+    "b": "vim::AnyBrackets",
+
+    // mini.ai plugin behavior
+    "Q": "vim::MiniQuotes",
+    "B": "vim::MiniBrackets"
+  }
+}
+```
+
+With this configuration, you can use commands like:
+
+- `cib` - Change inside brackets using AnyBrackets behavior
+- `ciB` - Change inside brackets using MiniBrackets behavior
+- `ciq` - Change inside quotes using AnyQuotes behavior
+- `ciQ` - Change inside quotes using MiniQuotes behavior
 
 ## Command palette
 
@@ -143,26 +250,28 @@ Below, you'll find tables listing the commands you can use in the command palett
 
 This table shows commands for managing windows, tabs, and panes. As commands don't support arguments currently, you cannot specify a filename when saving or creating a new file.
 
-| Command        | Description                                          |
-| -------------- | ---------------------------------------------------- |
-| `:w[rite][!]`  | Save the current file                                |
-| `:wq[!]`       | Save the file and close the buffer                   |
-| `:q[uit][!]`   | Close the buffer                                     |
-| `:wa[ll][!]`   | Save all open files                                  |
-| `:wqa[ll][!]`  | Save all open files and close all buffers            |
-| `:qa[ll][!]`   | Close all buffers                                    |
-| `:[e]x[it][!]` | Close the buffer                                     |
-| `:up[date]`    | Save the current file                                |
-| `:cq`          | Quit completely (close all running instances of Zed) |
-| `:vs[plit]`    | Split the pane vertically                            |
-| `:sp[lit]`     | Split the pane horizontally                          |
-| `:new`         | Create a new file in a horizontal split              |
-| `:vne[w]`      | Create a new file in a vertical split                |
-| `:tabedit`     | Create a new file in a new tab                       |
-| `:tabnew`      | Create a new file in a new tab                       |
-| `:tabn[ext]`   | Go to the next tab                                   |
-| `:tabp[rev]`   | Go to previous tab                                   |
-| `:tabc[lose]`  | Close the current tab                                |
+| Command         | Description                                          |
+| --------------- | ---------------------------------------------------- |
+| `:w[rite][!]`   | Save the current file                                |
+| `:wq[!]`        | Save the file and close the buffer                   |
+| `:q[uit][!]`    | Close the buffer                                     |
+| `:wa[ll][!]`    | Save all open files                                  |
+| `:wqa[ll][!]`   | Save all open files and close all buffers            |
+| `:qa[ll][!]`    | Close all buffers                                    |
+| `:[e]x[it][!]`  | Close the buffer                                     |
+| `:up[date]`     | Save the current file                                |
+| `:cq`           | Quit completely (close all running instances of Zed) |
+| `:bd[elete][!]` | Close the active file in all panes                   |
+| `:vs[plit]`     | Split the pane vertically                            |
+| `:sp[lit]`      | Split the pane horizontally                          |
+| `:new`          | Create a new file in a horizontal split              |
+| `:vne[w]`       | Create a new file in a vertical split                |
+| `:tabedit`      | Create a new file in a new tab                       |
+| `:tabnew`       | Create a new file in a new tab                       |
+| `:tabn[ext]`    | Go to the next tab                                   |
+| `:tabp[rev]`    | Go to previous tab                                   |
+| `:tabc[lose]`   | Close the current tab                                |
+| `:ls`           | Show all buffers                                     |
 
 > **Note:** The `!` character is used to force the command to execute without saving changes or prompting before overwriting a file.
 
@@ -176,6 +285,8 @@ These ex commands open Zed's various panels and windows.
 | Open the collaboration panel | `:C[ollab]`      |
 | Open the chat panel          | `:Ch[at]`        |
 | Open the AI panel            | `:A[I]`          |
+| Open the git panel           | `:G[it]`         |
+| Open the debug panel         | `:D[ebug]`       |
 | Open the notifications panel | `:No[tif]`       |
 | Open the feedback window     | `:fe[edback]`    |
 | Open the diagnostics window  | `:cl[ist]`       |
@@ -213,11 +324,11 @@ These commands jump to specific positions in the file.
 
 ### Replacement
 
-This command replaces text. It emulates the substitute command in vim. The substitute command uses regular expressions, and Zed uses a slightly different syntax than vim. You can learn more about Zed's syntax below, [in the regex differences section](#regex-differences). Also, by default, Zed always replaces all occurrences of the search pattern in the current line.
+This command replaces text. It emulates the substitute command in vim. The substitute command uses regular expressions, and Zed uses a slightly different syntax than vim. You can learn more about Zed's syntax below, [in the regex differences section](#regex-differences). Zed will replace only the first occurrence of the search pattern in the current line. To replace all matches append the `g` flag.
 
-| Command              | Description                       |
-| -------------------- | --------------------------------- |
-| `:[range]s/foo/bar/` | Replace instances of foo with bar |
+| Command                 | Description                       |
+| ----------------------- | --------------------------------- |
+| `:[range]s/foo/bar/[g]` | Replace instances of foo with bar |
 
 ### Editing
 
@@ -229,6 +340,17 @@ These commands help you edit text.
 | `:d[elete][l][p]` | Delete the current line                                 |
 | `:s[ort] [i]`     | Sort the current selection (with i, case-insensitively) |
 | `:y[ank]`         | Yank (copy) the current selection or line               |
+
+### Set
+
+These commands modify editor options locally for the current buffer.
+
+| Command                         | Description                                                                                   |
+| ------------------------------- | --------------------------------------------------------------------------------------------- |
+| `:se[t] [no]wrap`               | Lines longer than the width of the window will wrap and displaying continues on the next line |
+| `:se[t] [no]nu[mber]`           | Print the line number in front of each line                                                   |
+| `:se[t] [no]r[elative]nu[mber]` | Changes the displayed number to be relative to the cursor                                     |
+| `:se[t] [no]i[gnore]c[ase]`     | Controls whether the buffer and project search use case-sensitive matching                    |
 
 ### Command mnemonics
 
@@ -243,33 +365,27 @@ As any Zed command is available, you may find that it's helpful to remember mnem
 
 ## Customizing key bindings
 
-In this section, we'll learn how to customize the key bindings of Zed's vim mode. You'll learn:
-
-- How to select the correct context for your new key bindings.
-- Useful contexts for vim mode key bindings.
-- Common key bindings to customize for extra productivity.
-
 ### Selecting the correct context
 
 Zed's key bindings are evaluated only when the `"context"` property matches your location in the editor. For example, if you add key bindings to the `"Editor"` context, they will only work when you're editing a file. If you add key bindings to the `"Workspace"` context, they will work everywhere in Zed. Here's an example of a key binding that saves when you're editing a file:
 
-```json
+```json [keymap]
 {
   "context": "Editor",
   "bindings": {
-    "ctrl-s": "file::Save"
+    "ctrl-s": "workspace::Save"
   }
 }
 ```
 
 Contexts are nested, so when you're editing a file, the context is the `"Editor"` context, which is inside the `"Pane"` context, which is inside the `"Workspace"` context. That's why any key bindings you add to the `"Workspace"` context will work when you're editing a file. Here's an example:
 
-```json
+```json [keymap]
 // This key binding will work when you're editing a file. It comes built into Zed by default as the workspace: save command.
 {
   "context": "Workspace",
   "bindings": {
-    "ctrl-s": "file::Save"
+    "ctrl-s": "workspace::Save"
   }
 }
 ```
@@ -295,7 +411,7 @@ Vim mode adds several contexts to the `"Editor"` context:
 
 Here's a template with useful vim mode contexts to help you customize your vim mode key bindings. You can copy it and integrate it into your user keymap.
 
-```json
+```json [keymap]
 [
   {
     "context": "VimControl && !menu",
@@ -334,66 +450,104 @@ By default, you can navigate between the different files open in the editor with
 
 But you cannot use the same shortcuts to move between all the editor docks (the terminal, project panel, assistant panel, ...). If you want to use the same shortcuts to navigate to the docks, you can add the following key bindings to your user keymap.
 
-```json
+```json [keymap]
 {
   "context": "Dock",
   "bindings": {
-    "ctrl-w h": ["workspace::ActivatePaneInDirection", "Left"],
-    "ctrl-w l": ["workspace::ActivatePaneInDirection", "Right"],
-    "ctrl-w k": ["workspace::ActivatePaneInDirection", "Up"],
-    "ctrl-w j": ["workspace::ActivatePaneInDirection", "Down"]
+    "ctrl-w h": "workspace::ActivatePaneLeft",
+    "ctrl-w l": "workspace::ActivatePaneRight",
+    "ctrl-w k": "workspace::ActivatePaneUp",
+    "ctrl-w j": "workspace::ActivatePaneDown"
     // ... or other keybindings
   }
 }
 ```
 
-Subword motion, which allows you to navigate and select individual words in camelCase or snake_case, is not enabled by default. To enable it, add these bindings to your keymap.
+Subword motion, which allows you to navigate and select individual words in `camelCase` or `snake_case`, is not enabled by default. To enable it, add these bindings to your keymap.
 
-```json
-[
-  {
-    "context": "VimControl && !menu && vim_mode != operator",
-    "bindings": {
-      "w": "vim::NextSubwordStart",
-      "b": "vim::PreviousSubwordStart",
-      "e": "vim::NextSubwordEnd",
-      "g e": "vim::PreviousSubwordEnd"
-    }
-  }
-]
-```
-
-Vim mode comes with shortcuts to surround the selection in normal mode (`ys`), but it doesn't have a shortcut to add surrounds in visual mode. By default, `shift-s` substitutes the selection (erases the text and enters insert mode). To use `shift-s` to add surrounds in visual mode, you can add the following object to your keymap.
-
-```json
+```json [keymap]
 {
-  "context": "vim_mode == visual",
+  "context": "VimControl && !menu && vim_mode != operator",
   "bindings": {
-    "shift-s": [
-      "vim::PushOperator",
-      {
-        "AddSurrounds": {}
-      }
-    ]
+    "w": "vim::NextSubwordStart",
+    "b": "vim::PreviousSubwordStart",
+    "e": "vim::NextSubwordEnd",
+    "g e": "vim::PreviousSubwordEnd"
   }
 }
 ```
 
-### Restoring common text editing keybindings
+> Note: Operations like `dw` remain unaffected. If you would like operations to
+> also use subword motion, remove `vim_mode != operator` from the `context`.
 
-If you're using vim mode on Linux or Windows, you may find it overrides keybindings you can't live without: `ctrl+v` to copy, `ctrl+f` to search, etc. You can restore them by copying this data into your keymap:
+Vim mode comes with shortcuts to surround the selection in normal mode (`ys`), but it doesn't have a shortcut to add surrounds in visual mode. By default, `shift-s` substitutes the selection (erases the text and enters insert mode). To use `shift-s` to add surrounds in visual mode, you can add the following object to your keymap.
 
-```json
+```json [keymap]
+{
+  "context": "vim_mode == visual",
+  "bindings": {
+    "shift-s": "vim::PushAddSurrounds"
+  }
+}
+```
+
+In non-modal text editors, cursor navigation typically wraps when moving past line ends. Zed, however, handles this behavior exactly like Vim by default: the cursor stops at line boundaries. If you prefer your cursor to wrap between lines, override these keybindings:
+
+```json [keymap]
+// In VimScript, this would look like this:
+// set whichwrap+=<,>,[,],h,l
+{
+  "context": "VimControl && !menu",
+  "bindings": {
+    "left": "vim::WrappingLeft",
+    "right": "vim::WrappingRight",
+    "h": "vim::WrappingLeft",
+    "l": "vim::WrappingRight"
+  }
+}
+```
+
+The [Sneak motion](https://github.com/justinmk/vim-sneak) feature allows for quick navigation to any two-character sequence in your text. You can enable it by adding the following keybindings to your keymap. By default, the `s` key is mapped to `vim::Substitute`. Adding these bindings will override that behavior, so ensure this change aligns with your workflow preferences.
+
+```json [keymap]
+{
+  "context": "vim_mode == normal || vim_mode == visual",
+  "bindings": {
+    "s": "vim::PushSneak",
+    "shift-s": "vim::PushSneakBackward"
+  }
+}
+```
+
+The [vim-exchange](https://github.com/tommcdo/vim-exchange) feature does not have a default binding for visual mode, as the `shift-x` binding conflicts with the default `shift-x` binding for visual mode (`vim::VisualDeleteLine`). To assign the default vim-exchange binding, add the following keybinding to your keymap:
+
+```json [keymap]
+{
+  "context": "vim_mode == visual",
+  "bindings": {
+    "shift-x": "vim::Exchange"
+  }
+}
+```
+
+### Restoring common text editing and Zed keybindings
+
+If you're using vim mode on Linux or Windows, you may find it overrides keybindings you can't live without: `ctrl+v` to paste, `ctrl+f` to search, etc. You can restore them by copying this data into your keymap:
+
+```json [keymap]
 {
   "context": "Editor && !menu",
   "bindings": {
-    "ctrl-c": "editor::Copy",          // vim default: return to normal mode
-    "ctrl-x": "editor::Cut",           // vim default: decrement
-    "ctrl-v": "editor::Paste",         // vim default: visual block mode
-    "ctrl-y": "editor::Undo",          // vim default: line up
-    "ctrl-f": "buffer_search::Deploy", // vim default: page down
-    "ctrl-o": "workspace::Open",       // vim default: go back
-    "ctrl-a": "editor::SelectAll",     // vim default: increment
+    "ctrl-f": "buffer_search::Deploy",      // vim default: page down
+    "ctrl-c": "editor::Copy",               // vim default: return to normal mode
+    "ctrl-x": "editor::Cut",                // vim default: decrement
+    "ctrl-v": "editor::Paste",              // vim default: visual block mode
+    "ctrl-a": "editor::SelectAll",          // vim default: increment
+    "ctrl-y": "editor::Undo",               // vim default: line up
+    "ctrl-t": "project_symbols::Toggle",    // vim default: go to older tag
+    "ctrl-o": "workspace::Open",            // vim default: go back
+    "ctrl-s": "workspace::Save",            // vim default: show signature
+    "ctrl-b": "workspace::ToggleLeftDock"   // vim default: down
   }
 },
 ```
@@ -404,15 +558,18 @@ You can change the following settings to modify vim mode's behavior:
 
 | Property                     | Description                                                                                                                                                                                   | Default Value |
 | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------- |
+| default_mode                 | The default mode to start in. One of "normal", "insert", "replace", "visual", "visual_line", "visual_block", "helix_normal".                                                                  | "normal"      |
 | use_system_clipboard         | Determines how system clipboard is used:<br><ul><li>"always": use for all operations</li><li>"never": only use when explicitly specified</li><li>"on_yank": use for yank operations</li></ul> | "always"      |
-| use_multiline_find           | If `true`, `f` and `t` motions extend across multiple lines.                                                                                                                                  | false         |
+| use_multiline_find           | deprecated                                                                                                                                                                                    |
 | use_smartcase_find           | If `true`, `f` and `t` motions are case-insensitive when the target letter is lowercase.                                                                                                      | false         |
+| gdefault                     | If `true`, the `:substitute` command replaces all matches in a line by default (as if `g` flag was given). The `g` flag then toggles this, replacing only the first match.                    | false         |
 | toggle_relative_line_numbers | If `true`, line numbers are relative in normal mode and absolute in insert mode, giving you the best of both options.                                                                         | false         |
 | custom_digraphs              | An object that allows you to add custom digraphs. Read below for an example.                                                                                                                  | {}            |
+| highlight_on_yank_duration   | The duration of the highlight animation(in ms). Set to `0` to disable                                                                                                                         | 200           |
 
 Here's an example of adding a digraph for the zombie emoji. This allows you to type `ctrl-k f z` to insert a zombie emoji. You can add as many digraphs as you like.
 
-```json
+```json [settings]
 {
   "vim": {
     "custom_digraphs": {
@@ -424,13 +581,15 @@ Here's an example of adding a digraph for the zombie emoji. This allows you to t
 
 Here's an example of these settings changed:
 
-```json
+```json [settings]
 {
   "vim": {
+    "default_mode": "insert",
     "use_system_clipboard": "never",
-    "use_multiline_find": true,
     "use_smartcase_find": true,
+    "gdefault": true,
     "toggle_relative_line_numbers": true,
+    "highlight_on_yank_duration": 50,
     "custom_digraphs": {
       "fz": "🧟‍♀️"
     }
@@ -442,24 +601,24 @@ Here's an example of these settings changed:
 
 Here are a few general Zed settings that can help you fine-tune your Vim experience:
 
-| Property                | Description                                                                                                                                                   | Default Value          |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------- |
-| cursor_blink            | If `true`, the cursor blinks.                                                                                                                                 | `true`                 |
-| relative_line_numbers   | If `true`, line numbers in the left gutter are relative to the cursor.                                                                                        | `true`                 |
-| scrollbar               | Object that controls the scrollbar display. Set to `{ "show": "never" }` to hide the scroll bar.                                                              | `{ "show": "always" }` |
-| scroll_beyond_last_line | If set to `"one_page"`, allows scrolling up to one page beyond the last line. Set to `"off"` to prevent this behavior.                                        | `"one_page"`           |
-| vertical_scroll_margin  | The number of lines to keep above or below the cursor when scrolling. Set to `0` to allow the cursor to go up to the edges of the screen vertically.          | `3`                    |
-| gutter.line_numbers     | Controls the display of line numbers in the gutter. Set the `"line_numbers"` property to `false` to hide line numbers.                                        | `true`                 |
-| command_aliases         | Object that defines aliases for commands in the command palette. You can use it to define shortcut names for commands you use often. Read below for examples. | `{}`                   |
+| Property                | Description                                                                                                                                                   | Default Value        |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- |
+| cursor_blink            | If `true`, the cursor blinks.                                                                                                                                 | `true`               |
+| relative_line_numbers   | If `"enabled"`, line numbers in the left gutter are relative to the cursor. If `"wrapped"`, they also display for wrapped lines.                              | `"disabled"`         |
+| scrollbar               | Object that controls the scrollbar display. Set to `{ "show": "never" }` to hide the scroll bar.                                                              | `{ "show": "auto" }` |
+| scroll_beyond_last_line | If set to `"one_page"`, allows scrolling up to one page beyond the last line. Set to `"off"` to prevent this behavior.                                        | `"one_page"`         |
+| vertical_scroll_margin  | The number of lines to keep above or below the cursor when scrolling. Set to `0` to allow the cursor to go up to the edges of the screen vertically.          | `3`                  |
+| gutter.line_numbers     | Controls the display of line numbers in the gutter. Set the `"line_numbers"` property to `false` to hide line numbers.                                        | `true`               |
+| command_aliases         | Object that defines aliases for commands in the command palette. You can use it to define shortcut names for commands you use often. Read below for examples. | `{}`                 |
 
 Here's an example of these settings changed:
 
-```json
+```json [settings]
 {
   // Disable cursor blink
   "cursor_blink": false,
   // Use relative line numbers
-  "relative_line_numbers": true,
+  "relative_line_numbers": "enabled",
   // Hide the scroll bar
   "scrollbar": { "show": "never" },
   // Prevent the buffer from scrolling beyond the last line
@@ -467,7 +626,7 @@ Here's an example of these settings changed:
   // Allow the cursor to reach the edges of the screen
   "vertical_scroll_margin": 0,
   "gutter": {
-    // Disable line numbers completely:
+    // Disable line numbers completely
     "line_numbers": false
   },
   "command_aliases": {

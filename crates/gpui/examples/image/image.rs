@@ -1,9 +1,17 @@
+#![cfg_attr(target_family = "wasm", no_main)]
+
+use std::fs;
 use std::path::PathBuf;
-use std::str::FromStr;
 use std::sync::Arc;
 
-use gpui::*;
-use std::fs;
+use anyhow::Result;
+use gpui::{
+    App, AppContext, AssetSource, Bounds, Context, ImageSource, KeyBinding, Menu, MenuItem, Point,
+    SharedString, SharedUri, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
+    img, prelude::*, px, rgb, size,
+};
+#[cfg(not(target_family = "wasm"))]
+use reqwest_client::ReqwestClient;
 
 struct Assets {
     base: PathBuf,
@@ -48,70 +56,91 @@ impl ImageContainer {
 }
 
 impl RenderOnce for ImageContainer {
-    fn render(self, _: &mut WindowContext) -> impl IntoElement {
+    fn render(self, _window: &mut Window, _: &mut App) -> impl IntoElement {
         div().child(
             div()
                 .flex_row()
                 .size_full()
                 .gap_4()
                 .child(self.text)
-                .child(img(self.src).w(px(256.0)).h(px(256.0))),
+                .child(img(self.src).size(px(256.0))),
         )
     }
 }
 
 struct ImageShowcase {
-    local_resource: Arc<PathBuf>,
+    local_resource: Arc<std::path::Path>,
     remote_resource: SharedUri,
     asset_resource: SharedString,
 }
 
 impl Render for ImageShowcase {
-    fn render(&mut self, _cx: &mut ViewContext<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .id("main")
+            .bg(gpui::white())
+            .overflow_y_scroll()
+            .p_5()
             .size_full()
-            .flex()
-            .flex_col()
-            .justify_center()
-            .items_center()
-            .gap_8()
-            .bg(rgb(0xFFFFFF))
             .child(
                 div()
                     .flex()
-                    .flex_row()
+                    .flex_col()
                     .justify_center()
                     .items_center()
                     .gap_8()
-                    .child(ImageContainer::new(
-                        "Image loaded from a local file",
-                        self.local_resource.clone(),
+                    .child(img(
+                        "https://github.com/zed-industries/zed/actions/workflows/ci.yml/badge.svg",
                     ))
-                    .child(ImageContainer::new(
-                        "Image loaded from a remote resource",
-                        self.remote_resource.clone(),
-                    ))
-                    .child(ImageContainer::new(
-                        "Image loaded from an asset",
-                        self.asset_resource.clone(),
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .gap_8()
                     .child(
                         div()
-                            .flex_col()
-                            .child("Auto Width")
-                            .child(img("https://picsum.photos/800/400").h(px(180.))),
+                            .flex()
+                            .flex_row()
+                            .justify_center()
+                            .items_center()
+                            .gap_8()
+                            .child(ImageContainer::new(
+                                "Image loaded from a local file",
+                                self.local_resource.clone(),
+                            ))
+                            .child(ImageContainer::new(
+                                "Image loaded from a remote resource",
+                                self.remote_resource.clone(),
+                            ))
+                            .child(ImageContainer::new(
+                                "Image loaded from an asset",
+                                self.asset_resource.clone(),
+                            )),
                     )
                     .child(
                         div()
+                            .flex()
+                            .flex_row()
+                            .gap_8()
+                            .child(
+                                div()
+                                    .flex_col()
+                                    .child("Auto Width")
+                                    .child(img("https://picsum.photos/800/400").h(px(180.))),
+                            )
+                            .child(
+                                div()
+                                    .flex_col()
+                                    .child("Auto Height")
+                                    .child(img("https://picsum.photos/800/400").w(px(180.))),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
                             .flex_col()
-                            .child("Auto Height")
-                            .child(img("https://picsum.photos/480/640").w(px(180.))),
+                            .justify_center()
+                            .items_center()
+                            .w_full()
+                            .border_1()
+                            .border_color(rgb(0xC0C0C0))
+                            .child("image with max width 100%")
+                            .child(img("https://picsum.photos/800/400").max_w_full()),
                     ),
             )
     }
@@ -119,48 +148,77 @@ impl Render for ImageShowcase {
 
 actions!(image, [Quit]);
 
+fn run_example() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+
+    #[cfg(not(target_family = "wasm"))]
+    let app = gpui_platform::application();
+    #[cfg(target_family = "wasm")]
+    let app = gpui_platform::application();
+    app.with_assets(Assets {
+        base: manifest_dir.join("examples"),
+    })
+    .run(move |cx: &mut App| {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let http_client = ReqwestClient::user_agent("gpui example").unwrap();
+            cx.set_http_client(Arc::new(http_client));
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            // Safety: the web examples run single-threaded; the client is
+            // created and used exclusively on the main thread.
+            let http_client = unsafe {
+                gpui_web::FetchHttpClient::with_user_agent("gpui example")
+                    .expect("failed to create FetchHttpClient")
+            };
+            cx.set_http_client(Arc::new(http_client));
+        }
+
+        cx.activate(true);
+        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+        cx.set_menus(vec![Menu {
+            name: "Image".into(),
+            items: vec![MenuItem::action("Quit", Quit)],
+        }]);
+
+        let window_options = WindowOptions {
+            titlebar: Some(TitlebarOptions {
+                title: Some(SharedString::from("Image Example")),
+                appears_transparent: false,
+                ..Default::default()
+            }),
+
+            window_bounds: Some(WindowBounds::Windowed(Bounds {
+                size: size(px(1100.), px(600.)),
+                origin: Point::new(px(200.), px(200.)),
+            })),
+
+            ..Default::default()
+        };
+
+        cx.open_window(window_options, |_, cx| {
+            cx.new(|_| ImageShowcase {
+                // Relative path to your root project path
+                local_resource: manifest_dir.join("examples/image/app-icon.png").into(),
+                remote_resource: "https://picsum.photos/800/400".into(),
+                asset_resource: "image/color.svg".into(),
+            })
+        })
+        .unwrap();
+    });
+}
+
+#[cfg(not(target_family = "wasm"))]
 fn main() {
     env_logger::init();
+    run_example();
+}
 
-    App::new()
-        .with_assets(Assets {
-            base: PathBuf::from("crates/gpui/examples"),
-        })
-        .run(|cx: &mut AppContext| {
-            cx.activate(true);
-            cx.on_action(|_: &Quit, cx| cx.quit());
-            cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
-            cx.set_menus(vec![Menu {
-                name: "Image".into(),
-                items: vec![MenuItem::action("Quit", Quit)],
-            }]);
-
-            let window_options = WindowOptions {
-                titlebar: Some(TitlebarOptions {
-                    title: Some(SharedString::from("Image Example")),
-                    appears_transparent: false,
-                    ..Default::default()
-                }),
-
-                window_bounds: Some(WindowBounds::Windowed(Bounds {
-                    size: size(px(1100.), px(600.)),
-                    origin: Point::new(px(200.), px(200.)),
-                })),
-
-                ..Default::default()
-            };
-
-            cx.open_window(window_options, |cx| {
-                cx.new_view(|_cx| ImageShowcase {
-                    // Relative path to your root project path
-                    local_resource: Arc::new(
-                        PathBuf::from_str("crates/gpui/examples/image/app-icon.png").unwrap(),
-                    ),
-                    remote_resource: "https://picsum.photos/512/512".into(),
-
-                    asset_resource: "image/color.svg".into(),
-                })
-            })
-            .unwrap();
-        });
+#[cfg(target_family = "wasm")]
+#[wasm_bindgen::prelude::wasm_bindgen(start)]
+pub fn start() {
+    gpui_platform::web_init();
+    run_example();
 }

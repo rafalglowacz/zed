@@ -1,4 +1,5 @@
-mod format;
+mod extension_snippet;
+pub mod format;
 mod registry;
 
 use std::{
@@ -9,18 +10,19 @@ use std::{
 
 use anyhow::Result;
 use collections::{BTreeMap, BTreeSet, HashMap};
-use format::VSSnippetsFile;
+use format::VsSnippetsFile;
 use fs::Fs;
 use futures::stream::StreamExt;
-use gpui::{AppContext, AsyncAppContext, Context, Model, ModelContext, Task, WeakModel};
+use gpui::{App, AppContext as _, AsyncApp, Context, Entity, Task, WeakEntity};
 pub use registry::*;
 use util::ResultExt;
 
-pub fn init(cx: &mut AppContext) {
+pub fn init(cx: &mut App) {
     SnippetRegistry::init_global(cx);
+    extension_snippet::init(cx);
 }
 
-// Is `None` if the snippet file is global.
+/// Language name, or `None` if the snippet file is global.
 type SnippetKind = Option<String>;
 fn file_stem_to_key(stem: &str) -> SnippetKind {
     if stem == "snippets" {
@@ -30,52 +32,62 @@ fn file_stem_to_key(stem: &str) -> SnippetKind {
     }
 }
 
-fn file_to_snippets(file_contents: VSSnippetsFile) -> Vec<Arc<Snippet>> {
-    let mut snippets = vec![];
-    for (prefix, snippet) in file_contents.snippets {
-        let prefixes = snippet
-            .prefix
-            .map_or_else(move || vec![prefix], |prefixes| prefixes.into());
-        let description = snippet
-            .description
-            .map(|description| description.to_string());
-        let body = snippet.body.to_string();
-        if snippet::Snippet::parse(&body).log_err().is_none() {
-            continue;
-        };
-        snippets.push(Arc::new(Snippet {
-            body,
-            prefix: prefixes,
-            description,
-        }));
-    }
-    snippets
+pub fn file_to_snippets(
+    file_contents: VsSnippetsFile,
+    source: &Path,
+) -> impl Iterator<Item = Result<Arc<Snippet>>> {
+    file_contents
+        .snippets
+        .into_iter()
+        .map(move |(name, snippet)| {
+            let snippet_name = name.clone();
+            let prefixes = snippet
+                .prefix
+                .map_or_else(move || vec![snippet_name], |prefixes| prefixes.into());
+            let description = snippet
+                .description
+                .map(|description| description.to_string());
+            let body = snippet.body.to_string();
+            match snippet::Snippet::parse(&body) {
+                Ok(_) => Ok(Arc::new(Snippet {
+                    body,
+                    prefix: prefixes,
+                    description,
+                    name,
+                })),
+                Err(e) => Err(anyhow::anyhow!(
+                    "Invalid snippet '{name}' in {source:?}: {e:#}"
+                )),
+            }
+        })
 }
+
 // Snippet with all of the metadata
 #[derive(Debug)]
 pub struct Snippet {
     pub prefix: Vec<String>,
     pub body: String,
     pub description: Option<String>,
+    pub name: String,
 }
 
 async fn process_updates(
-    this: WeakModel<SnippetProvider>,
+    this: WeakEntity<SnippetProvider>,
     entries: Vec<PathBuf>,
-    mut cx: AsyncAppContext,
+    mut cx: AsyncApp,
 ) -> Result<()> {
-    let fs = this.update(&mut cx, |this, _| this.fs.clone())?;
+    let fs = this.read_with(&cx, |this, _| this.fs.clone())?;
     for entry_path in entries {
-        if !entry_path
+        if entry_path
             .extension()
-            .map_or(false, |extension| extension == "json")
+            .is_none_or(|extension| extension != "json")
         {
             continue;
         }
         let entry_metadata = fs.metadata(&entry_path).await;
         // Entry could have been removed, in which case we should no longer show completions for it.
         let entry_exists = entry_metadata.is_ok();
-        if entry_metadata.map_or(false, |entry| entry.map_or(false, |e| e.is_dir)) {
+        if entry_metadata.is_ok_and(|entry| entry.is_some_and(|e| e.is_dir)) {
             // Don't process dirs.
             continue;
         }
@@ -96,11 +108,13 @@ async fn process_updates(
                 let Some(file_contents) = contents else {
                     return;
                 };
-                let Ok(as_json) = serde_json::from_str::<VSSnippetsFile>(&file_contents) else {
+                let Ok(as_json) = serde_json_lenient::from_str::<VsSnippetsFile>(&file_contents)
+                else {
                     return;
                 };
-                let snippets = file_to_snippets(as_json);
-                *snippets_of_kind.entry(entry_path).or_default() = snippets;
+                let snippets = file_to_snippets(as_json, entry_path.as_path());
+                *snippets_of_kind.entry(entry_path).or_default() =
+                    snippets.filter_map(Result::log_err).collect();
             } else {
                 snippets_of_kind.remove(&entry_path);
             }
@@ -110,11 +124,11 @@ async fn process_updates(
 }
 
 async fn initial_scan(
-    this: WeakModel<SnippetProvider>,
+    this: WeakEntity<SnippetProvider>,
     path: Arc<Path>,
-    mut cx: AsyncAppContext,
+    cx: AsyncApp,
 ) -> Result<()> {
-    let fs = this.update(&mut cx, |this, _| this.fs.clone())?;
+    let fs = this.read_with(&cx, |this, _| this.fs.clone())?;
     let entries = fs.read_dir(&path).await;
     if let Ok(entries) = entries {
         let entries = entries
@@ -134,19 +148,17 @@ pub struct SnippetProvider {
 }
 
 // Watches global snippet directory, is created just once and reused across multiple projects
-struct GlobalSnippetWatcher(Model<SnippetProvider>);
+struct GlobalSnippetWatcher(Entity<SnippetProvider>);
 
 impl GlobalSnippetWatcher {
-    fn new(fs: Arc<dyn Fs>, cx: &mut AppContext) -> Self {
-        let global_snippets_dir = paths::config_dir().join("snippets");
-        let provider = cx.new_model(|_cx| SnippetProvider {
+    fn new(fs: Arc<dyn Fs>, cx: &mut App) -> Self {
+        let global_snippets_dir = paths::snippets_dir();
+        let provider = cx.new(|_cx| SnippetProvider {
             fs,
             snippets: Default::default(),
             watch_tasks: vec![],
         });
-        provider.update(cx, |this, cx| {
-            this.watch_directory(&global_snippets_dir, cx)
-        });
+        provider.update(cx, |this, cx| this.watch_directory(global_snippets_dir, cx));
         Self(provider)
     }
 }
@@ -154,12 +166,8 @@ impl GlobalSnippetWatcher {
 impl gpui::Global for GlobalSnippetWatcher {}
 
 impl SnippetProvider {
-    pub fn new(
-        fs: Arc<dyn Fs>,
-        dirs_to_watch: BTreeSet<PathBuf>,
-        cx: &mut AppContext,
-    ) -> Model<Self> {
-        cx.new_model(move |cx| {
+    pub fn new(fs: Arc<dyn Fs>, dirs_to_watch: BTreeSet<PathBuf>, cx: &mut App) -> Entity<Self> {
+        cx.new(move |cx| {
             if !cx.has_global::<GlobalSnippetWatcher>() {
                 let global_watcher = GlobalSnippetWatcher::new(fs.clone(), cx);
                 cx.set_global(global_watcher);
@@ -179,11 +187,11 @@ impl SnippetProvider {
     }
 
     /// Add directory to be watched for content changes
-    fn watch_directory(&mut self, path: &Path, cx: &ModelContext<Self>) {
+    fn watch_directory(&mut self, path: &Path, cx: &Context<Self>) {
         let path: Arc<Path> = Arc::from(path);
 
-        self.watch_tasks.push(cx.spawn(|this, mut cx| async move {
-            let fs = this.update(&mut cx, |this, _| this.fs.clone())?;
+        self.watch_tasks.push(cx.spawn(async move |this, cx| {
+            let fs = this.read_with(cx, |this, _| this.fs.clone())?;
             let watched_path = path.clone();
             let watcher = fs.watch(&watched_path, Duration::from_secs(1));
             initial_scan(this.clone(), path, cx.clone()).await?;
@@ -204,7 +212,7 @@ impl SnippetProvider {
     fn lookup_snippets<'a, const LOOKUP_GLOBALS: bool>(
         &'a self,
         language: &'a SnippetKind,
-        cx: &AppContext,
+        cx: &App,
     ) -> Vec<Arc<Snippet>> {
         let mut user_snippets: Vec<_> = self
             .snippets
@@ -223,19 +231,32 @@ impl SnippetProvider {
                         .lookup_snippets::<false>(language, cx),
                 );
             }
+
+            let Some(registry) = SnippetRegistry::try_global(cx) else {
+                return user_snippets;
+            };
+
+            let registry_snippets = registry.get_snippets(language);
+            user_snippets.extend(registry_snippets);
         }
-
-        let Some(registry) = SnippetRegistry::try_global(cx) else {
-            return user_snippets;
-        };
-
-        let registry_snippets = registry.get_snippets(language);
-        user_snippets.extend(registry_snippets);
 
         user_snippets
     }
 
-    pub fn snippets_for(&self, language: SnippetKind, cx: &AppContext) -> Vec<Arc<Snippet>> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn add_snippet_for_test(
+        &mut self,
+        language: SnippetKind,
+        path: PathBuf,
+        snippet: Vec<Arc<Snippet>>,
+    ) {
+        self.snippets
+            .entry(language)
+            .or_default()
+            .insert(path, snippet);
+    }
+
+    pub fn snippets_for(&self, language: SnippetKind, cx: &App) -> Vec<Arc<Snippet>> {
         let mut requested_snippets = self.lookup_snippets::<true>(&language, cx);
 
         if language.is_some() {
@@ -243,5 +264,40 @@ impl SnippetProvider {
             requested_snippets.extend(self.lookup_snippets::<true>(&None, cx));
         }
         requested_snippets
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fs::FakeFs;
+    use gpui;
+    use gpui::TestAppContext;
+    use indoc::indoc;
+
+    #[gpui::test]
+    fn test_lookup_snippets_dup_registry_snippets(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.background_executor.clone());
+        cx.update(|cx| {
+            SnippetRegistry::init_global(cx);
+            SnippetRegistry::global(cx)
+                .register_snippets(
+                    "ruby".as_ref(),
+                    indoc! {r#"
+                    {
+                      "Log to console": {
+                        "prefix": "log",
+                        "body": ["console.info(\"Hello, ${1:World}!\")", "$0"],
+                        "description": "Logs to console"
+                      }
+                    }
+            "#},
+                )
+                .unwrap();
+            let provider = SnippetProvider::new(fs.clone(), Default::default(), cx);
+            cx.update_entity(&provider, |provider, cx| {
+                assert_eq!(1, provider.snippets_for(Some("ruby".to_owned()), cx).len());
+            });
+        });
     }
 }

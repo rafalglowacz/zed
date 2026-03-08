@@ -1,6 +1,6 @@
-use anyhow::Context;
+use anyhow::Context as _;
 use collections::HashMap;
-use futures::{channel::oneshot, Future, FutureExt};
+use futures::{Future, FutureExt, channel::oneshot};
 use parking_lot::{Mutex, RwLock};
 use std::{
     marker::PhantomData,
@@ -27,21 +27,22 @@ static QUEUES: LazyLock<RwLock<HashMap<Arc<str>, WriteQueue>>> = LazyLock::new(D
 /// Thread safe connection to a given database file or in memory db. This can be cloned, shared, static,
 /// whatever. It derefs to a synchronous connection by thread that is read only. A write capable connection
 /// may be accessed by passing a callback to the `write` function which will queue the callback
-pub struct ThreadSafeConnection<M: Migrator + 'static = ()> {
+#[derive(Clone)]
+pub struct ThreadSafeConnection {
     uri: Arc<str>,
     persistent: bool,
     connection_initialize_query: Option<&'static str>,
     connections: Arc<ThreadLocal<Connection>>,
-    _migrator: PhantomData<*mut M>,
 }
 
-unsafe impl<M: Migrator> Send for ThreadSafeConnection<M> {}
-unsafe impl<M: Migrator> Sync for ThreadSafeConnection<M> {}
+unsafe impl Send for ThreadSafeConnection {}
+unsafe impl Sync for ThreadSafeConnection {}
 
 pub struct ThreadSafeConnectionBuilder<M: Migrator + 'static = ()> {
     db_initialize_query: Option<&'static str>,
     write_queue_constructor: Option<WriteQueueConstructor>,
-    connection: ThreadSafeConnection<M>,
+    connection: ThreadSafeConnection,
+    _migrator: PhantomData<*mut M>,
 }
 
 impl<M: Migrator> ThreadSafeConnectionBuilder<M> {
@@ -72,7 +73,7 @@ impl<M: Migrator> ThreadSafeConnectionBuilder<M> {
         self
     }
 
-    pub async fn build(self) -> anyhow::Result<ThreadSafeConnection<M>> {
+    pub async fn build(self) -> anyhow::Result<ThreadSafeConnection> {
         self.connection
             .initialize_queues(self.write_queue_constructor);
 
@@ -94,6 +95,14 @@ impl<M: Migrator> ThreadSafeConnectionBuilder<M> {
                 let mut migration_result =
                     anyhow::Result::<()>::Err(anyhow::anyhow!("Migration never run"));
 
+                let foreign_keys_enabled: bool =
+                    connection.select_row::<i32>("PRAGMA foreign_keys")?()
+                        .unwrap_or(None)
+                        .map(|enabled| enabled != 0)
+                        .unwrap_or(false);
+
+                connection.exec("PRAGMA foreign_keys = OFF;")?()?;
+
                 for _ in 0..MIGRATION_RETRIES {
                     migration_result = connection
                         .with_savepoint("thread_safe_multi_migration", || M::migrate(connection));
@@ -103,6 +112,9 @@ impl<M: Migrator> ThreadSafeConnectionBuilder<M> {
                     }
                 }
 
+                if foreign_keys_enabled {
+                    connection.exec("PRAGMA foreign_keys = ON;")?()?;
+                }
                 migration_result
             })
             .await?;
@@ -111,7 +123,7 @@ impl<M: Migrator> ThreadSafeConnectionBuilder<M> {
     }
 }
 
-impl<M: Migrator> ThreadSafeConnection<M> {
+impl ThreadSafeConnection {
     fn initialize_queues(&self, write_queue_constructor: Option<WriteQueueConstructor>) -> bool {
         if !QUEUES.read().contains_key(&self.uri) {
             let mut queues = QUEUES.write();
@@ -125,7 +137,7 @@ impl<M: Migrator> ThreadSafeConnection<M> {
         false
     }
 
-    pub fn builder(uri: &str, persistent: bool) -> ThreadSafeConnectionBuilder<M> {
+    pub fn builder<M: Migrator>(uri: &str, persistent: bool) -> ThreadSafeConnectionBuilder<M> {
         ThreadSafeConnectionBuilder::<M> {
             db_initialize_query: None,
             write_queue_constructor: None,
@@ -134,8 +146,8 @@ impl<M: Migrator> ThreadSafeConnection<M> {
                 persistent,
                 connection_initialize_query: None,
                 connections: Default::default(),
-                _migrator: PhantomData,
             },
+            _migrator: PhantomData,
         }
     }
 
@@ -200,7 +212,7 @@ impl<M: Migrator> ThreadSafeConnection<M> {
     }
 }
 
-impl ThreadSafeConnection<()> {
+impl ThreadSafeConnection {
     /// Special constructor for ThreadSafeConnection which disallows db initialization and migrations.
     /// This allows construction to be infallible and not write to the db.
     pub fn new(
@@ -214,7 +226,6 @@ impl ThreadSafeConnection<()> {
             persistent,
             connection_initialize_query,
             connections: Default::default(),
-            _migrator: PhantomData,
         };
 
         connection.initialize_queues(write_queue_constructor);
@@ -222,19 +233,7 @@ impl ThreadSafeConnection<()> {
     }
 }
 
-impl<M: Migrator> Clone for ThreadSafeConnection<M> {
-    fn clone(&self) -> Self {
-        Self {
-            uri: self.uri.clone(),
-            persistent: self.persistent,
-            connection_initialize_query: self.connection_initialize_query,
-            connections: self.connections.clone(),
-            _migrator: PhantomData,
-        }
-    }
-}
-
-impl<M: Migrator> Deref for ThreadSafeConnection<M> {
+impl Deref for ThreadSafeConnection {
     type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
@@ -250,11 +249,14 @@ pub fn background_thread_queue() -> WriteQueueConstructor {
     Box::new(|| {
         let (sender, receiver) = channel::<QueuedWrite>();
 
-        thread::spawn(move || {
-            while let Ok(write) = receiver.recv() {
-                write()
-            }
-        });
+        thread::Builder::new()
+            .name("sqlezWorker".to_string())
+            .spawn(move || {
+                while let Ok(write) = receiver.recv() {
+                    write()
+                }
+            })
+            .unwrap();
 
         let sender = UnboundedSyncSender::new(sender);
         Box::new(move |queued_write| {
@@ -290,18 +292,14 @@ mod test {
 
         enum TestDomain {}
         impl Domain for TestDomain {
-            fn name() -> &'static str {
-                "test"
-            }
-            fn migrations() -> &'static [&'static str] {
-                &["CREATE TABLE test(col1 TEXT, col2 TEXT) STRICT;"]
-            }
+            const NAME: &str = "test";
+            const MIGRATIONS: &[&str] = &["CREATE TABLE test(col1 TEXT, col2 TEXT) STRICT;"];
         }
 
         for _ in 0..100 {
             handles.push(thread::spawn(|| {
                 let builder =
-                    ThreadSafeConnection::<TestDomain>::builder("annoying-test.db", false)
+                    ThreadSafeConnection::builder::<TestDomain>("annoying-test.db", false)
                         .with_db_initialization_query("PRAGMA journal_mode=WAL")
                         .with_connection_initialize_query(indoc! {"
                                 PRAGMA synchronous=NORMAL;
@@ -324,12 +322,9 @@ mod test {
     fn wild_zed_lost_failure() {
         enum TestWorkspace {}
         impl Domain for TestWorkspace {
-            fn name() -> &'static str {
-                "workspace"
-            }
+            const NAME: &str = "workspace";
 
-            fn migrations() -> &'static [&'static str] {
-                &["
+            const MIGRATIONS: &[&str] = &["
                     CREATE TABLE workspaces(
                         workspace_id INTEGER PRIMARY KEY,
                         dock_visible INTEGER, -- Boolean
@@ -348,12 +343,11 @@ mod test {
                             ON DELETE CASCADE
                             ON UPDATE CASCADE
                     ) STRICT;
-                "]
-            }
+                "];
         }
 
         let builder =
-            ThreadSafeConnection::<TestWorkspace>::builder("wild_zed_lost_failure", false)
+            ThreadSafeConnection::builder::<TestWorkspace>("wild_zed_lost_failure", false)
                 .with_connection_initialize_query("PRAGMA FOREIGN_KEYS=true");
 
         smol::block_on(builder.build()).unwrap();

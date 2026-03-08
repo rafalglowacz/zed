@@ -1,61 +1,85 @@
 # Summary
 
-# General
+# Welcome
 
 - [Getting Started](./getting-started.md)
-- [System Requirements](./system-requirements.md)
-- [Linux](./linux.md)
-- [Windows](./windows.md)
-- [Telemetry](./telemetry.md)
-- [Additional Learning Materials](./additional-learning-materials.md)
+- [Installation](./installation.md)
+  - [Update](./update.md)
+  - [Uninstall](./uninstall.md)
+- [Troubleshooting](./troubleshooting.md)
 
-# Configuration
+# AI
 
-- [Configuring Zed](./configuring-zed.md)
-- [Configuring Languages](./configuring-languages.md)
-- [Key bindings](./key-bindings.md)
-- [Snippets](./snippets.md)
-- [Themes](./themes.md)
-- [Vim Mode](./vim.md)
+- [Overview](./ai/overview.md)
+- [Agent Panel](./ai/agent-panel.md)
+  - [Tools](./ai/tools.md)
+  - [Tool Permissions](./ai/tool-permissions.md)
+  - [External Agents](./ai/external-agents.md)
+- [Inline Assistant](./ai/inline-assistant.md)
+- [Edit Prediction](./ai/edit-prediction.md)
+- [Text Threads](./ai/text-threads.md)
+- [Rules](./ai/rules.md)
+- [Model Context Protocol](./ai/mcp.md)
+- [Configuration](./ai/configuration.md)
+  - [LLM Providers](./ai/llm-providers.md)
+  - [Agent Settings](./ai/agent-settings.md)
+- [Subscription](./ai/subscription.md)
+  - [Models](./ai/models.md)
+  - [Plans and Usage](./ai/plans-and-usage.md)
+  - [Billing](./ai/billing.md)
 
-<!-- - [Globs](./globs.md) -->
-<!-- - [Fonts](./fonts.md) -->
+# Working with Code
 
-# Using Zed
-
-- [Multibuffers](./multibuffers.md)
-- [Outline Panel](./outline-panel.md)
-- [Code Completions](./completions.md)
-- [Channels](./channels.md)
-- [Collaboration](./collaboration.md)
+- [Editing Code](./editing-code.md)
+  - [Code Completions](./completions.md)
+  - [Snippets](./snippets.md)
+  - [Diagnostics & Quick Fixes](./diagnostics.md)
+  - [Multibuffers](./multibuffers.md)
+- [Finding & Navigating](./finding-navigating.md)
+  - [Command Palette](./command-palette.md)
+  - [Outline Panel](./outline-panel.md)
+  - [Tab Switcher](./tab-switcher.md)
+- [Running & Testing](./running-testing.md)
+  - [Terminal](./terminal.md)
+  - [Tasks](./tasks.md)
+  - [Debugger](./debugger.md)
+  - [REPL](./repl.md)
 - [Git](./git.md)
-- [Tasks](./tasks.md)
-- [Remote Development](./remote-development.md)
+
+# Collaboration
+
+- [Overview](./collaboration/overview.md)
+  - [Channels](./collaboration/channels.md)
+  - [Contacts and Private Calls](./collaboration/contacts-and-private-calls.md)
+
+# Remote Development
+
+- [Overview](./remote-development.md)
 - [Environment Variables](./environment.md)
-- [REPL](./repl.md)
+- [Dev Containers](./dev-containers.md)
 
-# Assistant
+# Platform Support
 
-- [Overview](./assistant/assistant.md)
-- [Configuration](./assistant/configuration.md)
-- [Assistant Panel](./assistant/assistant-panel.md)
-- [Contexts](./assistant/contexts.md)
-- [Inline Assistant](./assistant/inline-assistant.md)
-- [Commands](./assistant/commands.md)
-- [Prompts](./assistant/prompting.md)
+- [macOS](./macos.md)
+- [Windows](./windows.md)
+- [Linux](./linux.md)
 
-# Extensions
+# Customization
 
-- [Overview](./extensions.md)
-- [Installing Extensions](./extensions/installing-extensions.md)
-- [Developing Extensions](./extensions/developing-extensions.md)
-- [Language Extensions](./extensions/languages.md)
-- [Theme Extensions](./extensions/themes.md)
-- [Slash Commands](./extensions/slash-commands.md)
+- [Appearance](./appearance.md)
+  - [Themes](./themes.md)
+  - [Icon Themes](./icon-themes.md)
+  - [Fonts & Visual Tweaks](./visual-customization.md)
+- [Keybindings](./key-bindings.md)
+  - [Vim Mode](./vim.md)
+  - [Helix Mode](./helix.md)
 
 # Language Support
 
 - [All Languages](./languages.md)
+- [Configuring Languages](./configuring-languages.md)
+  - [Toolchains](./toolchains.md)
+  - [Semantic Tokens](./semantic-tokens.md)
 - [Ansible](./languages/ansible.md)
 - [AsciiDoc](./languages/asciidoc.md)
 - [Astro](./languages/astro.md)
@@ -68,6 +92,7 @@
 - [CSS](./languages/css.md)
 - [Dart](./languages/dart.md)
 - [Deno](./languages/deno.md)
+- [Diff](./languages/diff.md)
 - [Docker](./languages/docker.md)
 - [Elixir](./languages/elixir.md)
 - [Elm](./languages/elm.md)
@@ -94,7 +119,9 @@
 - [Markdown](./languages/markdown.md)
 - [Nim](./languages/nim.md)
 - [OCaml](./languages/ocaml.md)
+- [OpenTofu](./languages/opentofu.md)
 - [PHP](./languages/php.md)
+- [PowerShell](./languages/powershell.md)
 - [Prisma](./languages/prisma.md)
 - [Proto](./languages/proto.md)
 - [PureScript](./languages/purescript.md)
@@ -108,6 +135,8 @@
 - [Rust](./languages/rust.md)
 - [Scala](./languages/scala.md)
 - [Scheme](./languages/scheme.md)
+- [Shell Script](./languages/sh.md)
+- [SQL](./languages/sql.md)
 - [Svelte](./languages/svelte.md)
 - [Swift](./languages/swift.md)
 - [Tailwind CSS](./languages/tailwindcss.md)
@@ -118,8 +147,45 @@
 - [Vue](./languages/vue.md)
 - [XML](./languages/xml.md)
 - [YAML](./languages/yaml.md)
+- [Yara](./languages/yara.md)
 - [Yarn](./languages/yarn.md)
 - [Zig](./languages/zig.md)
+
+# Extensions
+
+- [Overview](./extensions.md)
+- [Installing Extensions](./extensions/installing-extensions.md)
+- [Developing Extensions](./extensions/developing-extensions.md)
+- [Extension Capabilities](./extensions/capabilities.md)
+- [Language Extensions](./extensions/languages.md)
+- [Debugger Extensions](./extensions/debugger-extensions.md)
+- [Theme Extensions](./extensions/themes.md)
+- [Icon Theme Extensions](./extensions/icon-themes.md)
+- [Slash Command Extensions](./extensions/slash-commands.md)
+- [Agent Server Extensions](./extensions/agent-servers.md)
+- [MCP Server Extensions](./extensions/mcp-extensions.md)
+
+# Coming From…
+
+- [VS Code](./migrate/vs-code.md)
+- [IntelliJ IDEA](./migrate/intellij.md)
+- [PyCharm](./migrate/pycharm.md)
+- [WebStorm](./migrate/webstorm.md)
+- [RustRover](./migrate/rustrover.md)
+
+# Reference
+
+- [All Settings](./reference/all-settings.md)
+- [All Actions](./all-actions.md)
+- [CLI Reference](./reference/cli.md)
+
+# Account & Privacy
+
+- [Authenticate](./authentication.md)
+- [Privacy and Security](./ai/privacy-and-security.md)
+  - [Worktree Trust](./worktree-trust.md)
+  - [AI Improvement](./ai/ai-improvement.md)
+- [Telemetry](./telemetry.md)
 
 # Developing Zed
 
@@ -127,6 +193,9 @@
   - [macOS](./development/macos.md)
   - [Linux](./development/linux.md)
   - [Windows](./development/windows.md)
-  - [Local Collaboration](./development/local-collaboration.md)
-- [Release Process](./development/releases.md)
+  - [FreeBSD](./development/freebsd.md)
+  - [Using Debuggers](./development/debuggers.md)
+  - [Performance](./performance.md)
+  - [Glossary](./development/glossary.md)
+- [Release Notes](./development/release-notes.md)
 - [Debugging Crashes](./development/debugging-crashes.md)

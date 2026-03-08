@@ -27,53 +27,86 @@
 //! ```
 use crate::{Entity, Subscription, TestAppContext, TestDispatcher};
 use futures::StreamExt as _;
-use rand::prelude::*;
-use smol::channel;
+use proptest::prelude::{Just, Strategy, any};
 use std::{
     env,
-    panic::{self, RefUnwindSafe},
+    panic::{self, RefUnwindSafe, UnwindSafe},
+    pin::Pin,
 };
+
+/// Strategy injected into `#[gpui::property_test]` tests to control the seed
+/// given to the scheduler. Doesn't shrink, since all scheduler seeds are
+/// equivalent in complexity. If `$SEED` is set, it always uses that value.
+pub fn seed_strategy() -> impl Strategy<Value = u64> {
+    match std::env::var("SEED") {
+        Ok(val) => Just(val.parse().unwrap()).boxed(),
+        Err(_) => any::<u64>().no_shrink().boxed(),
+    }
+}
+
+/// Similar to [`run_test`], but only runs the callback once, allowing
+/// [`FnOnce`] callbacks. This is intended for use with the
+/// `gpui::property_test` macro and generally should not be used directly.
+///
+/// Doesn't support many features of [`run_test`], since these are provided by
+/// proptest.
+pub fn run_test_once(seed: u64, test_fn: Box<dyn UnwindSafe + FnOnce(TestDispatcher)>) {
+    let result = panic::catch_unwind(|| {
+        let dispatcher = TestDispatcher::new(seed);
+        let scheduler = dispatcher.scheduler().clone();
+        test_fn(dispatcher);
+        scheduler.end_test();
+    });
+
+    match result {
+        Ok(()) => {}
+        Err(e) => panic::resume_unwind(e),
+    }
+}
 
 /// Run the given test function with the configured parameters.
 /// This is intended for use with the `gpui::test` macro
 /// and generally should not be used directly.
 pub fn run_test(
-    mut num_iterations: u64,
+    num_iterations: usize,
+    explicit_seeds: &[u64],
     max_retries: usize,
     test_fn: &mut (dyn RefUnwindSafe + Fn(TestDispatcher, u64)),
     on_fail_fn: Option<fn()>,
 ) {
-    let starting_seed = env::var("SEED")
-        .map(|seed| seed.parse().expect("invalid SEED variable"))
-        .unwrap_or(0);
-    if let Ok(iterations) = env::var("ITERATIONS") {
-        num_iterations = iterations.parse().expect("invalid ITERATIONS variable");
-    }
-    let is_randomized = num_iterations > 1;
+    let (seeds, is_multiple_runs) = calculate_seeds(num_iterations as u64, explicit_seeds);
 
-    for seed in starting_seed..starting_seed + num_iterations {
-        let mut retry = 0;
+    for seed in seeds {
+        let mut attempt = 0;
         loop {
-            if is_randomized {
+            if is_multiple_runs {
                 eprintln!("seed = {seed}");
             }
             let result = panic::catch_unwind(|| {
-                let dispatcher = TestDispatcher::new(StdRng::seed_from_u64(seed));
+                let dispatcher = TestDispatcher::new(seed);
+                let scheduler = dispatcher.scheduler().clone();
                 test_fn(dispatcher, seed);
+                scheduler.end_test();
             });
 
             match result {
                 Ok(_) => break,
                 Err(error) => {
-                    if retry < max_retries {
-                        println!("retrying: attempt {}", retry);
-                        retry += 1;
+                    if attempt < max_retries {
+                        println!("attempt {} failed, retrying", attempt);
+                        attempt += 1;
+                        // The panic payload might itself trigger an unwind on drop:
+                        // https://doc.rust-lang.org/std/panic/fn.catch_unwind.html#notes
+                        std::mem::forget(error);
                     } else {
-                        if is_randomized {
-                            eprintln!("failing seed: {}", seed);
+                        if is_multiple_runs {
+                            eprintln!("failing seed: {seed}");
+                            eprintln!(
+                                "You can rerun from this seed by setting the environmental variable SEED to {seed}"
+                            );
                         }
-                        if let Some(f) = on_fail_fn {
-                            f()
+                        if let Some(on_fail_fn) = on_fail_fn {
+                            on_fail_fn()
                         }
                         panic::resume_unwind(error);
                     }
@@ -83,9 +116,57 @@ pub fn run_test(
     }
 }
 
+fn calculate_seeds(
+    iterations: u64,
+    explicit_seeds: &[u64],
+) -> (impl Iterator<Item = u64> + '_, bool) {
+    let iterations = env::var("ITERATIONS")
+        .ok()
+        .map(|var| var.parse().expect("invalid ITERATIONS variable"))
+        .unwrap_or(iterations);
+
+    let env_num = env::var("SEED")
+        .map(|seed| seed.parse().expect("invalid SEED variable as integer"))
+        .ok();
+
+    let empty_range = || 0..0;
+
+    let iter = {
+        let env_range = if let Some(env_num) = env_num {
+            env_num..env_num + 1
+        } else {
+            empty_range()
+        };
+
+        // if `iterations` is 1 and !(`explicit_seeds` is non-empty || `SEED` is set), then add     the run `0`
+        // if `iterations` is 1 and  (`explicit_seeds` is non-empty || `SEED` is set), then discard the run `0`
+        // if `iterations` isn't 1 and `SEED` is set, do `SEED..SEED+iterations`
+        // otherwise, do `0..iterations`
+        let iterations_range = match (iterations, env_num) {
+            (1, None) if explicit_seeds.is_empty() => 0..1,
+            (1, None) | (1, Some(_)) => empty_range(),
+            (iterations, Some(env)) => env..env + iterations,
+            (iterations, None) => 0..iterations,
+        };
+
+        // if `SEED` is set, ignore `explicit_seeds`
+        let explicit_seeds = if env_num.is_some() {
+            &[]
+        } else {
+            explicit_seeds
+        };
+
+        env_range
+            .chain(iterations_range)
+            .chain(explicit_seeds.iter().copied())
+    };
+    let is_multiple_runs = iter.clone().nth(1).is_some();
+    (iter, is_multiple_runs)
+}
+
 /// A test struct for converting an observation callback into a stream.
 pub struct Observation<T> {
-    rx: channel::Receiver<T>,
+    rx: Pin<Box<async_channel::Receiver<T>>>,
     _subscription: Subscription,
 }
 
@@ -100,14 +181,15 @@ impl<T: 'static> futures::Stream for Observation<T> {
     }
 }
 
-/// observe returns a stream of the change events from the given `View` or `Model`
-pub fn observe<T: 'static>(entity: &impl Entity<T>, cx: &mut TestAppContext) -> Observation<()> {
-    let (tx, rx) = smol::channel::unbounded();
+/// observe returns a stream of the change events from the given `Entity`
+pub fn observe<T: 'static>(entity: &Entity<T>, cx: &mut TestAppContext) -> Observation<()> {
+    let (tx, rx) = async_channel::unbounded();
     let _subscription = cx.update(|cx| {
         cx.observe(entity, move |_, _| {
-            let _ = smol::block_on(tx.send(()));
+            let _ = pollster::block_on(tx.send(()));
         })
     });
+    let rx = Box::pin(rx);
 
     Observation { rx, _subscription }
 }

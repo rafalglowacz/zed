@@ -1,3 +1,8 @@
+---
+title: Language Extensions
+description: "Overview of programming language support in Zed, including built-in and extension-based languages."
+---
+
 # Language Extensions
 
 Language support in Zed has several components:
@@ -20,26 +25,29 @@ path_suffixes = ["myl"]
 line_comments = ["# "]
 ```
 
-- `name` is the human readable name that will show up in the Select Language dropdown.
-- `grammar` is the name of a grammar. Grammars are registered separately, described below.
-- `path_suffixes` (optional) is an array of file suffixes that should be associated with this language. This supports glob patterns like `config/**/*.toml` where `**` matches 0 or more directories and `*` matches 0 or more characters.
-- `line_comments` (optional) is an array of strings that are used to identify line comments in the language.
+- `name` (required) is the human readable name that will show up in the Select Language dropdown.
+- `grammar` (required) is the name of a grammar. Grammars are registered separately, described below.
+- `path_suffixes` is an array of file suffixes that should be associated with this language. Unlike `file_types` in settings, this does not support glob patterns.
+- `line_comments` is an array of strings that are used to identify line comments in the language. This is used for the `editor::ToggleComments` keybind: {#kb editor::ToggleComments} for toggling lines of code.
+- `tab_size` defines the indentation/tab size used for this language (default is `4`).
+- `hard_tabs` whether to indent with tabs (`true`) or spaces (`false`, the default).
+- `first_line_pattern` is a regular expression that can be used alongside `path_suffixes` (above) or `file_types` in settings to match files that should use this language. For example, Zed uses this to identify Shell Scripts by matching [shebang lines](https://github.com/zed-industries/zed/blob/main/crates/languages/src/bash/config.toml) in the first line of a script.
+- `debuggers` is an array of strings that are used to identify debuggers in the language. When launching a debugger's `New Process Modal`, Zed will order available debuggers by the order of entries in this array.
 
 <!--
 TBD: Document `language_name/config.toml` keys
 
-- line_comments, block_comment
 - autoclose_before
 - brackets (start, end, close, newline, not_in: ["comment", "string"])
-- tab_size, hard_tabs
 - word_characters
 - prettier_parser_name
 - opt_into_language_servers
-- first_line_pattern
 - code_fence_block_name
 - scope_opt_in_language_servers
 - increase_indent_pattern, decrease_indent_pattern
 - collapsed_placeholder
+- auto_indent_on_paste, auto_indent_using_last_non_empty_line
+- overrides: `[overrides.element]`, `[overrides.string]`
 -->
 
 ## Grammar
@@ -49,10 +57,10 @@ Zed uses the [Tree-sitter](https://tree-sitter.github.io) parsing library to pro
 ```toml
 [grammars.gleam]
 repository = "https://github.com/gleam-lang/tree-sitter-gleam"
-commit = "58b7cac8fc14c92b0677c542610d8738c373fa81"
+rev = "58b7cac8fc14c92b0677c542610d8738c373fa81"
 ```
 
-The `repository` field must specify a repository where the Tree-sitter grammar should be loaded from, and the `commit` field must contain the SHA of the Git commit to use. An extension can provide multiple grammars by referencing multiple tree-sitter repositories.
+The `repository` field must specify a repository where the Tree-sitter grammar should be loaded from, and the `rev` field must contain a Git revision to use, such as the SHA of a Git commit. If you're developing an extension locally and want to load a grammar from the local filesystem, you can use a `file://` URL for `repository`. An extension can provide multiple grammars by referencing multiple tree-sitter repositories.
 
 ## Tree-sitter Queries
 
@@ -67,8 +75,9 @@ several features:
 - Syntax overrides
 - Text redactions
 - Runnable code detection
+- Selecting classes, functions, etc.
 
-The following sections elaborate on how [Tree-sitter queries](https://tree-sitter.github.io/tree-sitter/using-parsers#query-syntax) enable these
+The following sections elaborate on how [Tree-sitter queries](https://tree-sitter.github.io/tree-sitter/using-parsers/queries/index.html) enable these
 features in Zed, using [JSON syntax](https://www.json.org/json-en.html) as a guiding example.
 
 ### Syntax highlighting
@@ -86,7 +95,7 @@ Here's an example from a `highlights.scm` for JSON:
 (number) @number
 ```
 
-This query marks strings, object keys, and numbers for highlighting. The following is a comprehensive list of captures supported by themes:
+This query marks strings, object keys, and numbers for highlighting. The following is the full list of captures supported by themes:
 
 | Capture                  | Description                            |
 | ------------------------ | -------------------------------------- |
@@ -95,6 +104,7 @@ This query marks strings, object keys, and numbers for highlighting. The followi
 | @comment                 | Captures comments                      |
 | @comment.doc             | Captures documentation comments        |
 | @constant                | Captures constants                     |
+| @constant.builtin        | Captures built-in constants            |
 | @constructor             | Captures constructors                  |
 | @embedded                | Captures embedded content              |
 | @emphasis                | Captures emphasized text               |
@@ -127,8 +137,10 @@ This query marks strings, object keys, and numbers for highlighting. The followi
 | @text.literal            | Captures literal text                  |
 | @title                   | Captures titles                        |
 | @type                    | Captures types                         |
+| @type.builtin            | Captures built-in types                |
 | @variable                | Captures variables                     |
 | @variable.special        | Captures special variables             |
+| @variable.parameter      | Captures function/method parameters    |
 | @variant                 | Captures variants                      |
 
 ### Bracket matching
@@ -149,6 +161,14 @@ This query identifies opening and closing brackets, braces, and quotation marks.
 | ------- | --------------------------------------------- |
 | @open   | Captures opening brackets, braces, and quotes |
 | @close  | Captures closing brackets, braces, and quotes |
+
+Zed uses these to highlight matching brackets: painting each bracket pair with a different color ("rainbow brackets") and highlighting the brackets if the cursor is inside the bracket pair.
+
+To opt out of rainbow brackets colorization, add the following to the corresponding `brackets.scm` entry:
+
+```scheme
+(("\"" @open "\"" @close) (#set! rainbow.exclude))
+```
 
 ### Code outline/structure
 
@@ -200,19 +220,19 @@ Here's an example from an `injections.scm` file for Markdown:
 ```scheme
 (fenced_code_block
   (info_string
-    (language) @language)
-  (code_fence_content) @content)
+    (language) @injection.language)
+  (code_fence_content) @injection.content)
 
 ((inline) @content
- (#set! "language" "markdown-inline"))
+ (#set! injection.language "markdown-inline"))
 ```
 
 This query identifies fenced code blocks, capturing the language specified in the info string and the content within the block. It also captures inline content and sets its language to "markdown-inline".
 
-| Capture   | Description                                                |
-| --------- | ---------------------------------------------------------- |
-| @language | Captures the language identifier for a code block          |
-| @content  | Captures the content to be treated as a different language |
+| Capture             | Description                                                |
+| ------------------- | ---------------------------------------------------------- |
+| @injection.language | Captures the language identifier for a code block          |
+| @injection.content  | Captures the content to be treated as a different language |
 
 Note that we couldn't use JSON as an example here because it doesn't support language injections.
 
@@ -220,7 +240,9 @@ Note that we couldn't use JSON as an example here because it doesn't support lan
 
 The `overrides.scm` file defines syntactic _scopes_ that can be used to override certain editor settings within specific language constructs.
 
-For example, there is a language-specific setting called `word_characters` that controls which non-alphabetic characters are considered part of a word, for filtering autocomplete suggestions. In JavaScript, "$" and "#" are considered word characters. But when your cursor is within a _string_ in JavaScript, "-" is _also_ considered a word character. To achieve this, the JavaScript `overrides.scm` file contains the following pattern:
+For example, there is a language-specific setting called `word_characters` that controls which non-alphabetic characters are considered part of a word, for example when you double click to select a variable. In JavaScript, "$" and "#" are considered word characters.
+
+There is also a language-specific setting called `completion_query_characters` that controls which characters trigger autocomplete suggestions. In JavaScript, when your cursor is within a _string_, `-` should be considered a completion query character. To achieve this, the JavaScript `overrides.scm` file contains the following pattern:
 
 ```scheme
 [
@@ -235,7 +257,7 @@ And the JavaScript `config.toml` contains this setting:
 word_characters = ["#", "$"]
 
 [overrides.string]
-word_characters = ["-"]
+completion_query_characters = ["-"]
 ```
 
 You can also disable certain auto-closing brackets in a specific scope. For example, to prevent auto-closing `'` within strings, you could put the following in the JavaScript `config.toml`:
@@ -249,12 +271,50 @@ brackets = [
 
 #### Range inclusivity
 
-By default, the ranges defined in `overrides.scm` are _exclusive_. So in the case above, if you cursor was _outside_ the quotation marks delimiting the string, the `string` scope would not take effect. Sometimes, you may want to make the range _inclusive_. You can do this by adding the `.inclusive` suffix to the capture name in the query.
+By default, the ranges defined in `overrides.scm` are _exclusive_. So in the case above, if your cursor was _outside_ the quotation marks delimiting the string, the `string` scope would not take effect. Sometimes, you may want to make the range _inclusive_. You can do this by adding the `.inclusive` suffix to the capture name in the query.
 
 For example, in JavaScript, we also disable auto-closing of single quotes within comments. And the comment scope must extend all the way to the newline after a line comment. To achieve this, the JavaScript `overrides.scm` contains the following pattern:
 
 ```scheme
 (comment) @comment.inclusive
+```
+
+### Text objects
+
+The `textobjects.scm` file defines rules for navigating by text objects. This was added in Zed v0.165 and is currently used only in Vim mode.
+
+Vim provides two levels of granularity for navigating around files. Section-by-section with `[]` etc., and method-by-method with `]m` etc. Even languages that don't support functions and classes can work well by defining similar concepts. For example CSS defines a rule-set as a method, and a media-query as a class.
+
+For languages with closures, these typically should not count as functions in Zed. This is best-effort, however, because languages like JavaScript do not syntactically differentiate between closures and top-level function declarations.
+
+For languages with declarations like C, provide queries that match `@class.around` or `@function.around`. The `if` and `ic` text objects will default to these if there is no inside.
+
+If you are not sure what to put in textobjects.scm, both [nvim-treesitter-textobjects](https://github.com/nvim-treesitter/nvim-treesitter-textobjects), and the [Helix editor](https://github.com/helix-editor/helix) have queries for many languages. You can refer to the Zed [built-in languages](https://github.com/zed-industries/zed/tree/main/crates/languages/src) to see how to adapt these.
+
+| Capture          | Description                                                             | Vim mode                                         |
+| ---------------- | ----------------------------------------------------------------------- | ------------------------------------------------ |
+| @function.around | An entire function definition or equivalent small section of a file.    | `[m`, `]m`, `[M`,`]M` motions. `af` text object  |
+| @function.inside | The function body (the stuff within the braces).                        | `if` text object                                 |
+| @class.around    | An entire class definition or equivalent large section of a file.       | `[[`, `]]`, `[]`, `][` motions. `ac` text object |
+| @class.inside    | The contents of a class definition.                                     | `ic` text object                                 |
+| @comment.around  | An entire comment (e.g. all adjacent line comments, or a block comment) | `gc` text object                                 |
+| @comment.inside  | The contents of a comment                                               | `igc` text object (rarely supported)             |
+
+For example:
+
+```scheme
+; include only the content of the method in the function
+(method_definition
+    body: (_
+        "{"
+        (_)* @function.inside
+        "}")) @function.around
+
+; match function.around for declarations with no body
+(function_signature_item) @function.around
+
+; join all adjacent comments into one
+(comment)+ @comment.around
 ```
 
 ### Text redactions
@@ -280,7 +340,7 @@ This query marks number and string values in key-value pairs and arrays for reda
 
 The `runnables.scm` file defines rules for detecting runnable code.
 
-Here's an example from an `runnables.scm` file for JSON:
+Here's an example from a `runnables.scm` file for JSON:
 
 ```scheme
 (
@@ -322,12 +382,12 @@ TBD: `#set! tag`
 
 Zed uses the [Language Server Protocol](https://microsoft.github.io/language-server-protocol/) to provide advanced language support.
 
-An extension may provide any number of language servers. To provide a language server from your extension, add an entry to your `extension.toml` with the name of your language server and the language it applies to:
+An extension may provide any number of language servers. To provide a language server from your extension, add an entry to your `extension.toml` with the name of your language server and the language(s) it applies to. The entry in the list of `languages` has to match the `name` field from the `config.toml` file for that language:
 
 ```toml
-[language_servers.my-language]
+[language_servers.my-language-server]
 name = "My Language LSP"
-language = "My Language"
+languages = ["My Language"]
 ```
 
 Then, in the Rust code for your extension, implement the `language_server_command` method on your extension:
@@ -349,3 +409,127 @@ impl zed::Extension for MyExtension {
 ```
 
 You can customize the handling of the language server using several optional methods in the `Extension` trait. For example, you can control how completions are styled using the `label_for_completion` method. For a complete list of methods, see the [API docs for the Zed extension API](https://docs.rs/zed_extension_api).
+
+### Syntax Highlighting with Semantic Tokens
+
+Zed supports syntax highlighting using semantic tokens from the attached language servers. This is currently disabled by default, but can be enabled in your settings file:
+
+```json [settings]
+{
+  // Enable semantic tokens globally, backed by tree-sitter highlights for each language:
+  "semantic_tokens": "combined",
+  // Or, specify per-language:
+  "languages": {
+    "Rust": {
+      // No tree-sitter, only LSP semantic tokens:
+      "semantic_tokens": "full"
+    }
+  }
+}
+```
+
+The `semantic_tokens` setting accepts the following values:
+
+- `"off"` (default): Do not request semantic tokens from language servers.
+- `"combined"`: Use LSP semantic tokens together with tree-sitter highlighting.
+- `"full"`: Use LSP semantic tokens exclusively, replacing tree-sitter highlighting.
+
+#### Extension-Provided Semantic Token Rules
+
+Language extensions can ship default semantic token rules for their language server's custom token types. To do this, place a `semantic_token_rules.json` file in the language directory alongside `config.toml`:
+
+```
+my-extension/
+  languages/
+    my-language/
+      config.toml
+      highlights.scm
+      semantic_token_rules.json
+```
+
+The file uses the same format as the `semantic_token_rules` array in user settings — a JSON array of rule objects:
+
+```json
+[
+  {
+    "token_type": "lifetime",
+    "style": ["lifetime"]
+  },
+  {
+    "token_type": "builtinType",
+    "style": ["type"]
+  },
+  {
+    "token_type": "selfKeyword",
+    "style": ["variable.special"]
+  }
+]
+```
+
+This is useful when a language server reports custom (non-standard) semantic token types that aren't covered by Zed's built-in default rules. Extension-provided rules act as sensible defaults for that language — users can always override them via `semantic_token_rules` in their settings file, and built-in default rules are only used when neither user nor extension rules match.
+
+#### Customizing Semantic Token Styles
+
+Zed supports customizing the styles used for semantic tokens. You can define rules in your settings file, which customize how semantic tokens get mapped to styles in your theme.
+
+```json [settings]
+{
+  "global_lsp_settings": {
+    "semantic_token_rules": [
+      {
+        // Highlight macros as keywords.
+        "token_type": "macro",
+        "style": ["syntax.keyword"]
+      },
+      {
+        // Highlight unresolved references in bold red.
+        "token_type": "unresolvedReference",
+        "foreground_color": "#c93f3f",
+        "font_weight": "bold"
+      },
+      {
+        // Underline all mutable variables/references/etc.
+        "token_modifiers": ["mutable"],
+        "underline": true
+      }
+    ]
+  }
+}
+```
+
+All rules that match a given `token_type` and `token_modifiers` are applied. Earlier rules take precedence. If no rules match, the token is not highlighted.
+
+Rules are applied in the following priority order (highest to lowest):
+
+1. **User settings** — rules from `semantic_token_rules` in your settings file.
+2. **Extension rules** — rules from `semantic_token_rules.json` in extension language directories.
+3. **Default rules** — Zed's built-in rules for standard LSP token types.
+
+Each rule in the `semantic_token_rules` array is defined as follows:
+
+- `token_type`: The semantic token type as defined by the [LSP specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_semanticTokens). If omitted, the rule matches all token types.
+- `token_modifiers`: A list of semantic token modifiers to match. All modifiers must be present to match.
+- `style`: A list of styles from the current syntax theme to use. The first style found is used. Any settings below override that style.
+- `foreground_color`: The foreground color to use for the token type, in hex format (e.g., `"#ff0000"`).
+- `background_color`: The background color to use for the token type, in hex format (e.g., `"#ff0000"`).
+- `underline`: A boolean or color to underline with, in hex format. If `true`, then the token will be underlined with the text color.
+- `strikethrough`: A boolean or color to strikethrough with, in hex format. If `true`, then the token have a strikethrough with the text color.
+- `font_weight`: One of `"normal"`, `"bold"`.
+- `font_style`: One of `"normal"`, `"italic"`.
+
+### Multi-Language Support
+
+If your language server supports additional languages, you can use `language_ids` to map Zed `languages` to the desired [LSP-specific `languageId`](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocumentItem) identifiers:
+
+```toml
+
+[language-servers.my-language-server]
+name = "Whatever LSP"
+languages = ["JavaScript", "HTML", "CSS"]
+
+[language-servers.my-language-server.language_ids]
+"JavaScript" = "javascript"
+"TSX" = "typescriptreact"
+"HTML" = "html"
+"CSS" = "css"
+```

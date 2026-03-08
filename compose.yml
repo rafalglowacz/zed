@@ -1,15 +1,4 @@
 services:
-  postgres:
-    image: postgres:15
-    container_name: zed_postgres
-    ports:
-      - 5432:5432
-    environment:
-      POSTGRES_HOST_AUTH_METHOD: trust
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./docker-compose.sql:/docker-entrypoint-initdb.d/init.sql
-
   blob_store:
     image: quay.io/minio/minio
     container_name: blob_store
@@ -23,7 +12,7 @@ services:
       - ./.blob_store:/data
 
   livekit_server:
-    image: livekit/livekit-server
+    image: docker.io/livekit/livekit-server
     container_name: livekit_server
     entrypoint: /livekit-server --config /livekit.yaml
     ports:
@@ -32,32 +21,3 @@ services:
       - 7882:7882/udp
     volumes:
       - ./livekit.yaml:/livekit.yaml
-
-  postgrest_app:
-    image: postgrest/postgrest
-    container_name: postgrest_app
-    ports:
-      - 8081:8081
-    environment:
-      PGRST_DB_URI: postgres://postgres@postgres:5432/zed
-    volumes:
-      - ./crates/collab/postgrest_app.conf:/etc/postgrest.conf
-    command: postgrest /etc/postgrest.conf
-    depends_on:
-      - postgres
-
-  postgrest_llm:
-    image: postgrest/postgrest
-    container_name: postgrest_llm
-    ports:
-      - 8082:8082
-    environment:
-      PGRST_DB_URI: postgres://postgres@postgres:5432/zed_llm
-    volumes:
-      - ./crates/collab/postgrest_llm.conf:/etc/postgrest.conf
-    command: postgrest /etc/postgrest.conf
-    depends_on:
-      - postgres
-
-volumes:
-  postgres_data:

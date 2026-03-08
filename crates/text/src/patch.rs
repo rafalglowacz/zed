@@ -9,16 +9,12 @@ pub struct Patch<T>(Vec<Edit<T>>);
 
 impl<T> Patch<T>
 where
-    T: 'static
-        + Clone
-        + Copy
-        + Ord
-        + Sub<T, Output = T>
-        + Add<T, Output = T>
-        + AddAssign
-        + Default
-        + PartialEq,
+    T: 'static + Clone + Copy + Ord + Default,
 {
+    pub const fn empty() -> Self {
+        Self(Vec::new())
+    }
+
     pub fn new(edits: Vec<Edit<T>>) -> Self {
         #[cfg(debug_assertions)]
         {
@@ -41,7 +37,51 @@ where
     pub fn into_inner(self) -> Vec<Edit<T>> {
         self.0
     }
+    pub fn invert(&mut self) -> &mut Self {
+        for edit in &mut self.0 {
+            mem::swap(&mut edit.old, &mut edit.new);
+        }
+        self
+    }
 
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn push(&mut self, edit: Edit<T>) {
+        if edit.is_empty() {
+            return;
+        }
+
+        if let Some(last) = self.0.last_mut() {
+            if last.old.end >= edit.old.start {
+                last.old.end = edit.old.end;
+                last.new.end = edit.new.end;
+            } else {
+                self.0.push(edit);
+            }
+        } else {
+            self.0.push(edit);
+        }
+    }
+}
+
+impl<T, TDelta> Patch<T>
+where
+    T: 'static
+        + Copy
+        + Ord
+        + Sub<T, Output = TDelta>
+        + Add<TDelta, Output = T>
+        + AddAssign<TDelta>
+        + Default,
+    TDelta: Ord + Copy,
+{
+    #[must_use]
     pub fn compose(&self, new_edits_iter: impl IntoIterator<Item = Edit<T>>) -> Self {
         let mut old_edits_iter = self.0.iter().cloned().peekable();
         let mut new_edits_iter = new_edits_iter.into_iter().peekable();
@@ -56,7 +96,7 @@ where
             // Push the old edit if its new end is before the new edit's old start.
             if let Some(old_edit) = old_edit.as_ref() {
                 let new_edit = new_edit.as_ref();
-                if new_edit.map_or(true, |new_edit| old_edit.new.end < new_edit.old.start) {
+                if new_edit.is_none_or(|new_edit| old_edit.new.end < new_edit.old.start) {
                     let catchup = old_edit.old.start - old_start;
                     old_start += catchup;
                     new_start += catchup;
@@ -77,7 +117,7 @@ where
             // Push the new edit if its old end is before the old edit's new start.
             if let Some(new_edit) = new_edit.as_ref() {
                 let old_edit = old_edit.as_ref();
-                if old_edit.map_or(true, |old_edit| new_edit.old.end < old_edit.new.start) {
+                if old_edit.is_none_or(|old_edit| new_edit.old.end < old_edit.new.start) {
                     let catchup = new_edit.new.start - new_start;
                     old_start += catchup;
                     new_start += catchup;
@@ -168,38 +208,6 @@ where
         composed
     }
 
-    pub fn invert(&mut self) -> &mut Self {
-        for edit in &mut self.0 {
-            mem::swap(&mut edit.old, &mut edit.new);
-        }
-        self
-    }
-
-    pub fn clear(&mut self) {
-        self.0.clear();
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub fn push(&mut self, edit: Edit<T>) {
-        if edit.is_empty() {
-            return;
-        }
-
-        if let Some(last) = self.0.last_mut() {
-            if last.old.end >= edit.old.start {
-                last.old.end = edit.old.end;
-                last.new.end = edit.new.end;
-            } else {
-                self.0.push(edit);
-            }
-        } else {
-            self.0.push(edit);
-        }
-    }
-
     pub fn old_to_new(&self, old: T) -> T {
         let ix = match self.0.binary_search_by(|probe| probe.old.start.cmp(&old)) {
             Ok(ix) => ix,
@@ -220,6 +228,55 @@ where
         } else {
             old
         }
+    }
+
+    /// Returns the edit that touches the given old position.
+    ///
+    /// An edit is considered to touch the given old position if edit.old.start <= old <= edit.old.end (note, inclusive on the right).
+    ///
+    /// If there are no edits touching the given old position, an empty edit with appropriate (empty) old and new ranges is returned.
+    pub fn edit_for_old_position(&self, old: T) -> Edit<T> {
+        let edits = self.edits();
+
+        let ix = match edits.binary_search_by(|probe| probe.old.start.cmp(&old)) {
+            Ok(ix) => ix,
+            Err(ix) => {
+                if ix == 0 {
+                    return Edit {
+                        old: old..old,
+                        new: old..old,
+                    };
+                } else {
+                    ix - 1
+                }
+            }
+        };
+
+        if let Some(edit) = edits.get(ix) {
+            if old > edit.old.end {
+                let translated = edit.new.end + (old - edit.old.end);
+                Edit {
+                    new: translated..translated,
+                    old: old..old,
+                }
+            } else {
+                edit.clone()
+            }
+        } else {
+            Edit {
+                old: old..old,
+                new: old..old,
+            }
+        }
+    }
+}
+
+impl<T> Patch<T> {
+    pub fn retain_mut<F>(&mut self, f: F)
+    where
+        F: FnMut(&mut Edit<T>) -> bool,
+    {
+        self.0.retain_mut(f);
     }
 }
 
@@ -487,8 +544,8 @@ mod tests {
             .map(|i| i.parse().expect("invalid `OPERATIONS` variable"))
             .unwrap_or(20);
 
-        let initial_chars = (0..rng.gen_range(0..=100))
-            .map(|_| rng.gen_range(b'a'..=b'z') as char)
+        let initial_chars = (0..rng.random_range(0..=100))
+            .map(|_| rng.random_range(b'a'..=b'z') as char)
             .collect::<Vec<_>>();
         log::info!("initial chars: {:?}", initial_chars);
 
@@ -507,11 +564,11 @@ mod tests {
                     break;
                 }
 
-                let end = rng.gen_range(last_edit_end..=expected_chars.len());
-                let start = rng.gen_range(last_edit_end..=end);
+                let end = rng.random_range(last_edit_end..=expected_chars.len());
+                let start = rng.random_range(last_edit_end..=end);
                 let old_len = end - start;
 
-                let mut new_len = rng.gen_range(0..=3);
+                let mut new_len = rng.random_range(0..=3);
                 if start == end && new_len == 0 {
                     new_len += 1;
                 }
@@ -519,7 +576,7 @@ mod tests {
                 last_edit_end = start + new_len + 1;
 
                 let new_chars = (0..new_len)
-                    .map(|_| rng.gen_range(b'A'..=b'Z') as char)
+                    .map(|_| rng.random_range(b'A'..=b'Z') as char)
                     .collect::<Vec<_>>();
                 log::info!(
                     "  editing {:?}: {:?}",

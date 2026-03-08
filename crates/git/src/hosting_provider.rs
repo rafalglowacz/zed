@@ -2,19 +2,55 @@ use std::{ops::Range, sync::Arc};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use collections::BTreeMap;
 use derive_more::{Deref, DerefMut};
-use gpui::{AppContext, Global};
+use gpui::{App, Global, SharedString};
 use http_client::HttpClient;
+use itertools::Itertools;
 use parking_lot::RwLock;
 use url::Url;
 
-use crate::Oid;
+use crate::repository::RepoPath;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct PullRequest {
     pub number: u32,
     pub url: Url,
+}
+
+#[derive(Clone)]
+pub struct GitRemote {
+    pub host: Arc<dyn GitHostingProvider + Send + Sync + 'static>,
+    pub owner: SharedString,
+    pub repo: SharedString,
+}
+
+impl std::fmt::Debug for GitRemote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitRemote")
+            .field("host", &self.host.name())
+            .field("owner", &self.owner)
+            .field("repo", &self.repo)
+            .finish()
+    }
+}
+
+impl GitRemote {
+    pub fn host_supports_avatars(&self) -> bool {
+        self.host.supports_avatars()
+    }
+
+    pub async fn avatar_url(
+        &self,
+        commit: SharedString,
+        author_email: Option<SharedString>,
+        client: Arc<dyn HttpClient>,
+    ) -> Option<Url> {
+        self.host
+            .commit_author_avatar_url(&self.owner, &self.repo, commit, author_email, client)
+            .await
+            .ok()
+            .flatten()
+    }
 }
 
 pub struct BuildCommitPermalinkParams<'a> {
@@ -23,8 +59,19 @@ pub struct BuildCommitPermalinkParams<'a> {
 
 pub struct BuildPermalinkParams<'a> {
     pub sha: &'a str,
-    pub path: &'a str,
+    /// URL-escaped path using unescaped `/` as the directory separator.
+    pub path: String,
     pub selection: Option<Range<u32>>,
+}
+
+impl<'a> BuildPermalinkParams<'a> {
+    pub fn new(sha: &'a str, path: &RepoPath, selection: Option<Range<u32>>) -> Self {
+        Self {
+            sha,
+            path: path.components().map(urlencoding::encode).join("/"),
+            selection,
+        }
+    }
 }
 
 /// A Git hosting provider.
@@ -45,6 +92,15 @@ pub trait GitHostingProvider {
 
     /// Returns a permalink to a file and/or selection on this hosting provider.
     fn build_permalink(&self, remote: ParsedGitRemote, params: BuildPermalinkParams) -> Url;
+
+    /// Returns a URL to create a pull request on this hosting provider.
+    fn build_create_pull_request_url(
+        &self,
+        _remote: &ParsedGitRemote,
+        _source_branch: &str,
+    ) -> Option<Url> {
+        None
+    }
 
     /// Returns whether this provider supports avatars.
     fn supports_avatars(&self) -> bool;
@@ -83,7 +139,8 @@ pub trait GitHostingProvider {
         &self,
         _repo_owner: &str,
         _repo: &str,
-        _commit: Oid,
+        _commit: SharedString,
+        _author_email: Option<SharedString>,
         _http_client: Arc<dyn HttpClient>,
     ) -> Result<Option<Url>> {
         Ok(None)
@@ -97,7 +154,8 @@ impl Global for GlobalGitHostingProviderRegistry {}
 
 #[derive(Default)]
 struct GitHostingProviderRegistryState {
-    providers: BTreeMap<String, Arc<dyn GitHostingProvider + Send + Sync + 'static>>,
+    default_providers: Vec<Arc<dyn GitHostingProvider + Send + Sync + 'static>>,
+    setting_providers: Vec<Arc<dyn GitHostingProvider + Send + Sync + 'static>>,
 }
 
 #[derive(Default)]
@@ -107,12 +165,13 @@ pub struct GitHostingProviderRegistry {
 
 impl GitHostingProviderRegistry {
     /// Returns the global [`GitHostingProviderRegistry`].
-    pub fn global(cx: &AppContext) -> Arc<Self> {
+    #[track_caller]
+    pub fn global(cx: &App) -> Arc<Self> {
         cx.global::<GlobalGitHostingProviderRegistry>().0.clone()
     }
 
     /// Returns the global [`GitHostingProviderRegistry`], if one is set.
-    pub fn try_global(cx: &AppContext) -> Option<Arc<Self>> {
+    pub fn try_global(cx: &App) -> Option<Arc<Self>> {
         cx.try_global::<GlobalGitHostingProviderRegistry>()
             .map(|registry| registry.0.clone())
     }
@@ -120,14 +179,14 @@ impl GitHostingProviderRegistry {
     /// Returns the global [`GitHostingProviderRegistry`].
     ///
     /// Inserts a default [`GitHostingProviderRegistry`] if one does not yet exist.
-    pub fn default_global(cx: &mut AppContext) -> Arc<Self> {
+    pub fn default_global(cx: &mut App) -> Arc<Self> {
         cx.default_global::<GlobalGitHostingProviderRegistry>()
             .0
             .clone()
     }
 
     /// Sets the global [`GitHostingProviderRegistry`].
-    pub fn set_global(registry: Arc<GitHostingProviderRegistry>, cx: &mut AppContext) {
+    pub fn set_global(registry: Arc<GitHostingProviderRegistry>, cx: &mut App) {
         cx.set_global(GlobalGitHostingProviderRegistry(registry));
     }
 
@@ -135,7 +194,8 @@ impl GitHostingProviderRegistry {
     pub fn new() -> Self {
         Self {
             state: RwLock::new(GitHostingProviderRegistryState {
-                providers: BTreeMap::default(),
+                setting_providers: Vec::default(),
+                default_providers: Vec::default(),
             }),
         }
     }
@@ -144,7 +204,22 @@ impl GitHostingProviderRegistry {
     pub fn list_hosting_providers(
         &self,
     ) -> Vec<Arc<dyn GitHostingProvider + Send + Sync + 'static>> {
-        self.state.read().providers.values().cloned().collect()
+        let state = self.state.read();
+        state
+            .default_providers
+            .iter()
+            .cloned()
+            .chain(state.setting_providers.iter().cloned())
+            .collect()
+    }
+
+    pub fn set_setting_providers(
+        &self,
+        providers: impl IntoIterator<Item = Arc<dyn GitHostingProvider + Send + Sync + 'static>>,
+    ) {
+        let mut state = self.state.write();
+        state.setting_providers.clear();
+        state.setting_providers.extend(providers);
     }
 
     /// Adds the provided [`GitHostingProvider`] to the registry.
@@ -152,10 +227,7 @@ impl GitHostingProviderRegistry {
         &self,
         provider: Arc<dyn GitHostingProvider + Send + Sync + 'static>,
     ) {
-        self.state
-            .write()
-            .providers
-            .insert(provider.name(), provider);
+        self.state.write().default_providers.push(provider);
     }
 }
 

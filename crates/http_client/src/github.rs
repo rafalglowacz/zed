@@ -1,13 +1,17 @@
-use crate::HttpClient;
-use anyhow::{anyhow, bail, Context, Result};
+use crate::{HttpClient, HttpRequestExt};
+use anyhow::{Context as _, Result, anyhow, bail};
 use futures::AsyncReadExt;
+use http::Request;
 use serde::Deserialize;
 use std::sync::Arc;
 use url::Url;
 
+const GITHUB_API_URL: &str = "https://api.github.com";
+
 pub struct GitHubLspBinaryVersion {
     pub name: String,
     pub url: String,
+    pub digest: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -24,6 +28,7 @@ pub struct GithubRelease {
 pub struct GithubReleaseAsset {
     pub name: String,
     pub browser_download_url: String,
+    pub digest: Option<String>,
 }
 
 pub async fn latest_github_release(
@@ -31,13 +36,18 @@ pub async fn latest_github_release(
     require_assets: bool,
     pre_release: bool,
     http: Arc<dyn HttpClient>,
-) -> Result<GithubRelease, anyhow::Error> {
+) -> anyhow::Result<GithubRelease> {
+    let url = format!("{GITHUB_API_URL}/repos/{repo_name_with_owner}/releases");
+
+    let request = Request::get(&url)
+        .follow_redirects(crate::RedirectPolicy::FollowAll)
+        .when_some(std::env::var("GITHUB_TOKEN").ok(), |builder, token| {
+            builder.header("Authorization", format!("Bearer {}", token))
+        })
+        .body(Default::default())?;
+
     let mut response = http
-        .get(
-            format!("https://api.github.com/repos/{repo_name_with_owner}/releases").as_str(),
-            Default::default(),
-            true,
-        )
+        .send(request)
         .await
         .context("error fetching latest release")?;
 
@@ -60,33 +70,46 @@ pub async fn latest_github_release(
         Ok(releases) => releases,
 
         Err(err) => {
-            log::error!("Error deserializing: {:?}", err);
+            log::error!("Error deserializing: {err:?}");
             log::error!(
                 "GitHub API response text: {:?}",
                 String::from_utf8_lossy(body.as_slice())
             );
-            return Err(anyhow!("error deserializing latest release"));
+            anyhow::bail!("error deserializing latest release: {err:?}");
         }
     };
 
-    releases
+    let mut release = releases
         .into_iter()
         .filter(|release| !require_assets || !release.assets.is_empty())
         .find(|release| release.pre_release == pre_release)
-        .ok_or(anyhow!("Failed to find a release"))
+        .context("finding a prerelease")?;
+    release.assets.iter_mut().for_each(|asset| {
+        if let Some(digest) = &mut asset.digest
+            && let Some(stripped) = digest.strip_prefix("sha256:")
+        {
+            *digest = stripped.to_owned();
+        }
+    });
+    Ok(release)
 }
 
 pub async fn get_release_by_tag_name(
     repo_name_with_owner: &str,
     tag: &str,
     http: Arc<dyn HttpClient>,
-) -> Result<GithubRelease, anyhow::Error> {
+) -> anyhow::Result<GithubRelease> {
+    let url = format!("{GITHUB_API_URL}/repos/{repo_name_with_owner}/releases/tags/{tag}");
+
+    let request = Request::get(&url)
+        .follow_redirects(crate::RedirectPolicy::FollowAll)
+        .when_some(std::env::var("GITHUB_TOKEN").ok(), |builder, token| {
+            builder.header("Authorization", format!("Bearer {}", token))
+        })
+        .body(Default::default())?;
+
     let mut response = http
-        .get(
-            &format!("https://api.github.com/repos/{repo_name_with_owner}/releases/tags/{tag}"),
-            Default::default(),
-            true,
-        )
+        .send(request)
         .await
         .context("error fetching latest release")?;
 
@@ -107,12 +130,12 @@ pub async fn get_release_by_tag_name(
     }
 
     let release = serde_json::from_slice::<GithubRelease>(body.as_slice()).map_err(|err| {
-        log::error!("Error deserializing: {:?}", err);
+        log::error!("Error deserializing: {err:?}");
         log::error!(
             "GitHub API response text: {:?}",
             String::from_utf8_lossy(body.as_slice())
         );
-        anyhow!("error deserializing GitHub release")
+        anyhow!("error deserializing GitHub release: {err:?}")
     })?;
 
     Ok(release)
@@ -121,6 +144,7 @@ pub async fn get_release_by_tag_name(
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum AssetKind {
     TarGz,
+    Gz,
     Zip,
 }
 
@@ -134,18 +158,19 @@ pub fn build_asset_url(repo_name_with_owner: &str, tag: &str, kind: AssetKind) -
         "{tag}.{extension}",
         extension = match kind {
             AssetKind::TarGz => "tar.gz",
+            AssetKind::Gz => "gz",
             AssetKind::Zip => "zip",
         }
     );
     url.path_segments_mut()
-        .map_err(|_| anyhow!("cannot modify url path segments"))?
+        .map_err(|()| anyhow!("cannot modify url path segments"))?
         .push(&asset_filename);
     Ok(url.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::github::{build_asset_url, AssetKind};
+    use crate::github::{AssetKind, build_asset_url};
 
     #[test]
     fn test_build_asset_url() {

@@ -1,14 +1,10 @@
-use std::fmt::format;
+use std::ops::Range;
 
-use gpui::{
-    colors, div, prelude::*, uniform_list, DefaultColor, DefaultThemeAppearance, Hsla, Render,
-    View, ViewContext, WindowContext,
-};
+use gpui::{Entity, Render, div, uniform_list};
+use gpui::{prelude::*, *};
+use ui::{AbsoluteLength, Color, DefiniteLength, Label, LabelCommon, px, v_flex};
+
 use story::Story;
-use strum::IntoEnumIterator;
-use ui::{
-    h_flex, px, v_flex, AbsoluteLength, ActiveTheme, Color, DefiniteLength, Label, LabelCommon,
-};
 
 const LENGTH: usize = 100;
 
@@ -17,7 +13,7 @@ pub struct IndentGuidesStory {
 }
 
 impl IndentGuidesStory {
-    pub fn view(cx: &mut WindowContext) -> View<Self> {
+    pub fn model(_window: &mut Window, cx: &mut App) -> Entity<Self> {
         let mut depths = Vec::new();
         depths.push(0);
         depths.push(1);
@@ -29,21 +25,20 @@ impl IndentGuidesStory {
         depths.push(1);
         depths.push(0);
 
-        cx.new_view(|_cx| Self { depths })
+        cx.new(|_cx| Self { depths })
     }
 }
 
 impl Render for IndentGuidesStory {
-    fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
-        Story::container()
-            .child(Story::title("Indent guides"))
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        Story::container(cx)
+            .child(Story::title("Indent guides", cx))
             .child(
                 v_flex().size_full().child(
                     uniform_list(
-                        cx.view().clone(),
                         "some-list",
                         self.depths.len(),
-                        |this, range, cx| {
+                        cx.processor(move |this, range: Range<usize>, _window, _cx| {
                             this.depths
                                 .iter()
                                 .enumerate()
@@ -57,26 +52,30 @@ impl Render for IndentGuidesStory {
                                         .child(Label::new(format!("Item {}", i)).color(Color::Info))
                                 })
                                 .collect()
-                        },
+                        }),
                     )
                     .with_sizing_behavior(gpui::ListSizingBehavior::Infer)
-                    .with_decoration(ui::indent_guides(
-                        cx.view().clone(),
-                        px(16.),
-                        ui::IndentGuideColors {
-                            default: Color::Info.color(cx),
-                            hovered: Color::Accent.color(cx),
-                            active: Color::Accent.color(cx),
-                        },
-                        |this, range, cx| {
-                            this.depths
-                                .iter()
-                                .skip(range.start)
-                                .take(range.end - range.start)
-                                .cloned()
-                                .collect()
-                        },
-                    )),
+                    .with_decoration(
+                        ui::indent_guides(
+                            px(16.),
+                            ui::IndentGuideColors {
+                                default: Color::Info.color(cx),
+                                hover: Color::Accent.color(cx),
+                                active: Color::Accent.color(cx),
+                            },
+                        )
+                        .with_compute_indents_fn(
+                            cx.entity(),
+                            |this, range, _cx, _context| {
+                                this.depths
+                                    .iter()
+                                    .skip(range.start)
+                                    .take(range.end - range.start)
+                                    .cloned()
+                                    .collect()
+                            },
+                        ),
+                    ),
                 ),
             )
     }

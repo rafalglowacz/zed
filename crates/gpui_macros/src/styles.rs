@@ -2,9 +2,9 @@ use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{format_ident, quote};
 use syn::{
-    braced,
+    Token, Visibility, braced,
     parse::{Parse, ParseStream, Result},
-    parse_macro_input, Token, Visibility,
+    parse_macro_input,
 };
 
 #[derive(Debug)]
@@ -271,6 +271,20 @@ pub fn cursor_style_methods(input: TokenStream) -> TokenStream {
             self
         }
 
+        /// Sets cursor style when hovering over an element to `nesw-resize`.
+        /// [Docs](https://tailwindcss.com/docs/cursor)
+        #visibility fn cursor_nesw_resize(mut self) -> Self {
+            self.style().mouse_cursor = Some(gpui::CursorStyle::ResizeUpRightDownLeft);
+            self
+        }
+
+        /// Sets cursor style when hovering over an element to `nwse-resize`.
+        /// [Docs](https://tailwindcss.com/docs/cursor)
+        #visibility fn cursor_nwse_resize(mut self) -> Self {
+            self.style().mouse_cursor = Some(gpui::CursorStyle::ResizeUpLeftDownRight);
+            self
+        }
+
         /// Sets cursor style when hovering over an element to `col-resize`.
         /// [Docs](https://tailwindcss.com/docs/cursor)
         #visibility fn cursor_col_resize(mut self) -> Self {
@@ -310,6 +324,13 @@ pub fn cursor_style_methods(input: TokenStream) -> TokenStream {
         /// [Docs](https://tailwindcss.com/docs/cursor)
         #visibility fn cursor_w_resize(mut self) -> Self {
             self.style().mouse_cursor = Some(gpui::CursorStyle::ResizeLeft);
+            self
+        }
+
+        /// Sets cursor style when hovering over an element to `none`.
+        /// [Docs](https://tailwindcss.com/docs/cursor)
+        #visibility fn cursor_none(mut self, cursor: CursorStyle) -> Self {
+            self.style().mouse_cursor = Some(gpui::CursorStyle::None);
             self
         }
     };
@@ -372,7 +393,7 @@ pub fn box_shadow_style_methods(input: TokenStream) -> TokenStream {
     let output = quote! {
         /// Sets the box shadow of the element.
         /// [Docs](https://tailwindcss.com/docs/box-shadow)
-        #visibility fn shadow(mut self, shadows: smallvec::SmallVec<[gpui::BoxShadow; 2]>) -> Self {
+        #visibility fn shadow(mut self, shadows: std::vec::Vec<gpui::BoxShadow>) -> Self {
             self.style().box_shadow = Some(shadows);
             self
         }
@@ -386,11 +407,26 @@ pub fn box_shadow_style_methods(input: TokenStream) -> TokenStream {
 
         /// Sets the box shadow of the element.
         /// [Docs](https://tailwindcss.com/docs/box-shadow)
-        #visibility fn shadow_sm(mut self) -> Self {
+        #visibility fn shadow_2xs(mut self) -> Self {
             use gpui::{BoxShadow, hsla, point, px};
-            use smallvec::smallvec;
+            use std::vec;
 
-            self.style().box_shadow = Some(smallvec![BoxShadow {
+            self.style().box_shadow = Some(vec![BoxShadow {
+                color: hsla(0., 0., 0., 0.05),
+                offset: point(px(0.), px(1.)),
+                blur_radius: px(0.),
+                spread_radius: px(0.),
+            }]);
+            self
+        }
+
+        /// Sets the box shadow of the element.
+        /// [Docs](https://tailwindcss.com/docs/box-shadow)
+        #visibility fn shadow_xs(mut self) -> Self {
+            use gpui::{BoxShadow, hsla, point, px};
+            use std::vec;
+
+            self.style().box_shadow = Some(vec![BoxShadow {
                 color: hsla(0., 0., 0., 0.05),
                 offset: point(px(0.), px(1.)),
                 blur_radius: px(2.),
@@ -401,13 +437,36 @@ pub fn box_shadow_style_methods(input: TokenStream) -> TokenStream {
 
         /// Sets the box shadow of the element.
         /// [Docs](https://tailwindcss.com/docs/box-shadow)
+        #visibility fn shadow_sm(mut self) -> Self {
+            use gpui::{BoxShadow, hsla, point, px};
+            use std::vec;
+
+            self.style().box_shadow = Some(vec![
+                BoxShadow {
+                    color: hsla(0., 0., 0., 0.1),
+                    offset: point(px(0.), px(1.)),
+                    blur_radius: px(3.),
+                    spread_radius: px(0.),
+                },
+                BoxShadow {
+                    color: hsla(0., 0., 0., 0.1),
+                    offset: point(px(0.), px(1.)),
+                    blur_radius: px(2.),
+                    spread_radius: px(-1.),
+                }
+            ]);
+            self
+        }
+
+        /// Sets the box shadow of the element.
+        /// [Docs](https://tailwindcss.com/docs/box-shadow)
         #visibility fn shadow_md(mut self) -> Self {
             use gpui::{BoxShadow, hsla, point, px};
-            use smallvec::smallvec;
+            use std::vec;
 
-            self.style().box_shadow = Some(smallvec![
+            self.style().box_shadow = Some(vec![
                 BoxShadow {
-                    color: hsla(0.5, 0., 0., 0.1),
+                    color: hsla(0., 0., 0., 0.1),
                     offset: point(px(0.), px(4.)),
                     blur_radius: px(6.),
                     spread_radius: px(-1.),
@@ -426,9 +485,9 @@ pub fn box_shadow_style_methods(input: TokenStream) -> TokenStream {
         /// [Docs](https://tailwindcss.com/docs/box-shadow)
         #visibility fn shadow_lg(mut self) -> Self {
             use gpui::{BoxShadow, hsla, point, px};
-            use smallvec::smallvec;
+            use std::vec;
 
-            self.style().box_shadow = Some(smallvec![
+            self.style().box_shadow = Some(vec![
                 BoxShadow {
                     color: hsla(0., 0., 0., 0.1),
                     offset: point(px(0.), px(10.)),
@@ -449,9 +508,9 @@ pub fn box_shadow_style_methods(input: TokenStream) -> TokenStream {
         /// [Docs](https://tailwindcss.com/docs/box-shadow)
         #visibility fn shadow_xl(mut self) -> Self {
             use gpui::{BoxShadow, hsla, point, px};
-            use smallvec::smallvec;
+            use std::vec;
 
-            self.style().box_shadow = Some(smallvec![
+            self.style().box_shadow = Some(vec![
                 BoxShadow {
                     color: hsla(0., 0., 0., 0.1),
                     offset: point(px(0.), px(20.)),
@@ -472,9 +531,9 @@ pub fn box_shadow_style_methods(input: TokenStream) -> TokenStream {
         /// [Docs](https://tailwindcss.com/docs/box-shadow)
         #visibility fn shadow_2xl(mut self) -> Self {
             use gpui::{BoxShadow, hsla, point, px};
-            use smallvec::smallvec;
+            use std::vec;
 
-            self.style().box_shadow = Some(smallvec![BoxShadow {
+            self.style().box_shadow = Some(vec![BoxShadow {
                 color: hsla(0., 0., 0., 0.25),
                 offset: point(px(0.), px(25.)),
                 blur_radius: px(50.),
@@ -856,8 +915,12 @@ fn box_prefixes() -> Vec<BoxStylePrefix> {
             fields: vec![quote! {size.width}, quote! {size.height}],
             doc_string_prefix: "Sets the width and height of the element.",
         },
-        // TODO: These don't use the same size ramp as the others
-        // see https://tailwindcss.com/docs/max-width
+        BoxStylePrefix {
+            prefix: "min_size",
+            auto_allowed: true,
+            fields: vec![quote! {min_size.width}, quote! {min_size.height}],
+            doc_string_prefix: "Sets the minimum width and height of the element.",
+        },
         BoxStylePrefix {
             prefix: "min_w",
             auto_allowed: true,
@@ -871,6 +934,12 @@ fn box_prefixes() -> Vec<BoxStylePrefix> {
             auto_allowed: true,
             fields: vec![quote! { min_size.height }],
             doc_string_prefix: "Sets the minimum height of the element. [Docs](https://tailwindcss.com/docs/min-height)",
+        },
+        BoxStylePrefix {
+            prefix: "max_size",
+            auto_allowed: true,
+            fields: vec![quote! {max_size.width}, quote! {max_size.height}],
+            doc_string_prefix: "Sets the maximum width and height of the element.",
         },
         // TODO: These don't use the same size ramp as the others
         // see https://tailwindcss.com/docs/max-width
@@ -1219,14 +1288,19 @@ fn corner_suffixes() -> Vec<CornerStyleSuffix> {
             doc_string_suffix: "0px",
         },
         CornerStyleSuffix {
-            suffix: "sm",
+            suffix: "xs",
             radius_tokens: quote! { rems(0.125) },
             doc_string_suffix: "2px (0.125rem)",
         },
         CornerStyleSuffix {
-            suffix: "md",
+            suffix: "sm",
             radius_tokens: quote! { rems(0.25) },
             doc_string_suffix: "4px (0.25rem)",
+        },
+        CornerStyleSuffix {
+            suffix: "md",
+            radius_tokens: quote! { rems(0.375) },
+            doc_string_suffix: "6px (0.375rem)",
         },
         CornerStyleSuffix {
             suffix: "lg",
@@ -1266,27 +1340,27 @@ fn border_prefixes() -> Vec<BorderStylePrefix> {
                 quote! { border_widths.bottom },
                 quote! { border_widths.left },
             ],
-            doc_string_prefix: "Sets the border width of the element. [Docs](https://tailwindcss.com/docs/border-width)"
+            doc_string_prefix: "Sets the border width of the element. [Docs](https://tailwindcss.com/docs/border-width)",
         },
         BorderStylePrefix {
             prefix: "border_t",
             fields: vec![quote! { border_widths.top }],
-            doc_string_prefix: "Sets the border width of the top side of the element. [Docs](https://tailwindcss.com/docs/border-width#individual-sides)"
+            doc_string_prefix: "Sets the border width of the top side of the element. [Docs](https://tailwindcss.com/docs/border-width#individual-sides)",
         },
         BorderStylePrefix {
             prefix: "border_b",
             fields: vec![quote! { border_widths.bottom }],
-            doc_string_prefix: "Sets the border width of the bottom side of the element. [Docs](https://tailwindcss.com/docs/border-width#individual-sides)"
+            doc_string_prefix: "Sets the border width of the bottom side of the element. [Docs](https://tailwindcss.com/docs/border-width#individual-sides)",
         },
         BorderStylePrefix {
             prefix: "border_r",
             fields: vec![quote! { border_widths.right }],
-            doc_string_prefix: "Sets the border width of the right side of the element. [Docs](https://tailwindcss.com/docs/border-width#individual-sides)"
+            doc_string_prefix: "Sets the border width of the right side of the element. [Docs](https://tailwindcss.com/docs/border-width#individual-sides)",
         },
         BorderStylePrefix {
             prefix: "border_l",
             fields: vec![quote! { border_widths.left }],
-            doc_string_prefix: "Sets the border width of the left side of the element. [Docs](https://tailwindcss.com/docs/border-width#individual-sides)"
+            doc_string_prefix: "Sets the border width of the left side of the element. [Docs](https://tailwindcss.com/docs/border-width#individual-sides)",
         },
         BorderStylePrefix {
             prefix: "border_x",
@@ -1294,7 +1368,7 @@ fn border_prefixes() -> Vec<BorderStylePrefix> {
                 quote! { border_widths.left },
                 quote! { border_widths.right },
             ],
-            doc_string_prefix: "Sets the border width of the vertical sides of the element. [Docs](https://tailwindcss.com/docs/border-width#horizontal-and-vertical-sides)"
+            doc_string_prefix: "Sets the border width of the vertical sides of the element. [Docs](https://tailwindcss.com/docs/border-width#horizontal-and-vertical-sides)",
         },
         BorderStylePrefix {
             prefix: "border_y",
@@ -1302,7 +1376,7 @@ fn border_prefixes() -> Vec<BorderStylePrefix> {
                 quote! { border_widths.top },
                 quote! { border_widths.bottom },
             ],
-            doc_string_prefix: "Sets the border width of the horizontal sides of the element. [Docs](https://tailwindcss.com/docs/border-width#horizontal-and-vertical-sides)"
+            doc_string_prefix: "Sets the border width of the horizontal sides of the element. [Docs](https://tailwindcss.com/docs/border-width#horizontal-and-vertical-sides)",
         },
     ]
 }

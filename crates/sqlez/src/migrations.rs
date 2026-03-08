@@ -6,7 +6,7 @@
 
 use std::ffi::CString;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context as _, Result};
 use indoc::{formatdoc, indoc};
 use libsqlite3_sys::sqlite3_exec;
 
@@ -34,7 +34,12 @@ impl Connection {
     /// Note: Unlike everything else in SQLez, migrations are run eagerly, without first
     /// preparing the SQL statements. This makes it possible to do multi-statement schema
     /// updates in a single string without running into prepare errors.
-    pub fn migrate(&self, domain: &'static str, migrations: &[&'static str]) -> Result<()> {
+    pub fn migrate(
+        &self,
+        domain: &'static str,
+        migrations: &[&'static str],
+        should_allow_migration_change: &mut dyn FnMut(usize, &str, &str) -> bool,
+    ) -> Result<()> {
         self.with_savepoint("migrating", || {
             // Setup the migrations table unconditionally
             self.exec(indoc! {"
@@ -54,6 +59,7 @@ impl Connection {
             let mut store_completed_migration = self
                 .exec_bound("INSERT INTO migrations (domain, step, migration) VALUES (?, ?, ?)")?;
 
+            let mut did_migrate = false;
             for (index, migration) in migrations.iter().enumerate() {
                 let migration =
                     sqlformat::format(migration, &sqlformat::QueryParams::None, Default::default());
@@ -68,24 +74,73 @@ impl Connection {
                     if completed_migration == migration {
                         // Migration already run. Continue
                         continue;
+                    } else if should_allow_migration_change(index, &completed_migration, &migration)
+                    {
+                        continue;
                     } else {
-                        return Err(anyhow!(formatdoc! {"
-                            Migration changed for {} at step {}
+                        anyhow::bail!(formatdoc! {"
+                            Migration changed for {domain} at step {index}
 
                             Stored migration:
-                            {}
+                            {completed_migration}
 
                             Proposed migration:
-                            {}", domain, index, completed_migration, migration}));
+                            {migration}"});
                     }
                 }
 
                 self.eager_exec(&migration)?;
+                did_migrate = true;
                 store_completed_migration((domain, index, migration))?;
+            }
+
+            if did_migrate {
+                self.delete_rows_with_orphaned_foreign_key_references()?;
+                self.exec("PRAGMA foreign_key_check;")?()?;
             }
 
             Ok(())
         })
+    }
+
+    /// Delete any rows that were orphaned by a migration. This is needed
+    /// because we disable foreign key constraints during migrations, so
+    /// that it's possible to re-create a table with the same name, without
+    /// deleting all associated data.
+    fn delete_rows_with_orphaned_foreign_key_references(&self) -> Result<()> {
+        let foreign_key_info: Vec<(String, String, String, String)> = self.select(
+            r#"
+                SELECT DISTINCT
+                    schema.name as child_table,
+                    foreign_keys.[from] as child_key,
+                    foreign_keys.[table] as parent_table,
+                    foreign_keys.[to] as parent_key
+                FROM sqlite_schema schema
+                JOIN pragma_foreign_key_list(schema.name) foreign_keys
+                WHERE
+                    schema.type = 'table' AND
+                    schema.name NOT LIKE "sqlite_%"
+            "#,
+        )?()?;
+
+        if !foreign_key_info.is_empty() {
+            log::info!(
+                "Found {} foreign key relationships to check",
+                foreign_key_info.len()
+            );
+        }
+
+        for (child_table, child_key, parent_table, parent_key) in foreign_key_info {
+            self.exec(&format!(
+                "
+                DELETE FROM {child_table}
+                WHERE {child_key} IS NOT NULL and {child_key} NOT IN
+                (SELECT {parent_key} FROM {parent_table})
+                "
+            ))?()?;
+        }
+
+        Ok(())
     }
 }
 
@@ -108,6 +163,7 @@ mod test {
                     a TEXT,
                     b TEXT
                 )"}],
+                &mut disallow_migration_change,
             )
             .unwrap();
 
@@ -136,6 +192,7 @@ mod test {
                         d TEXT
                     )"},
                 ],
+                &mut disallow_migration_change,
             )
             .unwrap();
 
@@ -214,7 +271,11 @@ mod test {
 
         // Run the migration verifying that the row got dropped
         connection
-            .migrate("test", &["DELETE FROM test_table"])
+            .migrate(
+                "test",
+                &["DELETE FROM test_table"],
+                &mut disallow_migration_change,
+            )
             .unwrap();
         assert_eq!(
             connection
@@ -232,7 +293,11 @@ mod test {
 
         // Run the same migration again and verify that the table was left unchanged
         connection
-            .migrate("test", &["DELETE FROM test_table"])
+            .migrate(
+                "test",
+                &["DELETE FROM test_table"],
+                &mut disallow_migration_change,
+            )
             .unwrap();
         assert_eq!(
             connection
@@ -252,27 +317,28 @@ mod test {
             .migrate(
                 "test migration",
                 &[
-                    indoc! {"
-                CREATE TABLE test (
-                    col INTEGER
-                )"},
-                    indoc! {"
-                    INSERT INTO test (col) VALUES (1)"},
+                    "CREATE TABLE test (col INTEGER)",
+                    "INSERT INTO test (col) VALUES (1)",
                 ],
+                &mut disallow_migration_change,
             )
             .unwrap();
+
+        let mut migration_changed = false;
 
         // Create another migration with the same domain but different steps
         let second_migration_result = connection.migrate(
             "test migration",
             &[
-                indoc! {"
-                CREATE TABLE test (
-                    color INTEGER
-                )"},
-                indoc! {"
-                INSERT INTO test (color) VALUES (1)"},
+                "CREATE TABLE test (color INTEGER )",
+                "INSERT INTO test (color) VALUES (1)",
             ],
+            &mut |_, old, new| {
+                assert_eq!(old, "CREATE TABLE test (col INTEGER)");
+                assert_eq!(new, "CREATE TABLE test (color INTEGER)");
+                migration_changed = true;
+                false
+            },
         );
 
         // Verify new migration returns error when run
@@ -284,7 +350,11 @@ mod test {
         let connection = Connection::open_memory(Some("test_create_alter_drop"));
 
         connection
-            .migrate("first_migration", &["CREATE TABLE table1(a TEXT) STRICT;"])
+            .migrate(
+                "first_migration",
+                &["CREATE TABLE table1(a TEXT) STRICT;"],
+                &mut disallow_migration_change,
+            )
             .unwrap();
 
         connection
@@ -305,11 +375,16 @@ mod test {
 
                     ALTER TABLE table2 RENAME TO table1;
                 "}],
+                &mut disallow_migration_change,
             )
             .unwrap();
 
         let res = &connection.select::<String>("SELECT b FROM table1").unwrap()().unwrap()[0];
 
         assert_eq!(res, "test text");
+    }
+
+    fn disallow_migration_change(_: usize, _: &str, _: &str) -> bool {
+        false
     }
 }

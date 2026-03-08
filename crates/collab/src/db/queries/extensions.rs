@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use anyhow::Context;
 use chrono::Utc;
 use sea_orm::sea_query::IntoCondition;
 use util::ResultExt;
@@ -7,31 +8,6 @@ use util::ResultExt;
 use super::*;
 
 impl Database {
-    pub async fn get_extensions(
-        &self,
-        filter: Option<&str>,
-        max_schema_version: i32,
-        limit: usize,
-    ) -> Result<Vec<ExtensionMetadata>> {
-        self.transaction(|tx| async move {
-            let mut condition = Condition::all()
-                .add(
-                    extension::Column::LatestVersion
-                        .into_expr()
-                        .eq(extension_version::Column::Version.into_expr()),
-                )
-                .add(extension_version::Column::SchemaVersion.lte(max_schema_version));
-            if let Some(filter) = filter {
-                let fuzzy_name_filter = Self::fuzzy_like_string(filter);
-                condition = condition.add(Expr::cust_with_expr("name ILIKE $1", fuzzy_name_filter));
-            }
-
-            self.get_extensions_where(condition, Some(limit as u64), &tx)
-                .await
-        })
-        .await
-    }
-
     pub async fn get_extensions_by_ids(
         &self,
         ids: &[&str],
@@ -63,7 +39,7 @@ impl Database {
         extensions: &[extension::Model],
         constraints: Option<&ExtensionVersionConstraints>,
         tx: &DatabaseTransaction,
-    ) -> Result<HashMap<ExtensionId, (extension_version::Model, SemanticVersion)>> {
+    ) -> Result<HashMap<ExtensionId, (extension_version::Model, Version)>> {
         let mut versions = extension_version::Entity::find()
             .filter(
                 extension_version::Column::ExtensionId
@@ -73,18 +49,17 @@ impl Database {
             .await?;
 
         let mut max_versions =
-            HashMap::<ExtensionId, (extension_version::Model, SemanticVersion)>::default();
+            HashMap::<ExtensionId, (extension_version::Model, Version)>::default();
         while let Some(version) = versions.next().await {
             let version = version?;
-            let Some(extension_version) = SemanticVersion::from_str(&version.version).log_err()
-            else {
+            let Some(extension_version) = Version::from_str(&version.version).log_err() else {
                 continue;
             };
 
-            if let Some((_, max_extension_version)) = &max_versions.get(&version.extension_id) {
-                if max_extension_version > &extension_version {
-                    continue;
-                }
+            if let Some((_, max_extension_version)) = &max_versions.get(&version.extension_id)
+                && max_extension_version > &extension_version
+            {
+                continue;
             }
 
             if let Some(constraints) = constraints {
@@ -96,7 +71,7 @@ impl Database {
                 }
 
                 if let Some(wasm_api_version) = version.wasm_api_version.as_ref() {
-                    if let Some(version) = SemanticVersion::from_str(wasm_api_version).log_err() {
+                    if let Some(version) = Version::from_str(wasm_api_version).log_err() {
                         if !constraints.wasm_api_versions.contains(&version) {
                             continue;
                         }
@@ -161,7 +136,7 @@ impl Database {
                 .filter(extension::Column::ExternalId.eq(extension_id))
                 .one(&*tx)
                 .await?
-                .ok_or_else(|| anyhow!("no such extension: {extension_id}"))?;
+                .with_context(|| format!("no such extension: {extension_id}"))?;
 
             let extensions = [extension];
             let mut versions = self
@@ -197,7 +172,7 @@ impl Database {
         .await
     }
 
-    pub async fn get_known_extension_versions<'a>(&self) -> Result<HashMap<String, Vec<String>>> {
+    pub async fn get_known_extension_versions(&self) -> Result<HashMap<String, Vec<String>>> {
         self.transaction(|tx| async move {
             let mut extension_external_ids_by_id = HashMap::default();
 
@@ -249,7 +224,7 @@ impl Database {
 
                 let insert = extension::Entity::insert(extension::ActiveModel {
                     name: ActiveValue::Set(latest_version.name.clone()),
-                    external_id: ActiveValue::Set(external_id.to_string()),
+                    external_id: ActiveValue::Set((*external_id).to_owned()),
                     id: ActiveValue::NotSet,
                     latest_version: ActiveValue::Set(latest_version.version.to_string()),
                     total_download_count: ActiveValue::NotSet,
@@ -269,7 +244,7 @@ impl Database {
                         .filter(extension::Column::ExternalId.eq(*external_id))
                         .one(&*tx)
                         .await?
-                        .ok_or_else(|| anyhow!("failed to insert extension"))?
+                        .context("failed to insert extension")?
                 };
 
                 extension_version::Entity::insert_many(versions.iter().map(|version| {
@@ -282,6 +257,45 @@ impl Database {
                         description: ActiveValue::Set(version.description.clone()),
                         schema_version: ActiveValue::Set(version.schema_version),
                         wasm_api_version: ActiveValue::Set(version.wasm_api_version.clone()),
+                        provides_themes: ActiveValue::Set(
+                            version.provides.contains(&ExtensionProvides::Themes),
+                        ),
+                        provides_icon_themes: ActiveValue::Set(
+                            version.provides.contains(&ExtensionProvides::IconThemes),
+                        ),
+                        provides_languages: ActiveValue::Set(
+                            version.provides.contains(&ExtensionProvides::Languages),
+                        ),
+                        provides_grammars: ActiveValue::Set(
+                            version.provides.contains(&ExtensionProvides::Grammars),
+                        ),
+                        provides_language_servers: ActiveValue::Set(
+                            version
+                                .provides
+                                .contains(&ExtensionProvides::LanguageServers),
+                        ),
+                        provides_context_servers: ActiveValue::Set(
+                            version
+                                .provides
+                                .contains(&ExtensionProvides::ContextServers),
+                        ),
+                        provides_agent_servers: ActiveValue::Set(
+                            version.provides.contains(&ExtensionProvides::AgentServers),
+                        ),
+                        provides_slash_commands: ActiveValue::Set(
+                            version.provides.contains(&ExtensionProvides::SlashCommands),
+                        ),
+                        provides_indexed_docs_providers: ActiveValue::Set(
+                            version
+                                .provides
+                                .contains(&ExtensionProvides::IndexedDocsProviders),
+                        ),
+                        provides_snippets: ActiveValue::Set(
+                            version.provides.contains(&ExtensionProvides::Snippets),
+                        ),
+                        provides_debug_adapters: ActiveValue::Set(
+                            version.provides.contains(&ExtensionProvides::DebugAdapters),
+                        ),
                         download_count: ActiveValue::NotSet,
                     }
                 }))
@@ -289,10 +303,10 @@ impl Database {
                 .exec_without_returning(&*tx)
                 .await?;
 
-                if let Ok(db_version) = semver::Version::parse(&extension.latest_version) {
-                    if db_version >= latest_version.version {
-                        continue;
-                    }
+                if let Ok(db_version) = semver::Version::parse(&extension.latest_version)
+                    && db_version >= latest_version.version
+                {
+                    continue;
                 }
 
                 let mut extension = extension.into_active_model();
@@ -356,9 +370,11 @@ fn metadata_from_extension_and_version(
     extension: extension::Model,
     version: extension_version::Model,
 ) -> ExtensionMetadata {
+    let provides = version.provides();
+
     ExtensionMetadata {
         id: extension.external_id.into(),
-        manifest: rpc::ExtensionApiManifest {
+        manifest: cloud_api_types::ExtensionApiManifest {
             name: extension.name,
             version: version.version.into(),
             authors: version
@@ -370,6 +386,7 @@ fn metadata_from_extension_and_version(
             repository: version.repository,
             schema_version: Some(version.schema_version),
             wasm_api_version: version.wasm_api_version,
+            provides,
         },
 
         published_at: convert_time_to_chrono(version.published_at),

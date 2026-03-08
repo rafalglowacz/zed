@@ -1,8 +1,14 @@
+---
+title: Remote Development in Zed - SSH Workflows
+description: Use remote development in Zed to edit code over SSH with local UI performance, remote terminals, language servers, and tasks.
+---
+
 # Remote Development
 
-Remote Development allows you to code at the speed of thought, even when your codebase is not on your local machine. You use Zed locally so the UI is immediately responsive, but offload heavy computation to the development server so that you can work effectively.
+Remote Development lets you edit code on a remote server while running Zed locally. The UI stays responsive because it runs on your machine, while language servers, tasks, and terminals run on the server.
 
-> **Note:** Remoting is still "beta". We are still refining the reliability and performance.
+For day-to-day workflows, pair remote development with [Tasks](./tasks.md),
+[Terminal](./terminal.md), and [Debugger](./debugger.md).
 
 ## Overview
 
@@ -10,14 +16,14 @@ Remote development requires two computers, your local machine that runs the Zed 
 
 ![Architectural overview of Zed Remote Development](https://zed.dev/img/remote-development/diagram.png)
 
-On your local machine, Zed runs its UI, talks to language models, uses Tree-sitter to parse and syntax-highlight code, and store unsaved changes and recent projects. The source code, language servers, tasks, and the terminal all run on the remote server.
+On your local machine, Zed runs its UI, talks to language models, uses Tree-sitter to parse and syntax-highlight code, and store unsaved changes and recent projects. The source code, language servers, tasks, and the terminal all run on the remote server. [AI features](./ai/overview.md) work in remote sessions, including the Agent Panel and Inline Assistant.
 
 > **Note:** The original version of remote development sent traffic via Zed's servers. As of Zed v0.157 you can no-longer use that mode.
 
 ## Setup
 
 1. Download and install the latest [Zed](https://zed.dev/releases). You need at least Zed v0.159.
-1. Open the remote projects dialogue with <kbd>cmd-shift-p remote</kbd> or <kbd>cmd-control-o</kbd>.
+1. Use {#kb projects::OpenRemote} to open the "Remote Projects" dialog.
 1. Click "Connect New Server" and enter the command you use to SSH into the server. See [Supported SSH options](#supported-ssh-options) for options you can pass.
 1. Your local machine will attempt to connect to the remote server using the `ssh` binary on your path. Assuming the connection is successful, Zed will download the server on the remote host and start it.
 1. Once the Zed server is running, you will be prompted to choose a path to open on the remote server.
@@ -31,18 +37,18 @@ The remote machine must be able to run Zed's server. The following platforms sho
 
 - macOS Catalina or later (Intel or Apple Silicon)
 - Linux (x86_64 or arm64, we do not yet support 32-bit platforms)
-- Windows is not yet supported.
+- Windows is not yet supported as a remote server, but Windows can be used as a local machine to connect to remote servers.
 
 ## Configuration
 
-The list of remote servers is stored in your settings file {#kb zed::OpenSettings}. You can edit this list using the Remote Projects dialogue {#kb projects::OpenRemote}, which provides some robustness - for example it checks that the connection can be established before writing it to the settings file.
+The list of remote servers is stored in your settings file {#kb zed::OpenSettings}. You can edit this list using the Remote Projects dialog {#kb projects::OpenRemote}, which provides some robustness - for example it checks that the connection can be established before writing it to the settings file.
 
-```json
+```json [settings]
 {
   "ssh_connections": [
     {
       "host": "192.168.1.10",
-      "projects": ["~/code/zed/zed"]
+      "projects": [{ "paths": ["~/code/zed/zed"] }]
     }
   ]
 }
@@ -50,12 +56,12 @@ The list of remote servers is stored in your settings file {#kb zed::OpenSetting
 
 Zed shells out to the `ssh` on your path, and so it will inherit any configuration you have in `~/.ssh/config` for the given host. That said, if you need to override anything you can configure the following additional options on each connection:
 
-```json
+```json [settings]
 {
   "ssh_connections": [
     {
       "host": "192.168.1.10",
-      "projects": ["~/code/zed/zed"],
+      "projects": [{ "paths": ["~/code/zed/zed"] }],
       // any argument to pass to the ssh master process
       "args": ["-i", "~/.ssh/work_id_file"],
       "port": 22, // defaults to 22
@@ -68,12 +74,12 @@ Zed shells out to the `ssh` on your path, and so it will inherit any configurati
 
 There are two additional Zed-specific options per connection, `upload_binary_over_ssh` and `nickname`:
 
-```json
+```json [settings]
 {
   "ssh_connections": [
     {
       "host": "192.168.1.10",
-      "projects": ["~/code/zed/zed"],
+      "projects": [{ "paths": ["~/code/zed/zed"] }],
       // by default Zed will download the server binary from the internet on the remote.
       // When this is true, it'll be downloaded to your laptop and uploaded over SSH.
       // This is useful when your remote server has restricted internet access.
@@ -89,6 +95,83 @@ If you use the command line to open a connection to a host by doing `zed ssh://1
 
 Additionally it's worth noting that while you can pass a password on the command line `zed ssh://user:password@host/~`, we do not support writing a password to your settings file. If you're connecting repeatedly to the same host, you should configure key-based authentication.
 
+## Remote Development on Windows (SSH)
+
+Zed on Windows supports SSH remoting and will prompt for credentials when needed.
+
+If you encounter authentication issues, confirm that your SSH key agent is running (e.g., ssh-agent or your Git client's agent) and that ssh.exe is on PATH.
+
+### Troubleshooting SSH on Windows
+
+When prompted for credentials, use the graphical askpass dialog. If it doesn't appear, check for credential manager conflicts and that GUI prompts aren't blocked by your terminal.
+
+## WSL Support
+
+Zed supports opening folders inside of WSL natively on Windows.
+
+### Opening a local folder in WSL
+
+To open a local folder inside a WSL container, use the `projects: open in wsl` action and select the folder you want to open. You will be presented with a list of available WSL distributions to open the folder in.
+
+### Opening a folder already in WSL
+
+To open a folder that's already located inside of a WSL container, use the `projects: open wsl` action and select the WSL distribution. The distribution will be added to the `Remote Projects` window where you will be able to open the folder.
+
+## Port forwarding
+
+If you'd like to be able to connect to ports on your remote server from your local machine, you can configure port forwarding in your settings file. This is particularly useful for developing websites so you can load the site in your browser while working.
+
+```json [settings]
+{
+  "ssh_connections": [
+    {
+      "host": "192.168.1.10",
+      "port_forwards": [{ "local_port": 8080, "remote_port": 80 }]
+    }
+  ]
+}
+```
+
+This will cause requests from your local machine to `localhost:8080` to be forwarded to the remote machine's port 80. Under the hood this uses the `-L` argument to ssh.
+
+By default these ports are bound to localhost, so other computers in the same network as your development machine cannot access them. You can set the local_host to bind to a different interface, for example, 0.0.0.0 will bind to all local interfaces.
+
+```json [settings]
+{
+  "ssh_connections": [
+    {
+      "host": "192.168.1.10",
+      "port_forwards": [
+        {
+          "local_port": 8080,
+          "remote_port": 80,
+          "local_host": "0.0.0.0"
+        }
+      ]
+    }
+  ]
+}
+```
+
+These ports also default to the `localhost` interface on the remote host. If you need to change this, you can also set the remote host:
+
+```json [settings]
+{
+  "ssh_connections": [
+    {
+      "host": "192.168.1.10",
+      "port_forwards": [
+        {
+          "local_port": 8080,
+          "remote_port": 80,
+          "remote_host": "docker-host"
+        }
+      ]
+    }
+  ]
+}
+```
+
 ## Zed settings
 
 When opening a remote project there are three relevant settings locations:
@@ -97,13 +180,39 @@ When opening a remote project there are three relevant settings locations:
 - The server Zed settings (in the same place) on the remote server.
 - The project settings (in `.zed/settings.json` or `.editorconfig` of your project)
 
-Both the local Zed and the server Zed read the project settings, but they are not aware of the other's main `settings.json`.
+Both the local Zed and the server Zed read the project settings, but they are not aware of the other's main settings file.
 
-Depending on the kind of setting you want to make, which settings file you should use:
+Which settings file you should use depends on the kind of setting you want to make:
 
 - Project settings should be used for things that affect the project: indentation settings, which formatter / language server to use, etc.
-- Server settings should be used for things that affect the server: paths to language servers, etc.
+- Server settings should be used for things that affect the server: paths to language servers, proxy settings, etc.
 - Local settings should be used for things that affect the UI: font size, etc.
+
+In addition any extensions you have installed locally will be propagated to the remote server. This means that language servers, etc. will run correctly.
+
+## Proxy Configuration
+
+The remote server will not use your local machine's proxy configuration because they may be under different network policies. If your remote server requires a proxy to access the internet, you must configure it on the remote server itself.
+
+In most cases, your remote server will already have proxy environment variables configured. Zed will automatically use them when downloading language servers, communicating with LLM models, etc.
+
+If needed, you can set these environment variables in the server's shell configuration (e.g., `~/.bashrc`):
+
+```bash
+export http_proxy="http://proxy.example.com:8080"
+export https_proxy="http://proxy.example.com:8080"
+export no_proxy="localhost,127.0.0.1"
+```
+
+Alternatively, you can configure the proxy in the remote machine's `~/.config/zed/settings.json` (Linux) or `~/.zed/settings.json` (macOS):
+
+```json
+{
+  "proxy": "http://proxy.example.com:8080"
+}
+```
+
+See the [proxy documentation](./reference/all-settings.md#network-proxy) for supported proxy types and additional configuration options.
 
 ## Initializing the remote server
 
@@ -115,7 +224,7 @@ Once the master connection is established, Zed will check to see if the remote s
 
 If it is not there or the version mismatches, Zed will try to download the latest version. By default, it will download from `https://zed.dev` directly, but if you set: `{"upload_binary_over_ssh":true}` in your settings for that server, it will download the binary to your local machine and then upload it to the remote server.
 
-If you'd like to maintain the server binary yourself you can. You can either download our prebuilt versions from [Github](https://github.com/zed-industries/zed/releases), or [build your own](https://zed.dev/docs/development) with `cargo build -p remote_server --release`. If you do this, you must upload it to `~/.zed_server/zed-remote-server-{RELEASE_CHANNEL}-{OS}-{ARCH}` on the server, for example `.zed-server/zed-remote-server-preview-linux-x86_64`. The version must exactly match the version of Zed itself you are using.
+If you'd like to maintain the server binary yourself you can. You can either download our prebuilt versions from [GitHub](https://github.com/zed-industries/zed/releases), or [build your own](https://zed.dev/docs/development) with `cargo build -p remote_server --release`. If you do this, you must upload it to `~/.zed_server/zed-remote-server-{RELEASE_CHANNEL}-{VERSION}` on the server, for example `~/.zed_server/zed-remote-server-stable-0.217.3+stable.105.80433cb239e868271457ac376673a5f75bc4adb1`. The version must exactly match the version of Zed itself you are using.
 
 ## Maintaining the SSH connection
 
@@ -125,13 +234,13 @@ Each connection tries to run the development server in proxy mode. This mode wil
 
 In the case that reconnecting fails, the daemon will not be re-used. That said, unsaved changes are by default persisted locally, so that you do not lose work. You can always reconnect to the project at a later date and Zed will restore unsaved changes.
 
-If you are struggling with connection issues, you should be able to see more information in the Zed log `cmd-shift-p Open Log`. If you are seeing things that are unexpected, please file a [GitHub issue](https://github.com/zed-industries/zed/issues/new) or reach out in the #remoting-feedback channel in the [Zed Discord](https://discord.gg/zed-community).
+If you are struggling with connection issues, you should be able to see more information in the Zed log `cmd-shift-p Open Log`. If you are seeing things that are unexpected, please file a [GitHub issue](https://github.com/zed-industries/zed/issues/new) or reach out in the #remoting-feedback channel in the [Zed Discord](https://zed.dev/community-links).
 
 ## Supported SSH Options
 
-Under the hood, Zed shells out to the `ssh` binary to connect to the remote server. We create one SSH control master per project, and use then use that to multiplex SSH connections for the Zed protocol itself, any terminals you open and tasks you run. We read settings from your SSH config file, but if you want to specify additional options to the SSH control master you can configure Zed to set them.
+Under the hood, Zed shells out to the `ssh` binary to connect to the remote server. We create one SSH control master per project, and then use that to multiplex SSH connections for the Zed protocol itself, any terminals you open and tasks you run. We read settings from your SSH config file, but if you want to specify additional options to the SSH control master you can configure Zed to set them.
 
-When typing in the "Connect New Server" dialogue, you can use bash-style quoting to pass options containing a space. Once you have created a server it will be added to the `"ssh_connections": []` array in your settings file. You can edit the settings file directly to make changes to SSH connections.
+When typing in the "Connect New Server" dialog, you can use bash-style quoting to pass options containing a space. Once you have created a server it will be added to the `"ssh_connections": []` array in your settings file. You can edit the settings file directly to make changes to SSH connections.
 
 Supported options:
 
@@ -140,16 +249,25 @@ Supported options:
 - `-i` - to use a specific key file
 - `-o` - to set custom options
 - `-J` / `-w` - to proxy the SSH connection
-- And also... `-4`, `-6`, `-A`, `-a`, `-C`, `-K`, `-k`, `-X`, `-x`, `-Y`, `-y`, `-B`, `-b`, `-c`, `-D`, `-I`, `-i`, `-J`, `-l`, `-m`, `-o`, `-P`, `-p`, `-w`
+- `-F` for specifying an `ssh_config`
+- And also... `-4`, `-6`, `-A`, `-B`, `-C`, `-D`, `-I`, `-K`, `-P`, `-X`, `-Y`, `-a`, `-b`, `-c`, `-i`, `-k`, `-l`, `-m`, `-o`, `-p`, `-w`, `-x`, `-y`
 
 Note that we deliberately disallow some options (for example `-t` or `-T`) that Zed will set for you.
 
 ## Known Limitations
 
-- Zed extensions are not yet supported on remotes, so languages that need them for support do not work.
 - You can't open files from the remote Terminal by typing the `zed` command.
-- Zed does not yet support automatic port-forwarding. You can use `-R` and `-L` in your SSH arguments for now.
 
 ## Feedback
 
-Please join the #remoting-feedback channel in the [Zed Discord](https://discord.gg/zed-community).
+Please join the #remoting-feedback channel in the [Zed Discord](https://zed.dev/community-links).
+
+## See also
+
+- [Running & Testing](./running-testing.md): Run tasks, terminal commands, and
+  debugger sessions while you work remotely.
+- [Configuring Zed](./configuring-zed.md): Manage shared and project settings,
+  including `.zed/settings.json`.
+- [Agent Panel](./ai/agent-panel.md): Use AI workflows in remote projects.
+- [Remote Development on zed.dev](https://zed.dev/remote-development): Product
+  overview and release updates.
