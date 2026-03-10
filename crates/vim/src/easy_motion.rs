@@ -35,6 +35,7 @@ enum Direction {
 }
 
 #[derive(Clone, serde::Deserialize, schemars::JsonSchema, PartialEq, gpui::Action)]
+#[action(namespace = easy_motion)]
 #[serde(rename_all = "camelCase")]
 struct NChar {
     direction: Direction,
@@ -42,22 +43,27 @@ struct NChar {
 }
 
 #[derive(Clone, serde::Deserialize, schemars::JsonSchema, PartialEq, gpui::Action)]
+#[action(namespace = easy_motion)]
 #[serde(rename_all = "camelCase")]
 struct Pattern(Direction);
 
 #[derive(Clone, serde::Deserialize, schemars::JsonSchema, PartialEq, gpui::Action)]
+#[action(namespace = easy_motion)]
 #[serde(rename_all = "camelCase")]
 pub struct Word(pub Direction);
 
 #[derive(Clone, serde::Deserialize, schemars::JsonSchema, PartialEq, gpui::Action)]
+#[action(namespace = easy_motion)]
 #[serde(rename_all = "camelCase")]
 struct SubWord(Direction);
 
 #[derive(Clone, serde::Deserialize, schemars::JsonSchema, PartialEq, gpui::Action)]
+#[action(namespace = easy_motion)]
 #[serde(rename_all = "camelCase")]
 pub struct FullWord(pub Direction);
 
 #[derive(Clone, serde::Deserialize, schemars::JsonSchema, PartialEq, gpui::Action)]
+#[action(namespace = easy_motion)]
 #[serde(rename_all = "camelCase")]
 pub struct Row(pub Direction);
 

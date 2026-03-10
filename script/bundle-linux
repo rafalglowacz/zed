@@ -80,6 +80,10 @@ cargo build --release --target "${target_triple}" --package zed --package cli
 # from influencing dynamic libraries required by it.
 if [[ "$remote_server_triple" == "$musl_triple" ]]; then
     export RUSTFLAGS="${RUSTFLAGS:-} -C target-feature=+crt-static"
+    # Newer glibc headers (>=2.38) redirect sscanf/strtol to __isoc23_* C23 variants,
+    # but musl doesn't implement those aliases. CFLAGS prevents fresh compilations of
+    # aws-lc-sys from emitting the references; the shim in server.rs resolves cached ones.
+    export CFLAGS="${CFLAGS:-} -D__isoc23_sscanf=sscanf -D__isoc23_strtol=strtol -D__isoc23_strtoul=strtoul -D__isoc23_strtoimax=strtoimax -D__isoc23_strtoumax=strtoumax"
 fi
 cargo build --release --target "${remote_server_triple}" --package remote_server
 

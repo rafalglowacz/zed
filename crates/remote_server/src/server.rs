@@ -6,6 +6,23 @@ mod remote_editing_tests;
 #[cfg(windows)]
 pub mod windows;
 
+// Newer glibc headers (>=2.38) emit references to __isoc23_* variants of sscanf/strtol etc.
+// when compiling in C23 mode, but musl doesn't implement those aliases. aws-lc-sys triggers
+// this. We provide the missing symbols as tail-calls into the standard musl implementations.
+// This must live here (in the rlib) rather than a standalone .o so it appears before -lc in
+// the linker command, causing musl to pull in sscanf/strtol etc. before link resolution ends.
+#[cfg(all(target_arch = "x86_64", target_env = "musl"))]
+core::arch::global_asm!(
+    ".text",
+    ".global __isoc23_sscanf",   ".type __isoc23_sscanf,   @function", "__isoc23_sscanf:",   "jmp sscanf",
+    ".global __isoc23_strtol",   ".type __isoc23_strtol,   @function", "__isoc23_strtol:",   "jmp strtol",
+    ".global __isoc23_strtoul",  ".type __isoc23_strtoul,  @function", "__isoc23_strtoul:",  "jmp strtoul",
+    ".global __isoc23_strtoll",  ".type __isoc23_strtoll,  @function", "__isoc23_strtoll:",  "jmp strtoll",
+    ".global __isoc23_strtoull", ".type __isoc23_strtoull, @function", "__isoc23_strtoull:", "jmp strtoull",
+    ".global __isoc23_strtoimax",".type __isoc23_strtoimax,@function", "__isoc23_strtoimax:","jmp strtoimax",
+    ".global __isoc23_strtoumax",".type __isoc23_strtoumax,@function", "__isoc23_strtoumax:","jmp strtoumax",
+);
+
 pub use headless_project::{HeadlessAppState, HeadlessProject};
 
 use anyhow::{Context as _, Result, anyhow};
