@@ -54,13 +54,11 @@ workspace.workspace = true
 zed_actions.workspace = true
 
 [dev-dependencies]
-assets.workspace = true
 command_palette = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }
 futures.workspace = true
 rope.workspace = true
 git_ui = { workspace = true, features = ["test-support"] }
-title_bar = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 rand.workspace = true
 release_channel.workspace = true

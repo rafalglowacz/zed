@@ -409,7 +409,7 @@ pub fn previous_subword_start(map: &DisplaySnapshot, point: DisplayPoint) -> Dis
     let classifier = map.buffer_snapshot().char_classifier_at(raw_point);
 
     find_preceding_boundary_display_point(map, point, FindRange::MultiLine, &mut |left, right| {
-        is_subword_start(left, right, &classifier) || left == '\n'
+        is_subword_start(left, right, &classifier) || left == '\n' || right == '\n'
     })
 }
 
@@ -432,6 +432,7 @@ pub fn is_subword_start(left: char, right: char, classifier: &CharClassifier) ->
     let is_word_start = classifier.kind(left) != classifier.kind(right) && !right.is_whitespace();
     let is_subword_start = classifier.is_word('-') && left == '-' && right != '-'
         || left == '_' && right != '_'
+        || left != '_' && right == '_'
         || left.is_lowercase() && right.is_uppercase();
     is_word_start || is_subword_start
 }
@@ -485,7 +486,7 @@ pub fn next_subword_end(map: &DisplaySnapshot, point: DisplayPoint) -> DisplayPo
     let classifier = map.buffer_snapshot().char_classifier_at(raw_point);
 
     find_boundary(map, point, FindRange::MultiLine, &mut |left, right| {
-        is_subword_end(left, right, &classifier) || right == '\n'
+        is_subword_end(left, right, &classifier) || left == '\n' || right == '\n'
     })
 }
 
@@ -520,6 +521,7 @@ pub fn is_subword_end(left: char, right: char, classifier: &CharClassifier) -> b
 fn is_subword_boundary_end(left: char, right: char, classifier: &CharClassifier) -> bool {
     classifier.is_word('-') && left != '-' && right == '-'
         || left != '_' && right == '_'
+        || left == '_' && right != '_'
         || left.is_lowercase() && right.is_uppercase()
 }
 
@@ -1019,10 +1021,10 @@ mod tests {
         }
 
         // Subword boundaries are respected
-        assert("lorem_ˇipˇsum", cx);
+        assert("loremˇ_ˇipsum", cx);
         assert("lorem_ˇipsumˇ", cx);
-        assert("ˇlorem_ˇipsum", cx);
-        assert("lorem_ˇipsum_ˇdolor", cx);
+        assert("ˇloremˇ_ipsum", cx);
+        assert("lorem_ˇipsumˇ_dolor", cx);
         assert("loremˇIpˇsum", cx);
         assert("loremˇIpsumˇ", cx);
 
@@ -1202,10 +1204,10 @@ mod tests {
         }
 
         // Subword boundaries are respected
-        assert("loˇremˇ_ipsum", cx);
+        assert("loremˇ_ˇipsum", cx);
         assert("ˇloremˇ_ipsum", cx);
-        assert("loremˇ_ipsumˇ", cx);
-        assert("loremˇ_ipsumˇ_dolor", cx);
+        assert("loremˇ_ˇipsum", cx);
+        assert("lorem_ˇipsumˇ_dolor", cx);
         assert("loˇremˇIpsum", cx);
         assert("loremˇIpsumˇDolor", cx);
 
@@ -1218,7 +1220,7 @@ mod tests {
         assert("loremˇ    ipsumˇ   ", cx);
         assert("loremˇ-ˇipsum", cx);
         assert("loremˇ#$@-ˇipsum", cx);
-        assert("loremˇ_ipsumˇ", cx);
+        assert("loremˇ_ˇipsum", cx);
         assert(" ˇbcˇΔ", cx);
         assert(" abˇ——ˇcd", cx);
     }
