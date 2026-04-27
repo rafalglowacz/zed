@@ -25189,6 +25189,7 @@ impl Editor {
                 self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
                 self.colorize_brackets(true, cx);
                 jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
+                self.refresh_outline_symbols_at_cursor(cx);
 
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
             }
@@ -26685,8 +26686,19 @@ impl Editor {
     fn breadcrumbs_inner(&self, cx: &App) -> Option<Vec<HighlightedText>> {
         let multibuffer = self.buffer().read(cx);
         let is_singleton = multibuffer.is_singleton();
-        let (buffer_id, symbols) = self.outline_symbols_at_cursor.as_ref()?;
-        let buffer = multibuffer.buffer(*buffer_id)?;
+
+        // For multi-buffer editors we need outline_symbols_at_cursor to know which
+        // buffer the cursor is in. For singleton buffers we fall back to the singleton
+        // buffer directly so the filename always shows even before outline symbols are
+        // first computed (e.g. on initial open before the cursor has moved).
+        let (buffer, opt_symbols): (_, Option<&[OutlineItem<Anchor>]>) =
+            match self.outline_symbols_at_cursor.as_ref() {
+                Some((buffer_id, symbols)) => {
+                    (multibuffer.buffer(*buffer_id)?, Some(symbols.as_slice()))
+                }
+                None if is_singleton => (multibuffer.as_singleton()?, None),
+                None => return None,
+            };
 
         let buffer = buffer.read(cx);
         // In a multi-buffer layout, we don't want to include the filename in the breadcrumbs
@@ -26717,10 +26729,12 @@ impl Editor {
             vec![]
         };
 
-        breadcrumbs.extend(symbols.iter().map(|symbol| HighlightedText {
-            text: symbol.text.clone().into(),
-            highlights: symbol.highlight_ranges.clone(),
-        }));
+        if let Some(symbols) = opt_symbols {
+            breadcrumbs.extend(symbols.iter().map(|symbol| HighlightedText {
+                text: symbol.text.clone().into(),
+                highlights: symbol.highlight_ranges.clone(),
+            }));
+        }
         Some(breadcrumbs)
     }
 
